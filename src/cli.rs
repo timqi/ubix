@@ -17,7 +17,17 @@ use crate::state::{LockedState, ToolRecord};
 
 /// ubix — declarative binary/CLI tool installer & tracker.
 #[derive(Debug, Parser)]
-#[command(name = "ubix", version, about, long_about = None)]
+#[command(
+    name = "ubix",
+    version = env!("UBIX_VERSION"),
+    long_version = concat!(
+        env!("UBIX_VERSION"),
+        "\ncommit ", env!("UBIX_GIT_SHA"),
+        " (", env!("UBIX_COMMIT_DATE"), ")"
+    ),
+    about,
+    long_about = None
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,

@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            artifact: ubix-darwin-arm64
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact: ubix-linux-amd64
+
+    env:
+      VERSION: ${{ github.ref_name }}
+      # Source of truth for the binary's own version: shallow CI checkouts may
+      # lack the tag object for `git describe`, so stamp it from the tag name.
+      UBIX_VERSION_OVERRIDE: ${{ github.ref_name }}
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install musl tools (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package binary
+        run: |
+          chmod +x target/${{ matrix.target }}/release/ubix
+          tar czf ${{ matrix.artifact }}-${{ env.VERSION }}.tar.gz -C target/${{ matrix.target }}/release ubix
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}-${{ env.VERSION }}
+          path: ${{ matrix.artifact }}-${{ env.VERSION }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          for dir in */; do
+            for file in "$dir"*; do
+              sha256sum "$file" >> ../checksums.txt
+            done
+          done
+          # Strip directory prefixes so checksums.txt lists bare filenames.
+          sed -i 's|[^ ]*/||' ../checksums.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            artifacts/**/*
+            checksums.txt

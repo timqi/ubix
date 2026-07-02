@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "Declarative binary/CLI tool installer & tracker (ubi + multi-source)"
 license = "MIT"
+repository = "https://github.com/timqi/ubix"
 
 [[bin]]
 name = "ubix"
