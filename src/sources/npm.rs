@@ -134,10 +134,16 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
         bail!("npm source received non-npm spec `{}`", tool.spec);
     }
     if !runner.which("fnm") {
-        bail!("`fnm` is not installed; run `ubix bootstrap fnm` first");
+        bail!(
+            "`fnm` not found; install it with:\n    \
+             ubix add github:Schniz/fnm --name fnm"
+        );
     }
     if !runner.which("npm") {
-        bail!("`npm` is not on PATH; ensure `fnm default <lts>` has been set (bootstrap fnm)");
+        bail!(
+            "`npm` is not on PATH; after installing fnm, run `fnm default <lts>` \
+             so npm is available"
+        );
     }
     let args = global_install_args(&parsed.locator, tool.version.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -258,6 +264,6 @@ mod tests {
         let runner = MockRunner::new();
         let t = ToolConfig::from_spec("npm:pnpm");
         let err = install(&t, &runner).unwrap_err();
-        assert!(err.to_string().contains("bootstrap fnm"), "{err}");
+        assert!(err.to_string().contains("ubix add github:Schniz/fnm"), "{err}");
     }
 }

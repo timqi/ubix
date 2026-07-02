@@ -1,21 +1,21 @@
-//! Toolchain / underlying-tool bootstrap (§6, D9).
+//! Toolchain bootstrap (§6, D9).
 //!
-//! * `uv`  (M3): install via the release engine (github:astral-sh/uv).
-//! * `fnm` (M4): install via the release engine (github:Schniz/fnm), then
-//!   `fnm install --lts` + `fnm default <lts>`.
-//! * `rust`(M5): fetch rustup-init from static.rust-lang.org and run `-y`.
-//! * `go`  (M5): fetch the latest stable tarball from go.dev/dl and extract to GOROOT.
+//! * `rust` (M5): fetch rustup-init from static.rust-lang.org and run `-y`.
+//! * `go`   (M5): fetch the latest stable tarball from go.dev/dl and extract to GOROOT.
 //!
-//! All are idempotent: if the target is already present they skip unless
-//! `--reinstall`. External calls go through the `CommandRunner`/`HttpClient`
-//! seams; the release fetches go through the `ReleaseEngine`.
+//! Underlying single-binary tools (uv, fnm) are ordinary github release tools —
+//! install them via `ubix add` (the source handlers print the exact spec when
+//! the tool is missing), not via a special bootstrap.
+//!
+//! Both targets are idempotent: if the target is already present they skip
+//! unless `--reinstall`. External calls go through the `CommandRunner`/
+//! `HttpClient` seams.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
 use crate::archive;
-use crate::engine::{ReleaseEngine, ReleaseRequest};
 use crate::http::HttpClient;
 use crate::runner::CommandRunner;
 
@@ -24,8 +24,6 @@ use crate::runner::CommandRunner;
 pub enum BootstrapTarget {
     Rust,
     Go,
-    Uv,
-    Fnm,
 }
 
 impl std::str::FromStr for BootstrapTarget {
@@ -34,9 +32,16 @@ impl std::str::FromStr for BootstrapTarget {
         Ok(match s.to_ascii_lowercase().as_str() {
             "rust" => BootstrapTarget::Rust,
             "go" => BootstrapTarget::Go,
-            "uv" => BootstrapTarget::Uv,
-            "fnm" => BootstrapTarget::Fnm,
-            other => bail!("unknown bootstrap target `{other}` (expected rust|go|uv|fnm)"),
+            // uv/fnm are plain github releases, not toolchain bootstraps.
+            "uv" => bail!(
+                "`uv` is not a bootstrap target; install it with:\n    \
+                 ubix add github:astral-sh/uv --name uv --exes uv,uvx"
+            ),
+            "fnm" => bail!(
+                "`fnm` is not a bootstrap target; install it with:\n    \
+                 ubix add github:Schniz/fnm --name fnm"
+            ),
+            other => bail!("unknown bootstrap target `{other}` (expected rust|go)"),
         })
     }
 }
@@ -45,122 +50,15 @@ impl std::str::FromStr for BootstrapTarget {
 pub struct BootstrapCtx<'a> {
     pub runner: &'a dyn CommandRunner,
     pub http: &'a dyn HttpClient,
-    pub engine: &'a dyn ReleaseEngine,
-    pub install_dir: PathBuf,
     pub go_root: PathBuf,
 }
 
 /// Run the bootstrap for `target`.
 pub fn bootstrap(target: BootstrapTarget, reinstall: bool, ctx: &BootstrapCtx) -> Result<()> {
     match target {
-        BootstrapTarget::Uv => bootstrap_uv(ctx, reinstall),
-        BootstrapTarget::Fnm => bootstrap_fnm(ctx, reinstall),
         BootstrapTarget::Rust => bootstrap_rust(ctx, reinstall),
         BootstrapTarget::Go => bootstrap_go(ctx, reinstall),
     }
-}
-
-fn bootstrap_uv(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
-    if ctx.runner.which("uv") && !reinstall {
-        println!("uv already installed (use --reinstall to force)");
-        return Ok(());
-    }
-    // uv ships uv+uvx in one archive. Install the primary `uv`; `uvx` is a thin
-    // shim uv provides itself. Drive the engine directly with a request.
-    let req = ReleaseRequest {
-        project: "astral-sh/uv".into(),
-        forge: ubi::ForgeType::GitHub,
-        tag: None,
-        matching: None,
-        exe: Some("uv".into()),
-        exes: Vec::new(),
-        rename: None,
-        install_dir: ctx.install_dir.clone(),
-        final_name: "uv".into(),
-        github_token: crate::sources::github::github_token_from_env(),
-        gitlab_token: None,
-        api_base_url: None,
-    };
-    ctx.engine.install(&req).context("installing uv via release engine")?;
-    println!("bootstrapped uv into {}", ctx.install_dir.display());
-    Ok(())
-}
-
-fn bootstrap_fnm(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
-    if ctx.runner.which("fnm") && !reinstall {
-        println!("fnm already installed (use --reinstall to force)");
-        return Ok(());
-    }
-    // fnm asset names are irregular (fnm-linux.zip / fnm-arm64.zip); ubi picks
-    // by matching. Install the fnm binary via the release engine.
-    let req = ReleaseRequest {
-        project: "Schniz/fnm".into(),
-        forge: ubi::ForgeType::GitHub,
-        tag: None,
-        matching: None,
-        exe: Some("fnm".into()),
-        exes: Vec::new(),
-        rename: None,
-        install_dir: ctx.install_dir.clone(),
-        final_name: "fnm".into(),
-        github_token: crate::sources::github::github_token_from_env(),
-        gitlab_token: None,
-        api_base_url: None,
-    };
-    ctx.engine.install(&req).context("installing fnm via release engine")?;
-
-    // The just-installed fnm is NOT on PATH yet (it lives in install_dir which
-    // the user may not have sourced), so invoke it by ABSOLUTE path.
-    let fnm_bin = ctx.install_dir.join("fnm");
-    let fnm_path = fnm_bin.to_string_lossy().into_owned();
-
-    // Install the latest LTS node.
-    let out = ctx
-        .runner
-        .run(&fnm_path, &["install", "--lts"], &[])
-        .context("running fnm install --lts")?;
-    if !out.success() {
-        bail!("fnm install --lts failed: {}", out.stderr.trim());
-    }
-    // Prefer setting the default to the exact version fnm just installed (parsed
-    // from its output); fall back to the `lts-latest` alias if we cannot parse.
-    let version = parse_fnm_installed_version(&out.stdout).or_else(|| {
-        // Some fnm versions print the "Installing ..." line to stderr.
-        parse_fnm_installed_version(&out.stderr)
-    });
-    let default_arg = version.as_deref().unwrap_or("lts-latest");
-    let out = ctx
-        .runner
-        .run(&fnm_path, &["default", default_arg], &[])
-        .context("running fnm default")?;
-    if !out.success() {
-        bail!("fnm default failed: {}", out.stderr.trim());
-    }
-    println!("bootstrapped fnm and set default node to {default_arg}");
-    Ok(())
-}
-
-/// Parse the installed node version (e.g. `v22.14.0`) from `fnm install --lts`
-/// output. fnm prints lines like `Installing Node v22.14.0 (x64)`.
-pub fn parse_fnm_installed_version(output: &str) -> Option<String> {
-    for line in output.lines() {
-        for tok in line.split_whitespace() {
-            let t = tok.trim_end_matches(['(', ')']);
-            if is_node_version(t) {
-                return Some(t.to_string());
-            }
-        }
-    }
-    None
-}
-
-fn is_node_version(s: &str) -> bool {
-    // vMAJOR.MINOR.PATCH
-    if let Some(rest) = s.strip_prefix('v') {
-        let parts: Vec<&str> = rest.split('.').collect();
-        return parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()));
-    }
-    false
 }
 
 fn bootstrap_rust(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
@@ -331,31 +229,28 @@ pub fn pick_go_archive(index_json: &str, os: &str, arch: &str) -> Result<GoArchi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::EngineResult;
     use crate::http::MockHttp;
-    use crate::runner::{CommandOutput, MockRunner};
-    use std::sync::Mutex;
-
-    struct RecordingEngine {
-        reqs: Mutex<Vec<ReleaseRequest>>,
-    }
-    impl ReleaseEngine for RecordingEngine {
-        fn install(&self, req: &ReleaseRequest) -> Result<EngineResult> {
-            self.reqs.lock().unwrap().push(req.clone());
-            let path = req.install_dir.join(&req.final_name);
-            Ok(EngineResult {
-                install_paths: vec![path],
-                sha256: "x".into(),
-                version: Some("v1".into()),
-            })
-        }
-    }
+    use crate::runner::MockRunner;
 
     #[test]
     fn target_parsing() {
         assert_eq!("rust".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Rust);
         assert_eq!("GO".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Go);
         assert!("brew".parse::<BootstrapTarget>().is_err());
+    }
+
+    #[test]
+    fn uv_target_points_to_add_spec() {
+        // uv/fnm are no longer bootstrap targets; parsing them yields a clear
+        // error pointing at the `ubix add` spec.
+        let err = "uv".parse::<BootstrapTarget>().unwrap_err().to_string();
+        assert!(err.contains("ubix add github:astral-sh/uv --name uv --exes uv,uvx"), "{err}");
+    }
+
+    #[test]
+    fn fnm_target_points_to_add_spec() {
+        let err = "fnm".parse::<BootstrapTarget>().unwrap_err().to_string();
+        assert!(err.contains("ubix add github:Schniz/fnm --name fnm"), "{err}");
     }
 
     #[test]
@@ -389,105 +284,6 @@ mod tests {
         let json = r#"[{"version":"go1.99rc1","stable":false,"files":[
             {"filename":"go.linux-amd64.tar.gz","os":"linux","arch":"amd64","kind":"archive","sha256":"x"}]}]"#;
         assert!(pick_go_archive(json, "linux", "amd64").is_err());
-    }
-
-    #[test]
-    fn uv_skips_when_present_without_reinstall() {
-        let runner = MockRunner::new().with_present("uv");
-        let http = MockHttp::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
-        let ctx = BootstrapCtx {
-            runner: &runner,
-            http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
-            go_root: PathBuf::from("/tmp/go"),
-        };
-        bootstrap(BootstrapTarget::Uv, false, &ctx).unwrap();
-        assert!(engine.reqs.lock().unwrap().is_empty(), "should skip");
-    }
-
-    #[test]
-    fn uv_installs_via_engine_when_missing() {
-        let runner = MockRunner::new(); // uv absent
-        let http = MockHttp::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
-        let ctx = BootstrapCtx {
-            runner: &runner,
-            http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
-            go_root: PathBuf::from("/tmp/go"),
-        };
-        bootstrap(BootstrapTarget::Uv, false, &ctx).unwrap();
-        let reqs = engine.reqs.lock().unwrap();
-        assert_eq!(reqs.len(), 1);
-        assert_eq!(reqs[0].project, "astral-sh/uv");
-    }
-
-    #[test]
-    fn fnm_uses_absolute_path_and_parses_version() {
-        // fnm is invoked by absolute path (/tmp/bin/fnm), and `default` targets
-        // the exact version parsed from the install output — not the alias.
-        let runner = MockRunner::new()
-            .expect(
-                "/tmp/bin/fnm install --lts",
-                CommandOutput {
-                    status: 0,
-                    stdout: "Installing Node v22.14.0 (x64)\n".into(),
-                    stderr: String::new(),
-                },
-            )
-            .expect(
-                "/tmp/bin/fnm default v22.14.0",
-                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
-            );
-        let http = MockHttp::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
-        let ctx = BootstrapCtx {
-            runner: &runner,
-            http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
-            go_root: PathBuf::from("/tmp/go"),
-        };
-        bootstrap(BootstrapTarget::Fnm, false, &ctx).unwrap();
-        assert_eq!(engine.reqs.lock().unwrap()[0].project, "Schniz/fnm");
-    }
-
-    #[test]
-    fn fnm_falls_back_to_alias_when_no_version() {
-        let runner = MockRunner::new()
-            .expect(
-                "/tmp/bin/fnm install --lts",
-                CommandOutput { status: 0, stdout: "done\n".into(), stderr: String::new() },
-            )
-            .expect(
-                "/tmp/bin/fnm default lts-latest",
-                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
-            );
-        let http = MockHttp::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
-        let ctx = BootstrapCtx {
-            runner: &runner,
-            http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
-            go_root: PathBuf::from("/tmp/go"),
-        };
-        bootstrap(BootstrapTarget::Fnm, false, &ctx).unwrap();
-    }
-
-    #[test]
-    fn parse_fnm_version_variants() {
-        assert_eq!(
-            parse_fnm_installed_version("Installing Node v22.14.0 (x64)").as_deref(),
-            Some("v22.14.0")
-        );
-        assert_eq!(parse_fnm_installed_version("v20.11.1").as_deref(), Some("v20.11.1"));
-        assert_eq!(parse_fnm_installed_version("no version here"), None);
-        // Not a 3-part version.
-        assert_eq!(parse_fnm_installed_version("v22"), None);
     }
 
     /// Build a tar.gz whose top-level dir is `go/` with a `go/bin/go` file.
@@ -530,12 +326,9 @@ mod tests {
         let goroot = tempfile::tempdir().unwrap();
         let go_root = goroot.path().join("go");
         let runner = MockRunner::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
         let ctx = BootstrapCtx {
             runner: &runner,
             http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
             go_root: go_root.clone(),
         };
         bootstrap(BootstrapTarget::Go, false, &ctx).unwrap();
@@ -560,12 +353,9 @@ mod tests {
         let goroot = tempfile::tempdir().unwrap();
         let go_root = goroot.path().join("go");
         let runner = MockRunner::new();
-        let engine = RecordingEngine { reqs: Mutex::new(Vec::new()) };
         let ctx = BootstrapCtx {
             runner: &runner,
             http: &http,
-            engine: &engine,
-            install_dir: PathBuf::from("/tmp/bin"),
             go_root: go_root.clone(),
         };
         let err = bootstrap(BootstrapTarget::Go, false, &ctx).unwrap_err();

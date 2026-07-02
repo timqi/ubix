@@ -228,13 +228,13 @@ node_default      = "v22.14.0"
 - **无 latest 概念**：视为固定版本，`outdated` 跳过、`upgrade` 需手动改 URL。state 记录 URL 与下载内容 sha256 以判定是否变化。
 
 ### 5.3 pypi（uv tool）
-- 引导：若无 `uv`，用 release 引擎装 `astral-sh/uv`（`exes=["uv","uvx"]`）。
+- 前置 `uv`：**不做特殊 bootstrap**——uv 本身就是普通 GitHub 单文件 release。缺失时报错并**列出可复制的安装 spec**：`ubix add github:astral-sh/uv --name uv --exes uv,uvx`。
 - 安装：`uv tool install <package>[==version][--with …]`。可执行入口以**符号链接**形式出现在 `~/.local/bin`，实体 venv 在 `~/.local/share/uv/tools/<name>/`。
 - 升级：`uv tool upgrade <package>`。
 - **卸载：一律 `uv tool uninstall <package>`**（删符号链接 + 清理 venv）。**不可直接 rm 符号链接**（会泄漏 venv）。§8.7 矩阵以此为准。
 
 ### 5.4 npm（fnm default LTS node，D4）
-- 引导：若无 `fnm`，用 release 引擎装 `Schniz/fnm`（asset 命名不规范：x86_64 是 `fnm-linux.zip`，arm 是 `fnm-arm64.zip`；aarch64 上可能需 `matching`）。
+- 前置 `fnm`：同 uv，**不做特殊 bootstrap**。缺失时报错并列出安装 spec：`ubix add github:Schniz/fnm --name fnm`（asset 命名不规范：x86_64 是 `fnm-linux.zip`，arm 是 `fnm-arm64.zip`；aarch64 上可能需 `--matching`）。装好后 `fnm default <lts>` 使 npm 可用。
 - `fnm install --lts` 并 `fnm default <该版本>`。
 - **PATH 目录运行时探测**：**不硬编码** `~/.local/share/fnm`。通过 `fnm env --json`（或读 `FNM_DIR`，并处理 legacy `~/.fnm` 回退）取得实际 base，得到稳定 alias bin 目录 `<base>/aliases/default/bin` 加入 PATH。alias 是软链，LTS 大版本升级自动跟随。
 - 包操作：`npm i -g <pkg>[@version]` / `@latest` / `npm rm -g <pkg>`。
@@ -255,7 +255,7 @@ node_default      = "v22.14.0"
 ---
 
 ## 6. 工具链引导（D9）
-一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑（D 见 §8）。
+`bootstrap` **仅用于多文件语言工具链 `rust` / `go`**（无法当单二进制 `add`）。uv / fnm 是普通单文件 release，用普通 `add` 安装（§5.3/§5.4），**不属于 bootstrap**。一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑。
 
 ### 6.1 Rust → rustup
 - `rustup-init` 单文件：`url:` 来源从 `https://static.rust-lang.org/rustup/dist/<target>/rustup-init` 拉取，运行 `rustup-init -y`。
@@ -276,12 +276,12 @@ ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--ve
 ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
 ubix upgrade [name | --all] [--force]   # 原地升级；pin tag 默认跳过（D11）
 ubix sync [--dry-run] [--prune] [--wait]  # 幂等对账；--prune 删孤儿（D10）
-ubix list                       # 已声明 / 已装工具及版本
+ubix list                       # 已声明工具：名称 / spec / 已装版本
 ubix outdated                   # 各来源最新版 vs 已装（查询见 §7.1）
 ubix info <name>                # 来源、asset/module、路径、参数
 ubix edit                       # 打开 config.toml
 ubix doctor                     # 检查 uv/fnm/rustup/go、各 PATH 段、~/.local/bin 就绪
-ubix bootstrap <rust|go|uv|fnm> [--reinstall]  # 引导工具链/底层工具（默认幂等跳过）
+ubix bootstrap <rust|go> [--reinstall]  # 仅引导语言工具链（uv/fnm 用普通 add，§5.3/5.4）
 ```
 
 ### 7.1 `outdated` 各来源查询

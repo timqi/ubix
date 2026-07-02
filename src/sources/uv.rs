@@ -64,7 +64,10 @@ pub fn install(
         bail!("uv source received non-pypi spec `{}`", tool.spec);
     }
     if !runner.which("uv") {
-        bail!("`uv` is not installed; run `ubix bootstrap uv` first");
+        bail!(
+            "`uv` not found; install it with:\n    \
+             ubix add github:astral-sh/uv --name uv --exes uv,uvx"
+        );
     }
     let args = install_args(tool, &parsed.locator, reinstall);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -98,7 +101,10 @@ pub fn upgrade(
 ) -> Result<InstallOutcome> {
     let parsed = parse_spec(&tool.spec, SourceKind::Pypi)?;
     if !runner.which("uv") {
-        bail!("`uv` is not installed; run `ubix bootstrap uv` first");
+        bail!(
+            "`uv` not found; install it with:\n    \
+             ubix add github:astral-sh/uv --name uv --exes uv,uvx"
+        );
     }
     let args = upgrade_args(&parsed.locator);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -160,7 +166,7 @@ mod tests {
         let runner = crate::runner::MockRunner::new(); // uv not present
         let t = ToolConfig::from_spec("pypi:ruff");
         let err = install(&t, &runner, std::path::Path::new("/tmp/bin"), false).unwrap_err();
-        assert!(err.to_string().contains("bootstrap uv"), "{err}");
+        assert!(err.to_string().contains("ubix add github:astral-sh/uv"), "{err}");
     }
 
     #[test]

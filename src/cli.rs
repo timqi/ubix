@@ -53,7 +53,7 @@ pub enum Command {
     Edit,
     /// Check underlying tools and PATH readiness.
     Doctor,
-    /// Bootstrap a toolchain / underlying tool.
+    /// Bootstrap a language toolchain (rust|go).
     Bootstrap(BootstrapArgs),
 }
 
@@ -129,7 +129,7 @@ pub struct InfoArgs {
 
 #[derive(Debug, Args)]
 pub struct BootstrapArgs {
-    /// One of rust|go|uv|fnm.
+    /// Toolchain to bootstrap: <rust|go>.
     pub target: String,
     #[arg(long)]
     pub reinstall: bool,
@@ -359,15 +359,22 @@ impl App {
             println!("no tools declared");
             return Ok(());
         }
-        for (name, tool) in &cfg.tools {
-            let parsed = cfg.parsed_spec(tool).ok();
-            let src = parsed.map(|p| p.source.to_string()).unwrap_or_else(|| "?".into());
-            let ver = state
-                .tools
-                .get(name)
-                .map(|r| r.installed_version.clone())
-                .unwrap_or_else(|| "(not installed)".into());
-            println!("{name:20} {src:8} {ver}");
+        // Columns: name, spec (encodes the source), installed version. The spec
+        // column is width-aligned to the widest spec so rows stay readable.
+        let rows: Vec<(String, String, String)> = cfg
+            .tools
+            .iter()
+            .map(|(name, tool)| {
+                let ver = state
+                    .tools
+                    .get(name)
+                    .map(|r| r.installed_version.clone())
+                    .unwrap_or_else(|| "(not installed)".into());
+                (name.clone(), tool.spec.clone(), ver)
+            })
+            .collect();
+        for line in format_list(&rows) {
+            println!("{line}");
         }
         Ok(())
     }
@@ -509,8 +516,6 @@ impl App {
         let ctx = bootstrap::BootstrapCtx {
             runner: self.runner.as_ref(),
             http: self.http.as_ref(),
-            engine: &UbiEngine::new(),
-            install_dir: cfg.settings.install_dir_path()?,
             go_root: crate::paths::expand(&cfg.settings.go_root)?,
         };
         bootstrap::bootstrap(target, args.reinstall, &ctx)
@@ -630,6 +635,16 @@ fn needs_install(
         }
     }
     false
+}
+
+/// Format `ubix list` rows (name, spec, version) into aligned lines. The name
+/// and spec columns are padded to the widest entry so output stays readable.
+fn format_list(rows: &[(String, String, String)]) -> Vec<String> {
+    let name_w = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
+    let spec_w = rows.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
+    rows.iter()
+        .map(|(name, spec, ver)| format!("{name:<name_w$}  {spec:<spec_w$}  {ver}"))
+        .collect()
 }
 
 /// Derive a tool name from a locator: last path segment, stripped of `@version`.
@@ -774,5 +789,26 @@ mod tests {
         let mut tool = ToolConfig::from_spec("pypi:ruff");
         tool.version = Some("0.7.0".into());
         assert!(needs_install(&parsed, &tool, Some(&rec("0.6.0")), false));
+    }
+
+    #[test]
+    fn format_list_aligns_and_shows_spec_and_version() {
+        let rows = vec![
+            ("eza".to_string(), "github:eza-community/eza".to_string(), "v0.23.4".to_string()),
+            ("ruff".to_string(), "pypi:ruff".to_string(), "(not installed)".to_string()),
+        ];
+        let lines = format_list(&rows);
+        // Name column padded to width of "ruff" (4); spec padded to widest spec.
+        assert_eq!(lines[0], "eza   github:eza-community/eza  v0.23.4");
+        assert!(lines[1].starts_with("ruff  pypi:ruff"));
+        assert!(lines[1].ends_with("(not installed)"));
+        // Both the spec and the version appear on each line.
+        assert!(lines[0].contains("github:eza-community/eza"));
+        assert!(lines[1].contains("pypi:ruff"));
+    }
+
+    #[test]
+    fn format_list_empty() {
+        assert!(format_list(&[]).is_empty());
     }
 }
