@@ -4,6 +4,12 @@
 //! onto that node. The alias bin dir (`<base>/aliases/default/bin`) is a symlink
 //! that follows LTS jumps, so it is the stable PATH entry (§8.9). We detect the
 //! fnm base at RUNTIME (never hardcode ~/.fnm) via `fnm env` / `$FNM_DIR`.
+//!
+//! CRITICAL: all npm operations run through `fnm exec --using=default -- npm …`,
+//! never bare `npm`. A bare `npm` on PATH may be a version-manager shim (e.g.
+//! mise) pointing at a *different* node, which would install the global package
+//! into the wrong place while ubix records the fnm alias-bin path. Routing
+//! through `fnm exec` guarantees the fnm default node's npm is used.
 
 use std::path::PathBuf;
 
@@ -14,18 +20,45 @@ use crate::paths;
 use crate::runner::CommandRunner;
 use crate::sources::{parse_spec, InstallOutcome, SourceKind};
 
-/// `npm i -g <pkg>[@version]`.
+/// `fnm exec --using=default -- npm i -g <pkg>[@version]`.
 pub fn global_install_args(pkg: &str, version: Option<&str>) -> Vec<String> {
     let spec = match version {
         Some(v) => format!("{pkg}@{v}"),
         None => pkg.to_string(),
     };
-    vec!["i".into(), "-g".into(), spec]
+    fnm_exec_npm(&["i", "-g", &spec])
 }
 
-/// `npm rm -g <pkg>`.
+/// `fnm exec --using=default -- npm rm -g <pkg>`.
 pub fn global_remove_args(pkg: &str) -> Vec<String> {
-    vec!["rm".into(), "-g".into(), pkg.to_string()]
+    fnm_exec_npm(&["rm", "-g", pkg])
+}
+
+/// Wrap an `npm` argument list so it runs on the fnm default node:
+/// `fnm exec --using=default -- npm <args…>`.
+fn fnm_exec_npm(npm_args: &[&str]) -> Vec<String> {
+    let mut v = vec![
+        "exec".to_string(),
+        "--using=default".to_string(),
+        "--".to_string(),
+        "npm".to_string(),
+    ];
+    v.extend(npm_args.iter().map(|s| s.to_string()));
+    v
+}
+
+/// Whether a fnm default node exists and works — pre-check before any npm op.
+/// Runs `fnm exec --using=default -- node --version`; success means a default
+/// node is set and usable.
+pub fn has_default_node(runner: &dyn CommandRunner) -> bool {
+    runner
+        .run(
+            "fnm",
+            &["exec", "--using=default", "--", "node", "--version"],
+            &[],
+        )
+        .map(|o| o.success())
+        .unwrap_or(false)
 }
 
 /// Parse the fnm base directory from `fnm env` output. fnm prints lines like
@@ -139,16 +172,21 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
              ubix add github:Schniz/fnm --name fnm"
         );
     }
-    if !runner.which("npm") {
+    // Require a fnm DEFAULT node (not just fnm) so `npm` runs on the right node.
+    if !has_default_node(runner) {
         bail!(
-            "`npm` is not on PATH; after installing fnm, run `fnm default <lts>` \
-             so npm is available"
+            "no fnm default node set; run `ubix bootstrap nodejs` \
+             (installs fnm's default LTS) first"
         );
     }
+    // Run via `fnm exec --using=default -- npm …` (never bare `npm`, which may be
+    // a mise/asdf shim on a different node).
     let args = global_install_args(&parsed.locator, tool.version.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    crate::step!("npm i -g {}…", parsed.locator);
-    let out = runner.run("npm", &arg_refs, &[]).context("running npm i -g")?;
+    crate::step!("fnm exec --using=default -- npm i -g {}…", parsed.locator);
+    let out = runner
+        .run("fnm", &arg_refs, &[])
+        .context("running npm i -g via fnm default node")?;
     if !out.success() {
         bail!("npm install failed: {}", out.stderr.trim());
     }
@@ -172,17 +210,23 @@ mod tests {
     use crate::runner::{CommandOutput, MockRunner};
 
     #[test]
-    fn install_args_plain_and_versioned() {
-        assert_eq!(global_install_args("pnpm", None), vec!["i", "-g", "pnpm"]);
+    fn install_args_route_through_fnm_exec() {
+        assert_eq!(
+            global_install_args("pnpm", None),
+            vec!["exec", "--using=default", "--", "npm", "i", "-g", "pnpm"]
+        );
         assert_eq!(
             global_install_args("pnpm", Some("9.1.0")),
-            vec!["i", "-g", "pnpm@9.1.0"]
+            vec!["exec", "--using=default", "--", "npm", "i", "-g", "pnpm@9.1.0"]
         );
     }
 
     #[test]
-    fn remove_args_shape() {
-        assert_eq!(global_remove_args("pnpm"), vec!["rm", "-g", "pnpm"]);
+    fn remove_args_route_through_fnm_exec() {
+        assert_eq!(
+            global_remove_args("pnpm"),
+            vec!["exec", "--using=default", "--", "npm", "rm", "-g", "pnpm"]
+        );
     }
 
     #[test]
@@ -262,9 +306,68 @@ mod tests {
 
     #[test]
     fn install_requires_fnm() {
+        // fnm itself missing → point at the add spec.
         let runner = MockRunner::new();
         let t = ToolConfig::from_spec("npm:pnpm");
         let err = install(&t, &runner).unwrap_err();
         assert!(err.to_string().contains("ubix add github:Schniz/fnm"), "{err}");
+    }
+
+    #[test]
+    fn install_requires_default_node() {
+        // fnm present but the default-node pre-check fails → bootstrap nodejs.
+        let runner = MockRunner::new().with_present("fnm").expect(
+            "fnm exec --using=default -- node --version",
+            CommandOutput { status: 1, stdout: String::new(), stderr: "no default".into() },
+        );
+        let t = ToolConfig::from_spec("npm:pnpm");
+        let err = install(&t, &runner).unwrap_err();
+        assert!(err.to_string().contains("ubix bootstrap nodejs"), "{err}");
+    }
+
+    #[test]
+    fn install_runs_npm_through_fnm_exec() {
+        // fnm present, default node OK → install runs `fnm exec … npm i -g`.
+        let runner = MockRunner::new()
+            .with_present("fnm")
+            .expect(
+                "fnm exec --using=default -- node --version",
+                CommandOutput { status: 0, stdout: "v22.14.0\n".into(), stderr: String::new() },
+            )
+            .expect(
+                "fnm exec --using=default -- npm i -g pnpm",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "fnm env",
+                CommandOutput {
+                    status: 0,
+                    stdout: "export FNM_DIR=\"/home/u/.local/share/fnm\"\n".into(),
+                    stderr: String::new(),
+                },
+            );
+        let t = ToolConfig::from_spec("npm:pnpm");
+        let out = install(&t, &runner).unwrap();
+        // Recorded install path is the fnm alias-bin dir + package name (unchanged).
+        assert_eq!(
+            out.install_paths,
+            vec![PathBuf::from("/home/u/.local/share/fnm/aliases/default/bin/pnpm")]
+        );
+        // The npm install was invoked via `fnm exec`, not bare `npm`.
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().any(|c| c.program == "fnm"
+            && c.args == ["exec", "--using=default", "--", "npm", "i", "-g", "pnpm"]));
+        assert!(!calls.iter().any(|c| c.program == "npm"), "must not invoke bare npm");
+    }
+
+    #[test]
+    fn has_default_node_true_false() {
+        let ok = MockRunner::new().expect(
+            "fnm exec --using=default -- node --version",
+            CommandOutput { status: 0, stdout: "v22.0.0\n".into(), stderr: String::new() },
+        );
+        assert!(has_default_node(&ok));
+        // Missing canned response → run errors → false.
+        assert!(!has_default_node(&MockRunner::new()));
     }
 }

@@ -256,11 +256,11 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - **卸载：一律 `uv tool uninstall <package>`**（删符号链接 + 清理 venv）。**不可直接 rm 符号链接**（会泄漏 venv）。§8.7 矩阵以此为准。
 
 ### 5.4 npm（fnm default LTS node，D4）
-- 前置 `fnm`：同 uv，**不做特殊 bootstrap**。缺失时报错并列出安装 spec：`ubix add github:Schniz/fnm --name fnm`（asset 命名不规范：x86_64 是 `fnm-linux.zip`，arm 是 `fnm-arm64.zip`；aarch64 上可能需 `--matching`）。装好后 `fnm default <lts>` 使 npm 可用。
-- `fnm install --lts` 并 `fnm default <该版本>`。
+- 前置 `fnm`：同 uv，**不做特殊 bootstrap**。缺失时报错并列出安装 spec：`ubix add github:Schniz/fnm --name fnm`（asset 命名不规范：x86_64 是 `fnm-linux.zip`，arm 是 `fnm-arm64.zip`；aarch64 上可能需 `--matching`）。`ubix bootstrap nodejs` 装 fnm 并 `fnm install --lts` + `fnm default <ver>`。
+- **前置 default node 校验**：任何 npm 操作前先 `fnm exec --using=default -- node --version` 确认存在可用的 fnm default node；缺失则报错 `no fnm default node set; run \`ubix bootstrap nodejs\` first`。
 - **PATH 目录运行时探测**：**不硬编码** `~/.local/share/fnm`。通过 `fnm env --json`（或读 `FNM_DIR`，并处理 legacy `~/.fnm` 回退）取得实际 base，得到稳定 alias bin 目录 `<base>/aliases/default/bin` 加入 PATH。alias 是软链，LTS 大版本升级自动跟随。
-- 包操作：`npm i -g <pkg>[@version]` / `@latest` / `npm rm -g <pkg>`。
-- **LTS 跃迁检测**：state 记录 `_runtime.node_default`；每次 `sync`/`upgrade` 读 `fnm current`/`fnm default` 实际版本，与记录值比较；不同则在新 default 上**按 config 重装所有 `npm` 来源工具**并更新记录，保持幂等。
+- 包操作**一律经 fnm default node 执行**：`fnm exec --using=default -- npm i -g <pkg>[@version]` / `… npm rm -g <pkg>`。**绝不**直接跑裸 `npm`——PATH 上的 `npm` 可能是版本管理器（如 mise/asdf）的 shim，指向另一个 node，会把全局包装错地方、而 ubix 记的是 fnm alias-bin 路径导致找不到。走 `fnm exec` 保证用的是 fnm default node 的 npm。
+- **LTS 跃迁检测**：state 记录 `_runtime.node_default`；每次 `sync`/`upgrade` 读 `fnm current`/`fnm default` 实际版本，与记录值比较；不同则在新 default 上**按 config 重装所有 `npm` 来源工具**并更新记录，保持幂等（重装同样经 `fnm exec --using=default` 且先校验 default node）。
 - 副作用（已接受）：node/npm/npx 及所有全局 npm 包入口都会进 PATH，不落 `~/.local/bin`。
 
 ### 5.5 cargo（源码，D7）

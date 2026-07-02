@@ -5,7 +5,7 @@
 //! * github / gitlab / url / go → unlink the tracked `install_paths`.
 //! * pypi(uv) → `uv tool uninstall` (never rm the symlink — that leaks the venv).
 //! * cargo → `cargo uninstall --root <root>`.
-//! * npm(fnm) → `npm rm -g <pkg>`.
+//! * npm(fnm) → `fnm exec --using=default -- npm rm -g <pkg>`.
 
 use anyhow::{bail, Context, Result};
 
@@ -92,9 +92,10 @@ fn uninstall_record(
             run_uninstall(runner, "cargo", &args, "cargo uninstall")?;
         }
         Some(SourceKind::Npm) => {
+            // Route through the fnm default node (never bare `npm`, §5.4).
             let locator = resolve_locator(record, cfg, name);
             let args = npm::global_remove_args(&locator);
-            run_uninstall(runner, "npm", &args, "npm rm -g")?;
+            run_uninstall(runner, "fnm", &args, "npm rm -g via fnm default node")?;
         }
         // github / gitlab / url / go / unknown → unlink tracked files.
         _ => {
@@ -239,12 +240,12 @@ mod tests {
     }
 
     #[test]
-    fn npm_uses_npm_rm() {
+    fn npm_uses_fnm_exec_npm_rm() {
         let mut cfg = cfg_with("pnpm", "npm:pnpm");
         let mut state = State::default();
         state.tools.insert("pnpm".into(), record("npm", vec![]));
         let runner = MockRunner::new().expect(
-            "npm rm -g pnpm",
+            "fnm exec --using=default -- npm rm -g pnpm",
             CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
         );
         remove_tool(&mut cfg, &mut state, &runner, "pnpm", false).unwrap();
