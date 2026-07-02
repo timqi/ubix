@@ -42,6 +42,9 @@ pub struct SourceInfo {
     pub summary: &'static str,
     /// A representative `prefix:locator` spec example.
     pub example: &'static str,
+    /// Where installed binaries land (§1.4 / §8.7). `~/.local/bin` is the
+    /// default install_dir.
+    pub location: &'static str,
 }
 
 impl SourceKind {
@@ -77,46 +80,54 @@ impl SourceKind {
     /// Human-facing metadata for `ubix sources`. `prefix` is derived from
     /// [`as_str`] so it never drifts from the parser.
     pub fn describe(self) -> SourceInfo {
-        let (backend, summary, example) = match self {
+        let (backend, summary, example, location) = match self {
             SourceKind::Github => (
                 "ubi (GitHub Releases)",
                 "prebuilt binaries from GitHub releases (asset heuristics via ubi)",
                 "github:eza-community/eza",
+                "~/.local/bin",
             ),
             SourceKind::Gitlab => (
                 "ubi (GitLab Releases; +host for self-hosted)",
                 "prebuilt binaries from GitLab releases; set `host` for self-hosted",
                 "gitlab:group/repo",
+                "~/.local/bin",
             ),
             SourceKind::Url => (
                 "built-in download (fixed link)",
                 "download a fixed archive/binary URL; no version discovery",
                 "url:https://example.com/x-linux-x86_64.tar.gz",
+                "~/.local/bin",
             ),
             SourceKind::Http => (
                 "built-in download + version discovery (templated URL)",
                 "templated URL with {version}/{os}/{arch}; version from version_source",
                 "http:https://host/{version}/{os}-{arch}/bin",
+                "~/.local/bin",
             ),
             SourceKind::Pypi => (
                 "uv tool",
                 "install Python CLI tools via `uv tool install`",
                 "pypi:ruff",
+                "~/.local/bin (uv entry-point symlink → uv tools venv)",
             ),
             SourceKind::Npm => (
                 "fnm default LTS node (npm -g)",
                 "global npm package on the fnm default LTS node",
                 "npm:pnpm",
+                "fnm default node bin (~/.local/share/fnm/aliases/default/bin)",
             ),
             SourceKind::Cargo => (
                 "cargo install --root ~/.local",
                 "compile a Rust crate into ~/.local/bin via cargo",
                 "cargo:ripgrep",
+                "~/.local/bin (cargo --root ~/.local)",
             ),
             SourceKind::Go => (
                 "GOBIN=~/.local/bin go install",
                 "compile a Go module into ~/.local/bin via go install",
                 "go:example.com/cmd/tool@latest",
+                "~/.local/bin (GOBIN)",
             ),
         };
         SourceInfo {
@@ -124,6 +135,7 @@ impl SourceKind {
             backend,
             summary,
             example,
+            location,
         }
     }
 }
@@ -416,6 +428,7 @@ mod tests {
             assert!(!info.backend.is_empty(), "{k} backend empty");
             assert!(!info.summary.is_empty(), "{k} summary empty");
             assert!(!info.example.is_empty(), "{k} example empty");
+            assert!(!info.location.is_empty(), "{k} location empty");
             // prefix is derived from as_str().
             assert_eq!(info.prefix, k.as_str());
             // The example spec parses to this same kind.

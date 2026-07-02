@@ -792,8 +792,9 @@ fn format_list(rows: &[(String, String, String)]) -> Vec<String> {
 }
 
 /// Format the `ubix sources` table from every [`SourceKind`]. A header plus one
-/// `PREFIX | BACKEND | EXAMPLE` row per source (aligned), with the summary on an
-/// indented second line. Data-driven from `SourceKind::all()`.
+/// `PREFIX | BACKEND | EXAMPLE` row per source (aligned), with the summary and
+/// install location on an indented second line. Data-driven from
+/// `SourceKind::all()`.
 fn format_sources() -> Vec<String> {
     let infos: Vec<_> = SourceKind::all().iter().map(|k| k.describe()).collect();
     // `prefix:` including the trailing colon for the PREFIX column.
@@ -821,7 +822,10 @@ fn format_sources() -> Vec<String> {
             "{:<prefix_w$}  {:<backend_w$}  {}",
             prefix_col[i], info.backend, info.example
         ));
-        out.push(format!("{:prefix_w$}  {}", "", info.summary));
+        out.push(format!(
+            "{:prefix_w$}  {} · installs to {}",
+            "", info.summary, info.location
+        ));
     }
     out
 }
@@ -1063,16 +1067,22 @@ mod tests {
         assert!(lines[0].contains("BACKEND"));
         assert!(lines[0].contains("EXAMPLE"));
         let joined = lines.join("\n");
-        // Every prefix and its example appear.
+        // Every prefix, example, backend, and install location appear.
         for &k in SourceKind::all() {
             let info = k.describe();
             assert!(joined.contains(&format!("{}:", info.prefix)), "missing prefix {}", info.prefix);
             assert!(joined.contains(info.example), "missing example {}", info.example);
             assert!(joined.contains(info.backend), "missing backend {}", info.backend);
+            assert!(joined.contains(info.location), "missing location {}", info.location);
         }
+        // The location is rendered as an "installs to <location>" suffix.
+        assert!(joined.contains("installs to "));
         // Spot-check a couple of the required backend strings.
         assert!(joined.contains("ubi (GitHub Releases)"));
         assert!(joined.contains("cargo install --root ~/.local"));
+        // Spot-check locations: the default install_dir and npm's fnm alias path.
+        assert!(joined.contains("~/.local/bin"));
+        assert!(joined.contains("~/.local/share/fnm/aliases/default/bin"));
     }
 
     #[test]
