@@ -36,6 +36,11 @@ pub trait CommandRunner {
         envs: &[(&str, &str)],
     ) -> Result<CommandOutput>;
 
+    /// Run an interactive program, **inheriting** the terminal (stdin/stdout/stderr),
+    /// and return its exit code. Required for editors and other TTY-driven programs —
+    /// the capturing `run` (pipes stdio) would deadlock them (child gets no TTY on stdin).
+    fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32>;
+
     /// Whether a program is discoverable on `PATH`.
     fn which(&self, program: &str) -> bool;
 }
@@ -70,6 +75,16 @@ impl CommandRunner for SystemRunner {
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         })
+    }
+
+    fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32> {
+        // `status()` inherits the parent's stdio (unlike `output()`), so the
+        // child editor gets the controlling terminal and does not deadlock.
+        let status = Command::new(program)
+            .args(args)
+            .status()
+            .with_context(|| format!("failed to spawn `{program}`"))?;
+        Ok(status.code().unwrap_or(-1))
     }
 
     fn which(&self, program: &str) -> bool {
@@ -154,6 +169,16 @@ impl CommandRunner for MockRunner {
             Some(o) => Ok(o.clone()),
             None => bail!("MockRunner: no canned response for `{key}`"),
         }
+    }
+
+    fn run_interactive(&self, program: &str, args: &[&str]) -> Result<i32> {
+        // Record the invocation (like `run`) and report success; tests assert the call.
+        self.calls.borrow_mut().push(RecordedCall {
+            program: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            envs: Vec::new(),
+        });
+        Ok(0)
     }
 
     fn which(&self, program: &str) -> bool {

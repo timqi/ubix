@@ -437,13 +437,22 @@ impl App {
         if !cfg_path.exists() {
             Config::default().save(&cfg_path)?;
         }
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-        let out = self
+        let editor = std::env::var("VISUAL")
+            .or_else(|_| std::env::var("EDITOR"))
+            .unwrap_or_else(|_| "vi".to_string());
+        // Support editors carrying args, e.g. EDITOR="code --wait" or "vim -p".
+        let mut parts = editor.split_whitespace();
+        let program = parts.next().unwrap_or("vi");
+        let mut args: Vec<&str> = parts.collect();
+        let path_str = cfg_path.to_string_lossy().into_owned();
+        args.push(&path_str);
+        // Launch interactively so the editor inherits the terminal (avoids a hang).
+        let code = self
             .runner
-            .run(&editor, &[&cfg_path.to_string_lossy()], &[])
+            .run_interactive(program, &args)
             .with_context(|| format!("launching editor `{editor}`"))?;
-        if !out.success() {
-            bail!("editor `{editor}` exited with status {}", out.status);
+        if code != 0 {
+            bail!("editor `{editor}` exited with status {code}");
         }
         Ok(())
     }
