@@ -169,21 +169,7 @@ pub fn current_target() -> &'static str {
     }
 }
 
-fn go_os() -> &'static str {
-    if cfg!(target_os = "macos") {
-        "darwin"
-    } else {
-        "linux"
-    }
-}
-
-fn go_arch() -> &'static str {
-    if cfg!(target_arch = "aarch64") {
-        "arm64"
-    } else {
-        "amd64"
-    }
-}
+use crate::platform::{goarch as go_arch, goos as go_os};
 
 /// A chosen go download: filename plus its published sha256 (for verification).
 #[derive(Debug, Clone, PartialEq, Eq)]

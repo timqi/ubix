@@ -127,6 +127,21 @@ pub struct ToolConfig {
     pub features: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub locked: Option<bool>,
+
+    // ---- http (templated URL + version discovery) ----
+    /// Alternate URL template used on Linux+musl (glibc uses the primary `url`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub url_musl: Option<String>,
+    /// Where to discover `{version}` when not pinned, e.g. `github:owner/repo`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub version_source: Option<String>,
+    /// Runtime-arch → URL-token overrides applied before `{arch}` substitution
+    /// (e.g. `amd64 = "x64"`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub arch_replace: Option<BTreeMap<String, String>>,
+    /// Runtime-os → URL-token overrides applied before `{os}` substitution.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub os_replace: Option<BTreeMap<String, String>>,
 }
 
 impl ToolConfig {
@@ -231,6 +246,30 @@ mod tests {
         let back: Config = toml::from_str(&text).unwrap();
         assert_eq!(cfg, back);
         assert_eq!(back.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn roundtrip_http_fields() {
+        let mut cfg = Config::default();
+        let mut claude = ToolConfig::from_spec(
+            "http:https://h/claude-code-releases/{version}/{os}-{arch}/claude",
+        );
+        claude.url_musl = Some("https://h/{version}/{os}-{arch}-musl/claude".into());
+        claude.version_source = Some("github:anthropics/claude-code".into());
+        claude.exe = Some("claude".into());
+        let mut am = BTreeMap::new();
+        am.insert("amd64".to_string(), "x64".to_string());
+        claude.arch_replace = Some(am);
+        cfg.tools.insert("claude".into(), claude);
+
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(cfg, back);
+        let c = &back.tools["claude"];
+        assert_eq!(c.version_source.as_deref(), Some("github:anthropics/claude-code"));
+        assert_eq!(c.arch_replace.as_ref().unwrap()["amd64"], "x64");
+        // Config validation accepts the http spec.
+        back.validate().unwrap();
     }
 
     #[test]

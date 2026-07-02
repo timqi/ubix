@@ -14,6 +14,7 @@ mod engine;
 mod http;
 mod outdated;
 mod paths;
+mod platform;
 mod remove;
 mod runner;
 mod sources;

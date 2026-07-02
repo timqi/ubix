@@ -85,22 +85,46 @@ pub fn install(
         Err(e) => return Err(e),
     }
 
-    let staging = tempfile::Builder::new()
-        .prefix("ubix-url-")
-        .tempdir()
-        .context("creating staging tempdir")?;
-    let extracted = archive::extract_all(url, &bytes, staging.path())?;
-
-    let final_name = tool
-        .rename
-        .clone()
-        .unwrap_or_else(|| default_name.to_string());
-    let selections = select_exes(
-        &extracted,
+    let install_paths = install_from_bytes(
+        url,
+        &bytes,
+        install_dir,
         tool.exe.as_deref(),
         tool.exes.as_deref(),
-        &final_name,
+        tool.rename.as_deref(),
+        default_name,
     )?;
+
+    Ok(InstallOutcome {
+        installed_version: "url".to_string(),
+        resolved_asset: Some(url.clone()),
+        install_paths,
+        // Record the content sha256 so a change to the URL's bytes is detectable.
+        sha256: Some(content_sha),
+    })
+}
+
+/// Shared download-payload installer used by the `url` and `http` sources:
+/// extract `bytes` (named by `name_hint`, e.g. the URL, for format detection),
+/// select the wanted exe/exes, chmod +x, and atomically install into
+/// `install_dir`. Returns the installed paths.
+pub fn install_from_bytes(
+    name_hint: &str,
+    bytes: &[u8],
+    install_dir: &Path,
+    exe: Option<&str>,
+    exes: Option<&[String]>,
+    rename: Option<&str>,
+    default_name: &str,
+) -> Result<Vec<PathBuf>> {
+    let staging = tempfile::Builder::new()
+        .prefix("ubix-dl-")
+        .tempdir()
+        .context("creating staging tempdir")?;
+    let extracted = archive::extract_all(name_hint, bytes, staging.path())?;
+
+    let final_name = rename.map(str::to_string).unwrap_or_else(|| default_name.to_string());
+    let selections = select_exes(&extracted, exe, exes, &final_name)?;
 
     std::fs::create_dir_all(install_dir)
         .with_context(|| format!("creating {}", install_dir.display()))?;
@@ -113,17 +137,10 @@ pub fn install(
         let _ = sha256_file(&dst)?;
         install_paths.push(dst);
     }
-
-    Ok(InstallOutcome {
-        installed_version: "url".to_string(),
-        resolved_asset: Some(url.clone()),
-        install_paths,
-        // Record the content sha256 so a change to the URL's bytes is detectable.
-        sha256: Some(content_sha),
-    })
+    Ok(install_paths)
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
     h.update(bytes);

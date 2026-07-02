@@ -12,6 +12,7 @@ use crate::paths::Paths;
 use crate::remove;
 use crate::runner::{CommandRunner, SystemRunner};
 use crate::sources::github::GithubSource;
+use crate::sources::http as http_source;
 use crate::sources::{cargo, gitlab, go, npm, parse_spec, url, uv, Source, SourceKind};
 use crate::state::{LockedState, ToolRecord};
 
@@ -34,6 +35,10 @@ pub struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+// `Add` carries the most flags (it's the richest subcommand); the size gap to
+// the other variants is expected for a clap args enum and boxing an `Args`
+// struct is not supported by the derive.
+#[allow(clippy::large_enum_variant)]
 pub enum Command {
     /// Add a tool (writes config and installs immediately). Spec syntax per PRD §4.2.
     Add(AddArgs),
@@ -80,6 +85,15 @@ pub struct AddArgs {
     /// Rename the installed executable.
     #[arg(long)]
     pub rename: Option<String>,
+    /// (http source) alternate URL template used on Linux+musl.
+    #[arg(long)]
+    pub url_musl: Option<String>,
+    /// (http source) where to discover the version, e.g. github:owner/repo.
+    #[arg(long)]
+    pub version_source: Option<String>,
+    /// (http source) runtime-arch → url-token override, repeatable, e.g. --arch-replace amd64=x64.
+    #[arg(long, value_name = "K=V")]
+    pub arch_replace: Vec<String>,
     /// Overwrite an existing tool of the same name (reinstall + replace config entry).
     #[arg(long)]
     pub force: bool,
@@ -176,6 +190,12 @@ impl App {
         tool.host = args.host;
         tool.version = args.version;
         tool.rename = args.rename;
+        // http-source fields.
+        tool.url_musl = args.url_musl;
+        tool.version_source = args.version_source;
+        if !args.arch_replace.is_empty() {
+            tool.arch_replace = Some(parse_kv_pairs(&args.arch_replace)?);
+        }
 
         let cfg_path = self.paths.config_file();
         let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
@@ -400,7 +420,14 @@ impl App {
                 .get(name)
                 .map(|r| r.installed_version.clone())
                 .unwrap_or_else(|| "(none)".into());
-            let latest = match outdated::latest_version(self.http.as_ref(), &parsed, tool.host.as_deref()) {
+            // http latest depends on the tool's `version_source` config, so it
+            // is routed to the http source; everything else uses the spec-only path.
+            let latest_res = if parsed.source == SourceKind::Http {
+                http_source::latest(tool, self.http.as_ref())
+            } else {
+                outdated::latest_version(self.http.as_ref(), &parsed, tool.host.as_deref())
+            };
+            let latest = match latest_res {
                 Ok(Latest::Version(v)) => v,
                 Ok(Latest::NotApplicable) => "n/a".to_string(),
                 Err(e) => format!("query-failed ({e})"),
@@ -568,6 +595,13 @@ impl App {
             SourceKind::Cargo => cargo::install(tool, self.runner.as_ref(), &install_dir)?,
             SourceKind::Go => go::install(tool, self.runner.as_ref(), &install_dir)?,
             SourceKind::Url => url::install(tool, self.http.as_ref(), &install_dir, name)?,
+            SourceKind::Http => http_source::install(
+                tool,
+                self.http.as_ref(),
+                self.runner.as_ref(),
+                &install_dir,
+                name,
+            )?,
         };
 
         // Record go/url modules for reference.
@@ -647,6 +681,21 @@ fn format_list(rows: &[(String, String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// Parse repeatable `k=v` CLI values into a map (used for `--arch-replace`).
+fn parse_kv_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut map = std::collections::BTreeMap::new();
+    for p in pairs {
+        let (k, v) = p
+            .split_once('=')
+            .with_context(|| format!("expected `key=value`, got `{p}`"))?;
+        if k.is_empty() {
+            bail!("empty key in `{p}`");
+        }
+        map.insert(k.to_string(), v.to_string());
+    }
+    Ok(map)
+}
+
 /// Derive a tool name from a locator: last path segment, stripped of `@version`.
 pub fn derive_name(locator: &str) -> String {
     let base = locator.rsplit('/').next().unwrap_or(locator);
@@ -668,6 +717,42 @@ fn path_contains(dir: &std::path::Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_kv_pairs_ok_and_errors() {
+        let m = parse_kv_pairs(&["amd64=x64".to_string(), "arm64=arm64".to_string()]).unwrap();
+        assert_eq!(m["amd64"], "x64");
+        assert_eq!(m["arm64"], "arm64");
+        assert!(parse_kv_pairs(&["novalue".to_string()]).is_err());
+        assert!(parse_kv_pairs(&["=x".to_string()]).is_err());
+    }
+
+    #[test]
+    fn cli_parses_http_add_flags() {
+        let cli = Cli::try_parse_from([
+            "ubix",
+            "add",
+            "http:https://h/{version}/{os}-{arch}/claude",
+            "--version-source",
+            "github:anthropics/claude-code",
+            "--url-musl",
+            "https://h/{version}/{os}-{arch}-musl/claude",
+            "--arch-replace",
+            "amd64=x64",
+            "--exe",
+            "claude",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Add(a) => {
+                assert_eq!(a.version_source.as_deref(), Some("github:anthropics/claude-code"));
+                assert!(a.url_musl.is_some());
+                assert_eq!(a.arch_replace, vec!["amd64=x64".to_string()]);
+                assert_eq!(a.exe.as_deref(), Some("claude"));
+            }
+            _ => panic!("expected add"),
+        }
+    }
 
     #[test]
     fn derive_name_owner_repo() {

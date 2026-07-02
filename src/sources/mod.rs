@@ -4,6 +4,7 @@ pub mod cargo;
 pub mod github;
 pub mod gitlab;
 pub mod go;
+pub mod http;
 pub mod npm;
 pub mod url;
 pub mod uv;
@@ -17,12 +18,13 @@ use crate::config::ToolConfig;
 use crate::runner::CommandRunner;
 use crate::state::ToolRecord;
 
-/// The seven recognized source kinds (§4.2).
+/// The recognized source kinds (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceKind {
     Github,
     Gitlab,
     Url,
+    Http,
     Pypi,
     Npm,
     Cargo,
@@ -36,6 +38,7 @@ impl SourceKind {
             SourceKind::Github => "github",
             SourceKind::Gitlab => "gitlab",
             SourceKind::Url => "url",
+            SourceKind::Http => "http",
             SourceKind::Pypi => "pypi",
             SourceKind::Npm => "npm",
             SourceKind::Cargo => "cargo",
@@ -53,11 +56,12 @@ impl FromStr for SourceKind {
             "github" => SourceKind::Github,
             "gitlab" => SourceKind::Gitlab,
             "url" => SourceKind::Url,
+            "http" => SourceKind::Http,
             "pypi" => SourceKind::Pypi,
             "npm" => SourceKind::Npm,
             "cargo" => SourceKind::Cargo,
             "go" => SourceKind::Go,
-            other => bail!("unknown source prefix `{other}:` (expected one of github/gitlab/url/pypi/npm/cargo/go)"),
+            other => bail!("unknown source prefix `{other}:` (expected one of github/gitlab/url/http/pypi/npm/cargo/go)"),
         })
     }
 }
@@ -147,6 +151,12 @@ fn validate_locator(kind: SourceKind, locator: &str) -> Result<()> {
                 bail!("url locator `{locator}` must be an http(s) URL");
             }
         }
+        SourceKind::Http => {
+            // locator is a URL TEMPLATE (may contain {version}/{os}/{arch}).
+            if !(locator.starts_with("http://") || locator.starts_with("https://")) {
+                bail!("http locator `{locator}` must be an http(s) URL template");
+            }
+        }
         SourceKind::Pypi | SourceKind::Npm | SourceKind::Cargo => {
             if locator.contains(char::is_whitespace) {
                 bail!("{kind} package name `{locator}` must not contain whitespace");
@@ -203,13 +213,14 @@ mod tests {
     }
 
     #[test]
-    fn all_seven_prefixes() {
+    fn all_prefixes() {
         assert_eq!(p("github:eza-community/eza").source, SourceKind::Github);
         assert_eq!(p("gitlab:group/repo").source, SourceKind::Gitlab);
         assert_eq!(
             p("url:https://example.com/x-linux-x86_64.tar.gz").source,
             SourceKind::Url
         );
+        assert_eq!(p("http:https://h/{version}/bin").source, SourceKind::Http);
         assert_eq!(p("pypi:ruff").source, SourceKind::Pypi);
         assert_eq!(p("npm:pnpm").source, SourceKind::Npm);
         assert_eq!(p("cargo:somecli").source, SourceKind::Cargo);
@@ -221,6 +232,18 @@ mod tests {
         let parsed = p("url:https://example.com:8443/x.tar.gz");
         assert_eq!(parsed.source, SourceKind::Url);
         assert_eq!(parsed.locator, "https://example.com:8443/x.tar.gz");
+    }
+
+    #[test]
+    fn http_prefix_holds_url_template() {
+        let parsed = p("http:https://h/{version}/{os}-{arch}/claude");
+        assert_eq!(parsed.source, SourceKind::Http);
+        assert_eq!(parsed.locator, "https://h/{version}/{os}-{arch}/claude");
+    }
+
+    #[test]
+    fn http_locator_requires_scheme() {
+        assert!(parse_spec("http:h/{version}/claude", SourceKind::Github).is_err());
     }
 
     #[test]
@@ -275,6 +298,7 @@ mod tests {
             SourceKind::Github,
             SourceKind::Gitlab,
             SourceKind::Url,
+            SourceKind::Http,
             SourceKind::Pypi,
             SourceKind::Npm,
             SourceKind::Cargo,
