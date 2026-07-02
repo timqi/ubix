@@ -215,8 +215,13 @@ pub fn install(
     })
 }
 
-/// Latest version for `outdated` (§7.1): query `version_source` if set, else n/a.
+/// Latest version for `outdated` (§7.1). A `version`/`tag` pin is the latest by
+/// definition (mirrors [`resolve_version`]'s priority) so pinned tools never show
+/// as perpetually outdated; otherwise query `version_source`, else n/a.
 pub fn latest(tool: &ToolConfig, http: &dyn HttpClient) -> Result<Latest> {
+    if let Some(pin) = tool.tag.as_deref().or(tool.version.as_deref()) {
+        return Ok(Latest::Version(strip_leading_v(pin).to_string()));
+    }
     match tool.version_source.as_deref() {
         Some(vs) => Ok(Latest::Version(strip_leading_v(&query_version_source(vs, http)?).to_string())),
         None => Ok(Latest::NotApplicable),
@@ -399,5 +404,17 @@ mod tests {
             r#"{"tag_name":"v9.9.9"}"#,
         );
         assert_eq!(latest(&tool, &http2).unwrap(), Latest::Version("9.9.9".into()));
+    }
+
+    #[test]
+    fn latest_honors_pin_over_version_source() {
+        // A pin makes `latest` == the pin (v-stripped) so a pinned tool never
+        // shows as perpetually outdated even when version_source has advanced.
+        let mut tool = ToolConfig::from_spec("template:https://h/{version}/bin");
+        tool.version = Some("v1.2.3".into());
+        tool.version_source = Some("github:anthropics/claude-code".into());
+        // No HTTP canned: the pin path must not query version_source.
+        let http = MockHttp::new();
+        assert_eq!(latest(&tool, &http).unwrap(), Latest::Version("1.2.3".into()));
     }
 }

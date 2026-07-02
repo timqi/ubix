@@ -260,18 +260,28 @@ pub fn matching_needed(assets: &[String], goos: &str, goarch: &str, aqua_matchin
     false
 }
 
-/// Return the matching map keeping only the platforms that still need matching.
-/// Keys not needing matching are dropped; a fully-redundant map returns empty.
+/// Return the matching map with redundant platforms neutralized to `""` (the
+/// "supported, no filter → let ubi decide" sentinel that [`PlatformString::resolve`]
+/// understands). Keys are NEVER dropped: dropping a key would make
+/// `PlatformString::resolve` error on that platform ("no matching entry"), which
+/// would break install on exactly the platforms pruning deemed safe. A
+/// fully-redundant map therefore has every value `""` — the caller collapses
+/// that to `matching = None`.
+///
+/// [`PlatformString::resolve`]: crate::config::PlatformString::resolve
 pub fn prune_matching(
     map: &BTreeMap<String, String>,
     assets: &[String],
 ) -> BTreeMap<String, String> {
     map.iter()
-        .filter(|(key, val)| {
+        .map(|(key, val)| {
             let (goos, goarch) = key.split_once('-').unwrap_or((key.as_str(), ""));
-            matching_needed(assets, goos, goarch, val)
+            if matching_needed(assets, goos, goarch, val) {
+                (key.clone(), val.clone())
+            } else {
+                (key.clone(), String::new()) // redundant → "no filter" sentinel
+            }
         })
-        .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
 }
 
@@ -367,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn prune_matching_drops_all_when_redundant() {
+    fn prune_matching_neutralizes_all_when_redundant() {
         let assets = v(&[
             "codex-x86_64-unknown-linux-musl.zst",
             "codex-aarch64-unknown-linux-musl.zst",
@@ -377,7 +387,28 @@ mod tests {
         let mut map = BTreeMap::new();
         map.insert("linux-amd64".into(), "codex-x86_64-unknown-linux-musl.zst".into());
         map.insert("darwin-arm64".into(), "codex-aarch64-apple-darwin.zst".into());
-        assert!(prune_matching(&map, &assets).is_empty());
+        let pruned = prune_matching(&map, &assets);
+        // Keys are kept (never dropped) but all values become the "" no-filter
+        // sentinel; the caller collapses this to `matching = None`.
+        assert_eq!(pruned.len(), 2);
+        assert!(pruned.values().all(String::is_empty));
+    }
+
+    #[test]
+    fn prune_matching_keeps_key_of_needed_platform() {
+        // A tool that ships ONLY a linux asset: darwin has no viable pick, so its
+        // matching is redundant (hopeless anyway) → "", while linux is fine → "".
+        // The key point: neither key is dropped, so resolve() never errors.
+        let assets = v(&[
+            "tool-x86_64-unknown-linux-gnu.tar.gz",
+            "tool-aarch64-unknown-linux-gnu.tar.gz",
+        ]);
+        let mut map = BTreeMap::new();
+        map.insert("linux-amd64".into(), "-x86_64-unknown-linux-gnu.tar.gz".into());
+        map.insert("darwin-arm64".into(), "-aarch64-apple-darwin.tar.gz".into());
+        let pruned = prune_matching(&map, &assets);
+        assert_eq!(pruned.len(), 2, "keys must be preserved, never dropped");
+        assert!(pruned.contains_key("darwin-arm64"));
     }
 
     #[test]

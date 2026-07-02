@@ -95,6 +95,10 @@ pub struct VersionOverride {
     pub supported_envs: Option<Vec<String>>,
     #[serde(default)]
     pub version_prefix: Option<String>,
+    /// `no_asset: true` → this whole version branch has no downloadable asset
+    /// (source-only / unavailable), so it must not inherit the base asset.
+    #[serde(default)]
+    pub no_asset: bool,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
     #[serde(default)]

@@ -86,18 +86,13 @@ impl ReleaseEngine for UbiEngine {
         // into staging; select the whitelisted names and atomically install each.
         if !req.exes.is_empty() {
             let extracted = crate::archive::collect_files(&staging_dir)?;
+            // First pass: resolve+validate EVERY requested entry before touching
+            // install_dir, so a missing/empty/duplicate entry can't leave a
+            // partially-installed set behind (§8.7 atomicity).
+            let planned = plan_exe_installs(&extracted, &req.exes, &req.install_dir)?;
+            // Second pass: publish all validated entries.
             let mut install_paths = Vec::new();
-            for want in &req.exes {
-                let src = extracted
-                    .iter()
-                    .find(|p| p.file_name().map(|f| f == want.as_str()).unwrap_or(false))
-                    .with_context(|| {
-                        format!("`exes` entry `{want}` not found in extracted archive")
-                    })?;
-                if std::fs::metadata(src).map(|m| m.len()).unwrap_or(0) == 0 {
-                    bail!("staged executable {} is empty", src.display());
-                }
-                let dst = req.install_dir.join(want);
+            for (src, dst) in planned {
                 atomic_install(src, &dst)?;
                 install_paths.push(dst);
             }
@@ -131,6 +126,33 @@ impl ReleaseEngine for UbiEngine {
             version: req.tag.clone(),
         })
     }
+}
+
+/// Resolve every `exes` entry against the `extracted` staging files, validating
+/// that each is present, non-empty, and unique. Returns `(src, dst)` pairs to
+/// install. Fails BEFORE any install if any entry is bad, so a partial multi-exe
+/// install is never published (§8.7 atomicity).
+fn plan_exe_installs<'a>(
+    extracted: &'a [PathBuf],
+    exes: &[String],
+    install_dir: &Path,
+) -> Result<Vec<(&'a PathBuf, PathBuf)>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut planned = Vec::new();
+    for want in exes {
+        if !seen.insert(want.as_str()) {
+            bail!("duplicate `exes` entry `{want}`");
+        }
+        let src = extracted
+            .iter()
+            .find(|p| p.file_name().map(|f| f == want.as_str()).unwrap_or(false))
+            .with_context(|| format!("`exes` entry `{want}` not found in extracted archive"))?;
+        if std::fs::metadata(src).map(|m| m.len()).unwrap_or(0) == 0 {
+            bail!("staged executable {} is empty", src.display());
+        }
+        planned.push((src, install_dir.join(want)));
+    }
+    Ok(planned)
 }
 
 /// Build and drive ubi on a minimal current-thread tokio runtime, installing
@@ -265,11 +287,11 @@ pub fn atomic_install(src: &Path, dst: &Path) -> Result<()> {
         .tempfile_in(dst_dir)
         .with_context(|| format!("creating temp in {}", dst_dir.display()))?;
     {
-        use std::io::Write;
-        let bytes = std::fs::read(src).with_context(|| format!("reading {}", src.display()))?;
-        tmp.write_all(&bytes)
+        let mut src_file =
+            std::fs::File::open(src).with_context(|| format!("reading {}", src.display()))?;
+        // Stream the copy instead of buffering the whole binary in memory.
+        std::io::copy(&mut src_file, tmp.as_file_mut())
             .with_context(|| format!("writing temp in {}", dst_dir.display()))?;
-        tmp.flush().ok();
     }
     #[cfg(unix)]
     {
@@ -279,11 +301,11 @@ pub fn atomic_install(src: &Path, dst: &Path) -> Result<()> {
         perms.set_mode(0o755);
         f.set_permissions(perms)?;
     }
-    let tmp_path = tmp.into_temp_path();
-    std::fs::rename(&tmp_path, dst)
+    // `persist` renames the temp file over `dst` and hands back ownership on
+    // failure; it avoids the manual `mem::forget` the raw rename would need.
+    tmp.into_temp_path()
+        .persist(dst)
         .with_context(|| format!("atomic rename into {}", dst.display()))?;
-    // rename consumed the temp path; prevent TempPath drop from unlinking.
-    std::mem::forget(tmp_path);
     Ok(())
 }
 
@@ -356,6 +378,32 @@ mod tests {
         };
         let found = locate_staged_exe(staging.path(), &req).unwrap();
         assert!(found.file_name().unwrap().to_string_lossy().contains("weird-name"));
+    }
+
+    #[test]
+    fn plan_exe_installs_validates_before_installing() {
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::write(staging.path().join("uv"), b"bin").unwrap();
+        std::fs::write(staging.path().join("empty"), b"").unwrap();
+        let extracted = vec![staging.path().join("uv"), staging.path().join("empty")];
+        let install_dir = std::path::Path::new("/tmp/bin");
+
+        // All present + non-empty → planned pairs.
+        let ok = plan_exe_installs(&extracted, &["uv".into()], install_dir).unwrap();
+        assert_eq!(ok, vec![(&extracted[0], install_dir.join("uv"))]);
+
+        // A missing entry fails the WHOLE plan (no partial install).
+        let err = plan_exe_installs(&extracted, &["uv".into(), "uvx".into()], install_dir)
+            .unwrap_err();
+        assert!(err.to_string().contains("uvx"), "{err}");
+
+        // An empty staged file is rejected.
+        assert!(plan_exe_installs(&extracted, &["empty".into()], install_dir).is_err());
+
+        // Duplicate entries are rejected.
+        let err = plan_exe_installs(&extracted, &["uv".into(), "uv".into()], install_dir)
+            .unwrap_err();
+        assert!(err.to_string().contains("duplicate"), "{err}");
     }
 
     #[test]

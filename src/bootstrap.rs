@@ -127,8 +127,17 @@ fn bootstrap_rust(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
     Ok(())
 }
 
+/// The go executable's file name for the running platform (`go.exe` on Windows).
+fn go_exe_name() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "go.exe"
+    } else {
+        "go"
+    }
+}
+
 fn bootstrap_go(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
-    if ctx.go_root.join("bin").join("go").exists() && !reinstall {
+    if ctx.go_root.join("bin").join(go_exe_name()).exists() && !reinstall {
         println!("go already installed at {} (use --reinstall to force)", ctx.go_root.display());
         return Ok(());
     }
@@ -150,19 +159,33 @@ fn bootstrap_go(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
             .with_context(|| format!("verifying {filename} against go.dev published sha256"))?;
     }
 
-    // The tarball contains a top-level `go/` dir; extract into go_root's parent
-    // so `<go_root>` becomes the extracted `go/`.
+    // The tarball contains a top-level `go/` dir. Extract into a staging dir on
+    // the SAME filesystem as go_root, then move the extracted `go/` to EXACTLY
+    // `ctx.go_root` — so a custom go_root whose basename isn't `go` still lands
+    // in the right place (a plain "extract into parent" would create `<parent>/go`).
     let parent = ctx
         .go_root
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     std::fs::create_dir_all(&parent).with_context(|| format!("creating {}", parent.display()))?;
-    // Remove an existing GOROOT on reinstall to avoid mixing versions.
-    if reinstall && ctx.go_root.exists() {
-        std::fs::remove_dir_all(&ctx.go_root).ok();
+    let staging = tempfile::Builder::new()
+        .prefix(".ubix-go-")
+        .tempdir_in(&parent)
+        .with_context(|| format!("creating go staging dir in {}", parent.display()))?;
+    archive::extract_into(&filename, &bytes, staging.path())?;
+    let extracted = staging.path().join("go");
+    if !extracted.join("bin").join(go_exe_name()).exists() {
+        bail!("go tarball did not contain the expected `go/bin/` layout");
     }
-    archive::extract_all(&filename, &bytes, &parent)?;
+    // Replace any existing GOROOT (stale/partial dir, or --reinstall) — propagate
+    // a removal failure rather than extracting into a mixed-version directory.
+    if ctx.go_root.exists() {
+        std::fs::remove_dir_all(&ctx.go_root)
+            .with_context(|| format!("removing existing {}", ctx.go_root.display()))?;
+    }
+    std::fs::rename(&extracted, &ctx.go_root)
+        .with_context(|| format!("moving extracted go into {}", ctx.go_root.display()))?;
     println!(
         "bootstrapped go into {} (add {}/bin to PATH)",
         ctx.go_root.display(),
@@ -368,6 +391,36 @@ mod tests {
         };
         bootstrap(BootstrapTarget::Go, false, &ctx).unwrap();
         assert!(go_root.join("bin").join("go").is_file());
+    }
+
+    #[test]
+    fn go_bootstrap_honors_custom_go_root_basename() {
+        // A go_root whose basename is NOT `go` must still receive the toolchain.
+        let gz = fake_go_tarball();
+        let sha = crate::engine::sha256_bytes(&gz);
+        let os = go_os();
+        let arch = go_arch();
+        let fname = format!("go1.99.0.{os}-{arch}.tar.gz");
+        let index = format!(
+            r#"[{{"version":"go1.99.0","stable":true,"files":[
+                {{"filename":"{fname}","os":"{os}","arch":"{arch}","kind":"archive","sha256":"{sha}"}}]}}]"#
+        );
+        let http = MockHttp::new()
+            .with_text("https://go.dev/dl/?mode=json", &index)
+            .with_bytes(&format!("https://go.dev/dl/{fname}"), gz);
+
+        let base = tempfile::tempdir().unwrap();
+        let go_root = base.path().join("golang-1.99"); // basename != "go"
+        let runner = MockRunner::new();
+        let ctx = BootstrapCtx {
+            runner: &runner,
+            http: &http,
+            go_root: go_root.clone(),
+        };
+        bootstrap(BootstrapTarget::Go, false, &ctx).unwrap();
+        assert!(go_root.join("bin").join("go").is_file());
+        // No stray `<parent>/go` left behind.
+        assert!(!base.path().join("go").exists());
     }
 
     #[test]

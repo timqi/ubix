@@ -73,7 +73,7 @@ impl Default for Settings {
 
 impl Settings {
     /// Resolve `install_dir` to an absolute path with `~`/`$XDG` expansion.
-    pub fn install_dir_path(&self) -> Result<PathBuf> {
+    pub fn install_dir_path(&self) -> PathBuf {
         paths::expand(&self.install_dir)
     }
 

@@ -66,7 +66,11 @@ pub fn update(http: &dyn HttpClient) -> Result<(PathBuf, usize)> {
         .context("fetching aqua root registry index")?;
     let path = root_cache_path();
     paths::ensure_parent_dir(&path)?;
-    std::fs::write(&path, &body).with_context(|| format!("writing {}", path.display()))?;
+    // Write to a temp sibling then rename, so a partial/failed write never
+    // truncates the existing cache (which serves as the offline fallback).
+    let tmp = path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
     Ok((path, body.len()))
 }
 

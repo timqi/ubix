@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::archive;
 use crate::config::ToolConfig;
-use crate::engine::{atomic_install, sha256_file};
+use crate::engine::atomic_install;
 use crate::http::HttpClient;
 use crate::sources::{parse_spec, InstallOutcome, SourceKind};
 
@@ -118,14 +118,28 @@ pub fn install_from_bytes(
     rename: Option<&str>,
     default_name: &str,
 ) -> Result<Vec<PathBuf>> {
+    // `rename` renames the single installed exe; it is meaningless with the
+    // multi-entry `exes` (which entry would it rename?), so reject that combo.
+    if rename.is_some() && exes.is_some_and(|e| !e.is_empty()) {
+        bail!("`rename` and `exes` cannot be combined (rename applies to a single exe only)");
+    }
+
     let staging = tempfile::Builder::new()
         .prefix("ubix-dl-")
         .tempdir()
         .context("creating staging tempdir")?;
     let extracted = archive::extract_all(name_hint, bytes, staging.path())?;
 
-    let final_name = rename.map(str::to_string).unwrap_or_else(|| default_name.to_string());
-    let selections = select_exes(&extracted, exe, exes, &final_name)?;
+    // Select by `exe`/default name (NOT by `rename`), then apply `rename` to the
+    // single-exe destination. Selecting by `rename` would look for an archive
+    // entry that does not exist and, worse, install `exe`-selected files under
+    // their original name (ignoring `rename` entirely).
+    let mut selections = select_exes(&extracted, exe, exes, default_name)?;
+    if let Some(new_name) = rename {
+        if let Some(first) = selections.first_mut() {
+            first.1 = new_name.to_string();
+        }
+    }
 
     std::fs::create_dir_all(install_dir)
         .with_context(|| format!("creating {}", install_dir.display()))?;
@@ -134,8 +148,6 @@ pub fn install_from_bytes(
         archive::make_executable(src)?;
         let dst = install_dir.join(&name);
         atomic_install(src, &dst)?;
-        // sha256 of the installed file (used for info/verification).
-        let _ = sha256_file(&dst)?;
         install_paths.push(dst);
     }
     Ok(install_paths)
@@ -282,6 +294,56 @@ mod tests {
         let tool = ToolConfig::from_spec(format!("url:{url}"));
         let err = install(&tool, &http, dir.path(), "rawtool").unwrap_err();
         assert!(err.to_string().contains("verifying"), "{err}");
+    }
+
+    #[test]
+    fn install_applies_rename_to_selected_exe() {
+        use crate::http::MockHttp;
+        // Archive contains a binary named "tool"; exe selects it, rename sets the
+        // installed name to "mytool" (previously rename was ignored for exe).
+        let mut tar_bytes = Vec::new();
+        {
+            let mut b = tar::Builder::new(&mut tar_bytes);
+            let data = b"payload";
+            let mut h = tar::Header::new_gnu();
+            h.set_path("tool").unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o755);
+            h.set_cksum();
+            b.append(&h, &data[..]).unwrap();
+            b.finish().unwrap();
+        }
+        let mut gz = Vec::new();
+        {
+            let mut e = flate2::write::GzEncoder::new(&mut gz, flate2::Compression::default());
+            e.write_all(&tar_bytes).unwrap();
+            e.finish().unwrap();
+        }
+        let url = "https://example.com/pkg.tar.gz";
+        let http = MockHttp::new().with_bytes(url, gz);
+        let dir = tempfile::tempdir().unwrap();
+        let mut tool = ToolConfig::from_spec(format!("url:{url}"));
+        tool.exe = Some("tool".into());
+        tool.rename = Some("mytool".into());
+        let out = install(&tool, &http, dir.path(), "default").unwrap();
+        assert_eq!(out.install_paths, vec![dir.path().join("mytool")]);
+        assert!(dir.path().join("mytool").is_file());
+    }
+
+    #[test]
+    fn install_from_bytes_rejects_rename_with_exes() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = install_from_bytes(
+            "x.tar.gz",
+            b"not-used-before-guard",
+            dir.path(),
+            None,
+            Some(&["a".to_string(), "b".to_string()]),
+            Some("nope"),
+            "default",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
     }
 
     #[test]

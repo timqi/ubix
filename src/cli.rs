@@ -121,6 +121,9 @@ pub struct AddArgs {
     /// (template source) runtime-arch → url-token override, repeatable, e.g. --arch-replace amd64=x64.
     #[arg(long, value_name = "K=V")]
     pub arch_replace: Vec<String>,
+    /// (template source) runtime-os → url-token override, repeatable, e.g. --os-replace darwin=macOS.
+    #[arg(long, value_name = "K=V")]
+    pub os_replace: Vec<String>,
     /// Overwrite an existing tool of the same name (reinstall + replace config entry).
     #[arg(long)]
     pub force: bool,
@@ -232,6 +235,31 @@ impl App {
         // package into a synthesized `github:` ToolConfig, then take the normal
         // add flow. `aqua:` never reaches parse_spec/SourceKind.
         if let Some(rest) = args.spec.strip_prefix("aqua:") {
+            // aqua synthesizes matching/exe/rename/version-source/etc. FROM the
+            // registry, so per-tool shaping flags would be silently dropped.
+            // Reject them explicitly (only --name/--force/--wait apply here).
+            let ignored: [(&str, bool); 11] = [
+                ("--matching", args.matching.is_some()),
+                ("--exe", args.exe.is_some()),
+                ("--exes", args.exes.is_some()),
+                ("--tag", args.tag.is_some()),
+                ("--host", args.host.is_some()),
+                ("--version", args.version.is_some()),
+                ("--rename", args.rename.is_some()),
+                ("--url-musl", args.url_musl.is_some()),
+                ("--version-source", args.version_source.is_some()),
+                ("--arch-replace", !args.arch_replace.is_empty()),
+                ("--os-replace", !args.os_replace.is_empty()),
+            ];
+            let set: Vec<&str> = ignored.iter().filter(|(_, s)| *s).map(|(f, _)| *f).collect();
+            if !set.is_empty() {
+                bail!(
+                    "`aqua:` synthesizes tool settings from the registry; \
+                     these flags are not supported with it: {}. \
+                     Add without them, then `ubix edit` to customize.",
+                    set.join(", ")
+                );
+            }
             let (owner, repo) = split_owner_repo(rest.trim())?;
             step!("resolving aqua:{owner}/{repo}");
             let (name, tool) =
@@ -252,6 +280,9 @@ impl App {
         tool.version_source = args.version_source;
         if !args.arch_replace.is_empty() {
             tool.arch_replace = Some(parse_kv_pairs(&args.arch_replace)?);
+        }
+        if !args.os_replace.is_empty() {
+            tool.os_replace = Some(parse_kv_pairs(&args.os_replace)?);
         }
 
         let default_source = Config::load_or_default(&self.paths.config_file())?
@@ -327,6 +358,11 @@ impl App {
 
     // ---- upgrade (unified converge / upgrade / report / prune) ----
     fn cmd_upgrade(&self, args: UpgradeArgs) -> Result<()> {
+        // `--all` and explicit names are mutually exclusive; accepting both would
+        // silently narrow `--all` to the named subset.
+        if args.all && !args.names.is_empty() {
+            bail!("`--all` cannot be combined with tool names; pass one or the other");
+        }
         let cfg = Config::load_or_default(&self.paths.config_file())?;
 
         // 1) Select the scope (declared to act on + orphans in scope). Preserves
@@ -343,7 +379,7 @@ impl App {
         } else {
             Some(LockedState::acquire(&self.paths.state_file(), args.wait)?)
         };
-        let ro_state = if dry_run {
+        let mut ro_state = if dry_run {
             Some(read_state_no_lock(&self.paths.state_file())?)
         } else {
             None
@@ -369,16 +405,34 @@ impl App {
 
         // 2) LTS-jump detection (§5.4): if the live fnm default differs from the
         //    recorded one, npm tools in scope must be reinstalled on the new node.
-        let recorded_node = state!().runtime.node_default.clone();
-        let live_node = npm::current_default_node(self.runner.as_ref());
-        let lts_jumped = npm::lts_jump(recorded_node.as_deref(), live_node.as_deref());
-        if lts_jumped && live_node.is_some() {
-            println!(
-                "node default changed {} -> {} (npm tools will be reinstalled)",
-                recorded_node.as_deref().unwrap_or("none"),
-                live_node.as_deref().unwrap_or("?")
-            );
-        }
+        //    Only probe fnm (and print the notice) when the scope actually holds
+        //    an npm tool — otherwise it's a pointless subprocess + misleading msg.
+        let scope_has_npm = selection.declared.iter().any(|n| {
+            cfg.tools
+                .get(n)
+                .and_then(|t| cfg.parsed_spec(t).ok())
+                .map(|p| p.source == SourceKind::Npm)
+                .unwrap_or(false)
+        }) || selection
+            .orphans
+            .iter()
+            .any(|n| state!().tool(n).map(|r| r.source == "npm").unwrap_or(false));
+
+        let (live_node, lts_jumped) = if scope_has_npm {
+            let recorded_node = state!().runtime.node_default.clone();
+            let live_node = npm::current_default_node(self.runner.as_ref());
+            let lts_jumped = npm::lts_jump(recorded_node.as_deref(), live_node.as_deref());
+            if lts_jumped && live_node.is_some() {
+                println!(
+                    "node default changed {} -> {} (npm tools will be reinstalled)",
+                    recorded_node.as_deref().unwrap_or("none"),
+                    live_node.as_deref().unwrap_or("?")
+                );
+            }
+            (live_node, lts_jumped)
+        } else {
+            (None, false)
+        };
 
         // 3) Backfill the real version for records stuck on the `latest` sentinel,
         //    by running the installed binary's `--version` (no reinstall, no
@@ -403,6 +457,14 @@ impl App {
             }
             if dry_run {
                 println!("would backfill `{name}` version: {ver}");
+                // Reflect the backfill in the in-memory state so the action
+                // decision below matches what a real run would decide (a real
+                // run backfills first, which can turn an "upgrade" into a "skip").
+                if let Some(s) = ro_state.as_mut() {
+                    if let Some(rec) = s.tools.get_mut(name) {
+                        rec.installed_version = ver.clone();
+                    }
+                }
                 continue;
             }
             if let Some(locked) = locked_opt.as_mut() {
@@ -483,8 +545,14 @@ impl App {
                         Some(_) => step!("upgrading `{name}`"),
                         None => step!("installing `{name}`"),
                     }
-                    // Route pypi through uv::upgrade (in-place); others reinstall.
-                    let record = self.upgrade_tool(&cfg, name, tool)?;
+                    // A missing tool is a fresh INSTALL (e.g. `uv tool install`),
+                    // not an upgrade — routing it through upgrade_tool would run
+                    // `uv tool upgrade` on a not-yet-installed package and fail.
+                    let record = if is_install {
+                        self.install_tool(&cfg, name, tool)?
+                    } else {
+                        self.upgrade_tool(&cfg, name, tool)?
+                    };
                     if let Some(locked) = locked_opt.as_mut() {
                         locked.state.tools.insert(name.clone(), record);
                         locked.save()?;
@@ -500,7 +568,7 @@ impl App {
         //    upgrade reinstalls just the named npm tools, not every npm tool, so
         //    leaving `node_default` unchanged lets a later `upgrade --all` still
         //    detect the LTS jump and reinstall the rest.
-        if args.all && !dry_run {
+        if args.all && !dry_run && scope_has_npm {
             if let (Some(live), Some(locked)) = (live_node, locked_opt.as_mut()) {
                 if locked.state.runtime.node_default.as_deref() != Some(live.as_str()) {
                     locked.state.runtime.node_default = Some(live);
@@ -555,9 +623,14 @@ impl App {
             return Ok(UpgradeAction::Upgrade { latest: Some(tag.clone()) });
         }
 
-        // Pinned version (pypi/cargo): converge to the version; skip once matched.
+        // Pinned version (pypi/cargo/npm): converge to the version; skip once
+        // matched. npm honors `tool.version` at install, so a pin must converge
+        // like pypi/cargo — otherwise it reinstalls against registry latest every run.
         if let Some(ver) = &tool.version {
-            if matches!(parsed.source, SourceKind::Pypi | SourceKind::Cargo) {
+            if matches!(
+                parsed.source,
+                SourceKind::Pypi | SourceKind::Cargo | SourceKind::Npm
+            ) {
                 if same_version(&rec.installed_version, ver) {
                     return Ok(UpgradeAction::Skip {
                         reason: format!("pinned to version `{ver}` (use --force)"),
@@ -720,7 +793,7 @@ impl App {
     // ---- doctor (§8.9) ----
     fn cmd_doctor(&self) -> Result<()> {
         let cfg = Config::load_or_default(&self.paths.config_file())?;
-        let install_dir = cfg.settings.install_dir_path()?;
+        let install_dir = cfg.settings.install_dir_path();
         detail!("verbosity = {:?}", self.verbosity);
         println!("ubix doctor");
         println!("  config: {}", self.paths.config_file().display());
@@ -731,7 +804,7 @@ impl App {
         let mut segments: Vec<std::path::PathBuf> = vec![
             install_dir.clone(),
             home.join(".cargo").join("bin"),
-            crate::paths::expand(&cfg.settings.go_root)?.join("bin"),
+            crate::paths::expand(&cfg.settings.go_root).join("bin"),
         ];
         if let Some(base) = npm::detect_fnm_base(self.runner.as_ref()) {
             segments.push(npm::alias_bin_dir(&base));
@@ -767,7 +840,7 @@ impl App {
                 let ctx = bootstrap::BootstrapCtx {
                     runner: self.runner.as_ref(),
                     http: self.http.as_ref(),
-                    go_root: crate::paths::expand(&cfg.settings.go_root)?,
+                    go_root: crate::paths::expand(&cfg.settings.go_root),
                 };
                 bootstrap::bootstrap(target, args.reinstall, &ctx)
             }
@@ -788,7 +861,7 @@ impl App {
         let cfg_path = self.paths.config_file();
         let mut locked = LockedState::acquire(&self.paths.state_file(), false)?;
         let mut cfg = Config::load_or_default(&cfg_path)?;
-        let install_dir = cfg.settings.install_dir_path()?;
+        let install_dir = cfg.settings.install_dir_path();
 
         let present = cfg.tools.contains_key(name) && self.runner.which(name);
         if present && !reinstall {
@@ -867,7 +940,14 @@ impl App {
             println!("# no matching needed: ubi selects the asset for {goos}-{goarch} automatically");
         } else {
             match crate::aqua::current_platform_matching(&tool) {
-                Some(m) => println!("# on {goos}-{goarch}: matches asset containing `{m}`"),
+                // Non-empty filter → show it.
+                Some(m) if !m.is_empty() => {
+                    println!("# on {goos}-{goarch}: matches asset containing `{m}`")
+                }
+                // Present but pruned to "" (supported, ubi auto-selects here).
+                Some(_) => println!(
+                    "# no matching needed: ubi selects the asset for {goos}-{goarch} automatically"
+                ),
                 None => println!(
                     "# note: {goos}-{goarch} is not among the supported platforms for this package"
                 ),
@@ -926,7 +1006,7 @@ impl App {
     fn upgrade_tool(&self, cfg: &Config, name: &str, tool: &ToolConfig) -> Result<ToolRecord> {
         let parsed = cfg.parsed_spec(tool)?;
         if parsed.source == SourceKind::Pypi {
-            let install_dir = cfg.settings.install_dir_path()?;
+            let install_dir = cfg.settings.install_dir_path();
             let outcome = uv::upgrade(tool, self.runner.as_ref(), &install_dir)?;
             let now = crate::now_iso8601();
             return Ok(ToolRecord {
@@ -947,7 +1027,7 @@ impl App {
     /// Install a tool via its source handler and return a fresh state record.
     fn install_tool(&self, cfg: &Config, name: &str, tool: &ToolConfig) -> Result<ToolRecord> {
         let parsed = cfg.parsed_spec(tool)?;
-        let install_dir = cfg.settings.install_dir_path()?;
+        let install_dir = cfg.settings.install_dir_path();
 
         // Key step: what we're resolving, plus any pins/filters that shape it.
         let mut extras: Vec<String> = Vec::new();
@@ -1478,6 +1558,8 @@ mod tests {
             "https://h/{version}/{os}-{arch}-musl/claude",
             "--arch-replace",
             "amd64=x64",
+            "--os-replace",
+            "darwin=macOS",
             "--exe",
             "claude",
         ])
@@ -1487,6 +1569,7 @@ mod tests {
                 assert_eq!(a.version_source.as_deref(), Some("github:anthropics/claude-code"));
                 assert!(a.url_musl.is_some());
                 assert_eq!(a.arch_replace, vec!["amd64=x64".to_string()]);
+                assert_eq!(a.os_replace, vec!["darwin=macOS".to_string()]);
                 assert_eq!(a.exe.as_deref(), Some("claude"));
             }
             _ => panic!("expected add"),
@@ -1785,6 +1868,30 @@ mod tests {
         match decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, false) {
             UpgradeAction::Skip { .. } => {}
             other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_npm_version_pin_converges_and_skips() {
+        // An npm tool pinned to a version must converge like pypi/cargo: skip
+        // when already at the pin, upgrade (reinstall the pin) when it differs.
+        // No HTTP is consulted for a pinned tool (registry latest is irrelevant).
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Npm, locator: "pnpm".into() };
+        let mut tool = ToolConfig::from_spec("npm:pnpm");
+        tool.version = Some("9.1.0".into());
+        let mut installed = rec("9.1.0");
+        installed.source = "npm".into();
+        match decide(&app, &parsed, &tool, Some(&installed), false, false) {
+            UpgradeAction::Skip { .. } => {}
+            other => panic!("expected skip at pinned version, got {other:?}"),
+        }
+        // Different installed version → converge to the pin.
+        let mut older = rec("8.0.0");
+        older.source = "npm".into();
+        match decide(&app, &parsed, &tool, Some(&older), false, false) {
+            UpgradeAction::Upgrade { latest } => assert_eq!(latest.as_deref(), Some("9.1.0")),
+            other => panic!("expected upgrade to pin, got {other:?}"),
         }
     }
 

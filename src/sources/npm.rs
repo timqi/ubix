@@ -98,7 +98,9 @@ fn extract_env_value(line: &str, key: &str) -> Option<String> {
 }
 
 fn unquote(s: &str) -> String {
-    let s = s.trim();
+    // Strip a trailing statement `;` (some `fnm env` fish lines end with one)
+    // before removing surrounding quotes.
+    let s = s.trim().trim_end_matches(';').trim();
     s.trim_matches('"').trim_matches('\'').to_string()
 }
 
@@ -138,12 +140,22 @@ pub fn current_default_node(runner: &dyn CommandRunner) -> Option<String> {
     if !runner.which("fnm") {
         return None;
     }
-    let out = runner.run("fnm", &["current"], &[]).ok()?;
+    // Query the default node's version via `fnm exec` — reliable from a plain
+    // subprocess (same mechanism as `has_default_node`), unlike `fnm current`,
+    // which needs a fnm-activated shell (FNM_MULTISHELL_PATH) and otherwise
+    // reports `none`/`system`, hiding real LTS jumps.
+    let out = runner
+        .run(
+            "fnm",
+            &["exec", "--using=default", "--", "node", "--version"],
+            &[],
+        )
+        .ok()?;
     if !out.success() {
         return None;
     }
     let v = out.stdout.trim();
-    if v.is_empty() || v == "none" || v == "system" {
+    if v.is_empty() {
         None
     } else {
         Some(v.to_string())
@@ -276,7 +288,7 @@ mod tests {
     #[test]
     fn current_default_node_parsed() {
         let runner = MockRunner::new().with_present("fnm").expect(
-            "fnm current",
+            "fnm exec --using=default -- node --version",
             CommandOutput {
                 status: 0,
                 stdout: "v22.14.0\n".into(),
@@ -287,10 +299,11 @@ mod tests {
     }
 
     #[test]
-    fn current_default_none_when_system() {
+    fn current_default_none_when_no_default() {
+        // No default node → `fnm exec --using=default` fails → None.
         let runner = MockRunner::new().with_present("fnm").expect(
-            "fnm current",
-            CommandOutput { status: 0, stdout: "system\n".into(), stderr: String::new() },
+            "fnm exec --using=default -- node --version",
+            CommandOutput { status: 1, stdout: String::new(), stderr: "no default".into() },
         );
         assert_eq!(current_default_node(&runner), None);
     }

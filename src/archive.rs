@@ -47,10 +47,22 @@ impl ArchiveFormat {
     }
 }
 
-/// Extract `bytes` (an archive named `name`) fully into `dest_dir`. For `Raw`,
-/// writes the bytes as a single file named after `name`'s basename. Returns the
-/// list of regular files produced (absolute paths).
+/// Extract `bytes` (an archive named `name`) fully into `dest_dir`, returning
+/// the list of regular files produced (absolute paths). For `Raw`, writes the
+/// bytes as a single file named after `name`'s basename.
+///
+/// `dest_dir` MUST be a dedicated (typically empty) directory: the returned list
+/// is the full recursive contents of `dest_dir` after extraction. Callers that
+/// extract into an already-populated directory should use [`extract_into`].
 pub fn extract_all(name: &str, bytes: &[u8], dest_dir: &Path) -> Result<Vec<PathBuf>> {
+    extract_into(name, bytes, dest_dir)?;
+    collect_files(dest_dir)
+}
+
+/// Extract `bytes` into `dest_dir` without enumerating the result. Safe to use
+/// when `dest_dir` already contains unrelated files (e.g. the go bootstrap
+/// unpacks into `$GOROOT`'s parent).
+pub fn extract_into(name: &str, bytes: &[u8], dest_dir: &Path) -> Result<()> {
     std::fs::create_dir_all(dest_dir)
         .with_context(|| format!("creating {}", dest_dir.display()))?;
     match ArchiveFormat::detect(name) {
@@ -59,7 +71,6 @@ pub fn extract_all(name: &str, bytes: &[u8], dest_dir: &Path) -> Result<Vec<Path
         ArchiveFormat::TarBz2 => {
             // bzip2 decoder is not a declared dep; surface a clear error rather
             // than mis-extracting. .tar.gz/.tar.xz/.zip cover the vast majority.
-            let _ = bytes;
             bail!("bzip2 archives are not supported; please use a .tar.gz/.tar.xz/.zip asset")
         }
         ArchiveFormat::Tar => untar(&mut &bytes[..], dest_dir),
@@ -71,17 +82,19 @@ pub fn extract_all(name: &str, bytes: &[u8], dest_dir: &Path) -> Result<Vec<Path
             let mut out = Vec::new();
             dec.read_to_end(&mut out).context("gunzip")?;
             let base = basename(name);
-            let base = base.strip_suffix(".gz").unwrap_or(&base);
+            // `.gz` detection is case-insensitive, so strip it case-insensitively too.
+            let base = base
+                .get(..base.len().saturating_sub(3))
+                .filter(|_| base.to_ascii_lowercase().ends_with(".gz"))
+                .unwrap_or(&base);
             let path = dest_dir.join(base);
             std::fs::write(&path, out).with_context(|| format!("writing {}", path.display()))?;
-            make_executable(&path)?;
-            Ok(vec![path])
+            make_executable(&path)
         }
         ArchiveFormat::Raw => {
             let path = dest_dir.join(basename(name));
             std::fs::write(&path, bytes).with_context(|| format!("writing {}", path.display()))?;
-            make_executable(&path)?;
-            Ok(vec![path])
+            make_executable(&path)
         }
     }
 }
@@ -95,14 +108,13 @@ fn basename(name: &str) -> String {
         .to_string()
 }
 
-fn untar<R: Read>(reader: &mut R, dest_dir: &Path) -> Result<Vec<PathBuf>> {
+fn untar<R: Read>(reader: &mut R, dest_dir: &Path) -> Result<()> {
     let mut ar = tar::Archive::new(reader);
     ar.unpack(dest_dir)
-        .with_context(|| format!("unpacking tar into {}", dest_dir.display()))?;
-    collect_files(dest_dir)
+        .with_context(|| format!("unpacking tar into {}", dest_dir.display()))
 }
 
-fn unzip(bytes: &[u8], dest_dir: &Path) -> Result<Vec<PathBuf>> {
+fn unzip(bytes: &[u8], dest_dir: &Path) -> Result<()> {
     let cursor = std::io::Cursor::new(bytes);
     let mut zip = zip::ZipArchive::new(cursor).context("opening zip archive")?;
     for i in 0..zip.len() {
@@ -136,7 +148,7 @@ fn unzip(bytes: &[u8], dest_dir: &Path) -> Result<Vec<PathBuf>> {
             }
         }
     }
-    collect_files(dest_dir)
+    Ok(())
 }
 
 /// Recursively collect regular files under `dir`.

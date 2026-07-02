@@ -40,7 +40,7 @@ pub fn remove_tool(
                 );
             };
             let parsed = cfg.parsed_spec(tool)?;
-            let install_dir = cfg.settings.install_dir_path()?;
+            let install_dir = cfg.settings.install_dir_path();
             let final_name = tool
                 .rename
                 .clone()
@@ -86,7 +86,7 @@ fn uninstall_record(
         }
         Some(SourceKind::Cargo) => {
             let locator = resolve_locator(record, cfg, name);
-            let install_dir = cfg.settings.install_dir_path()?;
+            let install_dir = cfg.settings.install_dir_path();
             let root = cargo::root_for(&install_dir);
             let args = cargo::uninstall_args(&locator, &root.to_string_lossy());
             run_uninstall(runner, "cargo", &args, "cargo uninstall")?;

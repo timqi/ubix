@@ -89,11 +89,12 @@ fn prune_synthesized_matching(http: &dyn HttpClient, tool: &mut ToolConfig, loca
         _ => return, // fetch failed / no assets → keep matching (safe default)
     };
     let pruned = prune::prune_matching(map, &assets);
-    let dropped = map.len() - pruned.len();
+    // Redundant platforms are neutralized to "" (not dropped — see prune_matching).
+    let dropped = pruned.values().filter(|v| v.is_empty()).count();
     if dropped == 0 {
         return;
     }
-    if pruned.is_empty() {
+    if pruned.values().all(String::is_empty) {
         crate::step!("matching not needed (ubi selects assets on its own); omitting");
         tool.matching = None;
     } else {

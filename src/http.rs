@@ -62,14 +62,12 @@ impl HttpClient for ReqwestClient {
                 .await
                 .with_context(|| format!("GET {url}"))?;
             let status = resp.status();
-            let body = resp
-                .text()
-                .await
-                .with_context(|| format!("reading body of {url}"))?;
             if !status.is_success() {
                 bail!("GET {url} returned HTTP {status}");
             }
-            Ok(body)
+            resp.text()
+                .await
+                .with_context(|| format!("reading body of {url}"))
         })
     }
 

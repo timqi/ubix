@@ -135,7 +135,9 @@ impl State {
 /// every save within a session.
 #[derive(Debug)]
 pub struct LockedState {
-    /// The lock-file handle; the flock lives here and must be kept alive.
+    /// The lock-file handle; the flock lives here and is held (never read) for
+    /// the lifetime of this guard — dropping it releases the lock.
+    #[allow(dead_code)]
     lock_file: File,
     path: PathBuf,
     pub state: State,
@@ -208,9 +210,9 @@ impl LockedState {
             .with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, &self.path)
             .with_context(|| format!("renaming into {}", self.path.display()))?;
-        // Keep the lock handle alive; it guards the sibling lock file, not
-        // state.toml, so the atomic rename above does not release it.
-        let _ = &self.lock_file;
+        // `self.lock_file` stays alive for the lifetime of this handle; it guards
+        // the sibling lock file, not state.toml, so the rename above does not
+        // release the lock (see the struct doc).
         Ok(())
     }
 }

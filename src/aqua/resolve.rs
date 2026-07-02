@@ -28,6 +28,8 @@ pub struct Branch {
     pub overrides: Vec<PlatformOverride>,
     /// Non-github_release type found on the branch (→ degrade).
     pub type_: Option<String>,
+    /// Branch-level `no_asset`: the whole branch is unavailable (no binary).
+    pub no_asset: bool,
 }
 
 /// The effective (merged) fields for a single platform.
@@ -93,6 +95,8 @@ fn base_branch(pkg: &Package) -> Branch {
         version_prefix: pkg.version_prefix.clone(),
         overrides: pkg.overrides.clone(),
         type_: pkg.type_.clone(),
+        // Base package has no branch-level no_asset (only platform overrides do).
+        no_asset: false,
     }
 }
 
@@ -127,6 +131,9 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
     if vo.type_.is_some() {
         b.type_ = vo.type_.clone();
     }
+    if vo.no_asset {
+        b.no_asset = true;
+    }
     b
 }
 
@@ -134,6 +141,10 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
 /// matching platform override (specificity-first). Returns `Ok(None)` when the
 /// platform is unavailable (unsupported env or `no_asset`).
 pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option<Effective>> {
+    // A branch marked `no_asset` has no binary for any platform → unavailable.
+    if branch.no_asset {
+        return Ok(None);
+    }
     if !env_supported(&branch.supported_envs, goos, goarch) {
         return Ok(None);
     }
@@ -243,6 +254,7 @@ fn pick_override<'a>(
 /// Evaluate an aqua `version_constraint` we understand. Supports:
 ///   * `semver("<op> X")`   where op ∈ < <= > >= ==
 ///   * `Version <op> "vX"`  where op ∈ < <= > >= ==
+///
 /// Anything else → error (caller degrades).
 pub fn eval_constraint(constraint: &str, latest: &str) -> Result<bool> {
     let c = constraint.trim();
@@ -374,7 +386,7 @@ mod tests {
         assert_eq!(branch.format.as_deref(), Some("zst"));
         assert_eq!(branch.version_prefix.as_deref(), Some("rust-"));
         // `"true"` present → picked outright regardless of the earlier semver branch.
-        assert!(branch.replacements.get("linux").is_some());
+        assert!(branch.replacements.contains_key("linux"));
     }
 
     #[test]
@@ -479,6 +491,28 @@ packages:
         assert!(effective_for(&branch, "linux", "amd64").unwrap().is_none());
         // darwin unaffected.
         assert!(effective_for(&branch, "darwin", "amd64").unwrap().is_some());
+    }
+
+    #[test]
+    fn branch_level_no_asset_makes_branch_unavailable() {
+        // A version_override branch with `no_asset: true` must NOT inherit the
+        // base asset; every platform is unavailable.
+        let yaml = r#"
+packages:
+  - type: github_release
+    repo_owner: x
+    repo_name: y
+    asset: base-{{.OS}}
+    format: raw
+    version_overrides:
+      - version_constraint: "true"
+        no_asset: true
+"#;
+        let pkg = parse(yaml);
+        let branch = select_branch(&pkg, "1.0.0", "x", "y").unwrap();
+        assert!(branch.no_asset);
+        assert!(effective_for(&branch, "linux", "amd64").unwrap().is_none());
+        assert!(effective_for(&branch, "darwin", "arm64").unwrap().is_none());
     }
 
     #[test]

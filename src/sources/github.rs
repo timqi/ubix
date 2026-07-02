@@ -41,11 +41,16 @@ impl GithubSource {
             );
         }
 
-        // `exes` (multi-entry, → ubi extract_all) is incompatible with `rename`
-        // (→ ubi rename_exe_to); ubi's build() would error deep inside. Fail
-        // clearly at build-request time instead (§5.1).
-        if tool.exes.as_ref().is_some_and(|e| !e.is_empty()) && tool.rename.is_some() {
-            bail!("`exes` and `rename` cannot be combined (rename applies to a single exe only)");
+        // `exes` (multi-entry, → ubi extract_all) is incompatible with both
+        // `rename` (→ ubi rename_exe_to) and the single-entry `exe`; ubi ignores
+        // `exe` on the extract_all path, so fail clearly here instead (§5.1).
+        if tool.exes.as_ref().is_some_and(|e| !e.is_empty()) {
+            if tool.rename.is_some() {
+                bail!("`exes` and `rename` cannot be combined (rename applies to a single exe only)");
+            }
+            if tool.exe.is_some() {
+                bail!("`exes` and `exe` cannot be combined (use `exes` alone to select multiple entries)");
+            }
         }
 
         let final_name = tool
@@ -211,6 +216,18 @@ mod tests {
         let mut tool = ToolConfig::from_spec("github:astral-sh/uv");
         tool.exes = Some(vec!["uv".into(), "uvx".into()]);
         tool.rename = Some("nope".into());
+        let err = src.install(&tool, &MockRunner::new()).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn exes_plus_exe_rejected() {
+        let src = GithubSource::for_tool("uv", PathBuf::from("/tmp/bin"), Box::new(FakeEngine {
+            last: Mutex::new(None),
+        }));
+        let mut tool = ToolConfig::from_spec("github:astral-sh/uv");
+        tool.exes = Some(vec!["uv".into(), "uvx".into()]);
+        tool.exe = Some("uv".into());
         let err = src.install(&tool, &MockRunner::new()).unwrap_err();
         assert!(err.to_string().contains("cannot be combined"), "{err}");
     }

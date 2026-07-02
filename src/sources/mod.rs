@@ -158,7 +158,7 @@ impl FromStr for SourceKind {
             "npm" => SourceKind::Npm,
             "cargo" => SourceKind::Cargo,
             "go" => SourceKind::Go,
-            other => bail!("unknown source prefix `{other}:` (expected one of github/gitlab/url/template/pypi/npm/cargo/go)"),
+            other => bail!("unknown source prefix `{other}:` (expected one of {})", known_prefixes()),
         })
     }
 }
@@ -175,6 +175,16 @@ pub struct ParsedSpec {
     pub source: SourceKind,
     /// The locator portion (after the prefix), e.g. `owner/repo`, a URL, a package name.
     pub locator: String,
+}
+
+/// The canonical source prefixes joined as `github/gitlab/…`, derived from
+/// [`SourceKind::all`] so error hints never drift from the parser.
+fn known_prefixes() -> String {
+    SourceKind::all()
+        .iter()
+        .map(|k| k.as_str())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Parse a `spec` string with the rules of §4.2.
@@ -208,7 +218,8 @@ pub fn parse_spec(spec: &str, default_source: SourceKind) -> Result<ParsedSpec> 
         if !maybe_prefix.contains('/') {
             bail!(
                 "unknown source prefix `{maybe_prefix}:` in spec `{spec}` \
-                 (expected one of github/gitlab/url/pypi/npm/cargo/go)"
+                 (expected one of {})",
+                known_prefixes()
             );
         }
     }
@@ -237,9 +248,10 @@ fn validate_locator(kind: SourceKind, locator: &str) -> Result<()> {
             }
         }
         SourceKind::Gitlab => {
-            // group[/subgroup...]/repo — at least two segments.
-            let segs: Vec<&str> = locator.split('/').filter(|s| !s.is_empty()).collect();
-            if segs.len() < 2 {
+            // group[/subgroup...]/repo — at least two segments, none empty (so
+            // `group//repo`, `/group/repo`, `group/repo/` are all rejected).
+            let segs: Vec<&str> = locator.split('/').collect();
+            if segs.len() < 2 || segs.iter().any(|s| s.is_empty()) {
                 bail!("gitlab locator `{locator}` must be `group[/subgroup…]/repo`");
             }
         }
@@ -398,6 +410,26 @@ mod tests {
     #[test]
     fn url_requires_scheme() {
         assert!(parse_spec("url:example.com/x.tar.gz", SourceKind::Github).is_err());
+    }
+
+    #[test]
+    fn gitlab_rejects_empty_segments() {
+        // Empty path segments (double slash, leading/trailing slash) are invalid.
+        assert!(parse_spec("gitlab:group//repo", SourceKind::Github).is_err());
+        assert!(parse_spec("gitlab:/group/repo", SourceKind::Github).is_err());
+        assert!(parse_spec("gitlab:group/repo/", SourceKind::Github).is_err());
+        // Valid group/subgroup/repo still parses.
+        assert_eq!(
+            parse_spec("gitlab:group/sub/repo", SourceKind::Github).unwrap().source,
+            SourceKind::Gitlab
+        );
+    }
+
+    #[test]
+    fn unknown_prefix_hint_lists_template() {
+        // Regression: the hint is derived from all() so it never drifts.
+        let err = parse_spec("brew:wget", SourceKind::Github).unwrap_err();
+        assert!(err.to_string().contains("template"), "{err}");
     }
 
     #[test]

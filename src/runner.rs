@@ -93,7 +93,19 @@ impl CommandRunner for SystemRunner {
         };
         std::env::split_paths(&path).any(|dir| {
             let candidate = dir.join(program);
-            candidate.is_file()
+            #[cfg(unix)]
+            {
+                // A PATH hit only counts if it's a regular file with an exec bit
+                // set — a non-executable file of the same name is not a program.
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(&candidate)
+                    .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+                    .unwrap_or(false)
+            }
+            #[cfg(not(unix))]
+            {
+                candidate.is_file()
+            }
         })
     }
 }

@@ -55,7 +55,7 @@ pub fn latest_version(
             Ok(Latest::Version(parse_pypi(&body)?))
         }
         SourceKind::Npm => {
-            let pkg = pkg_name(&spec.locator);
+            let pkg = npm_pkg_name(&spec.locator);
             let url = format!("https://registry.npmjs.org/{pkg}/latest");
             let body = http.get_text(&url)?;
             Ok(Latest::Version(parse_npm(&body)?))
@@ -86,6 +86,22 @@ fn pkg_name(locator: &str) -> String {
         .next()
         .unwrap_or(locator)
         .to_string()
+}
+
+/// Bare npm package name, preserving a leading `@scope/`. npm uses `@` both for
+/// the scope prefix AND the version separator (`@scope/pkg@1.2.3`), so a plain
+/// split-on-`@` would wrongly return `""` for scoped packages.
+fn npm_pkg_name(locator: &str) -> String {
+    match locator.strip_prefix('@') {
+        // Scoped: `@scope/pkg[@version]` → keep `@scope/pkg`, drop a trailing
+        // `@version` (the second `@`).
+        Some(rest) => match rest.split_once('@') {
+            Some((name, _version)) => format!("@{name}"),
+            None => format!("@{rest}"),
+        },
+        // Unscoped: `pkg[@version]`.
+        None => pkg_name(locator),
+    }
 }
 
 /// Minimal percent-encoding for a gitlab project path (`/` → `%2F`).
@@ -299,5 +315,29 @@ mod tests {
     fn pkg_name_strips_constraints() {
         assert_eq!(pkg_name("ruff==0.6"), "ruff");
         assert_eq!(pkg_name("ripgrep"), "ripgrep");
+    }
+
+    #[test]
+    fn npm_pkg_name_preserves_scope() {
+        assert_eq!(npm_pkg_name("pnpm"), "pnpm");
+        assert_eq!(npm_pkg_name("pnpm@9.1.0"), "pnpm");
+        assert_eq!(npm_pkg_name("@babel/core"), "@babel/core");
+        assert_eq!(npm_pkg_name("@babel/core@7.24.0"), "@babel/core");
+    }
+
+    #[test]
+    fn npm_scoped_package_queries_correct_url() {
+        let http = MockHttp::new().with_text(
+            "https://registry.npmjs.org/@babel/core/latest",
+            r#"{"version":"7.24.0","name":"@babel/core"}"#,
+        );
+        let spec = ParsedSpec {
+            source: SourceKind::Npm,
+            locator: "@babel/core".into(),
+        };
+        assert_eq!(
+            latest_version(&http, &spec, None).unwrap(),
+            Latest::Version("7.24.0".into())
+        );
     }
 }

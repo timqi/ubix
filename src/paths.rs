@@ -57,10 +57,8 @@ fn home_dir_join(seg: &str) -> PathBuf {
 /// Expand a leading `~` / `~/` and `$XDG_CONFIG_HOME` / `$XDG_DATA_HOME` /
 /// `$HOME` tokens in a path string. Only the documented tokens are expanded so
 /// that arbitrary environment injection is not possible.
-pub fn expand(input: &str) -> Result<PathBuf> {
-    let expanded = expand_tokens(input);
-    let expanded = expand_tilde(&expanded);
-    Ok(PathBuf::from(expanded))
+pub fn expand(input: &str) -> PathBuf {
+    PathBuf::from(expand_tilde(&expand_tokens(input)))
 }
 
 fn expand_tokens(input: &str) -> String {
@@ -125,7 +123,7 @@ mod tests {
     #[test]
     fn expand_bare_tilde() {
         with_home("/home/alice", || {
-            assert_eq!(expand("~").unwrap(), PathBuf::from("/home/alice"));
+            assert_eq!(expand("~"), PathBuf::from("/home/alice"));
         });
     }
 
@@ -133,7 +131,7 @@ mod tests {
     fn expand_tilde_slash() {
         with_home("/home/alice", || {
             assert_eq!(
-                expand("~/.local/bin").unwrap(),
+                expand("~/.local/bin"),
                 PathBuf::from("/home/alice/.local/bin")
             );
         });
@@ -143,7 +141,7 @@ mod tests {
     fn expand_home_token() {
         with_home("/home/bob", || {
             assert_eq!(
-                expand("$HOME/x").unwrap(),
+                expand("$HOME/x"),
                 PathBuf::from("/home/bob/x")
             );
         });
@@ -151,13 +149,13 @@ mod tests {
 
     #[test]
     fn no_expansion_for_absolute() {
-        assert_eq!(expand("/opt/bin").unwrap(), PathBuf::from("/opt/bin"));
+        assert_eq!(expand("/opt/bin"), PathBuf::from("/opt/bin"));
     }
 
     #[test]
     fn tilde_only_at_start() {
         // A tilde not at the start is left untouched.
-        assert_eq!(expand("/x/~y").unwrap(), PathBuf::from("/x/~y"));
+        assert_eq!(expand("/x/~y"), PathBuf::from("/x/~y"));
     }
 
     #[test]

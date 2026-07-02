@@ -36,10 +36,16 @@ pub fn build_request(
     if parsed.source != SourceKind::Gitlab {
         bail!("gitlab source received non-gitlab spec `{}`", tool.spec);
     }
-    // `exes` (extract_all) and `rename` (rename_exe_to) cannot be combined; ubi
-    // build() would error. Fail clearly at build-request time (§5.1).
-    if tool.exes.as_ref().is_some_and(|e| !e.is_empty()) && tool.rename.is_some() {
-        bail!("`exes` and `rename` cannot be combined (rename applies to a single exe only)");
+    // `exes` (extract_all) cannot be combined with `rename` (rename_exe_to) nor
+    // the single-entry `exe` (ignored on the extract_all path). Fail clearly at
+    // build-request time (§5.1).
+    if tool.exes.as_ref().is_some_and(|e| !e.is_empty()) {
+        if tool.rename.is_some() {
+            bail!("`exes` and `rename` cannot be combined (rename applies to a single exe only)");
+        }
+        if tool.exe.is_some() {
+            bail!("`exes` and `exe` cannot be combined (use `exes` alone to select multiple entries)");
+        }
     }
     let final_name = tool
         .rename
@@ -143,6 +149,15 @@ mod tests {
         let mut t = ToolConfig::from_spec("gitlab:group/repo");
         t.exes = Some(vec!["a".into(), "b".into()]);
         t.rename = Some("x".into());
+        let err = build_request(&t, "repo", PathBuf::from("/tmp/bin")).unwrap_err();
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
+    }
+
+    #[test]
+    fn exes_plus_exe_rejected() {
+        let mut t = ToolConfig::from_spec("gitlab:group/repo");
+        t.exes = Some(vec!["a".into(), "b".into()]);
+        t.exe = Some("a".into());
         let err = build_request(&t, "repo", PathBuf::from("/tmp/bin")).unwrap_err();
         assert!(err.to_string().contains("cannot be combined"), "{err}");
     }
