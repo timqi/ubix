@@ -761,11 +761,33 @@ fn needs_install(
 
 /// Format `ubix list` rows (name, spec, version) into aligned lines. The name
 /// and spec columns are padded to the widest entry so output stays readable.
+/// Max width of the spec column in `list`; longer specs (e.g. http templates
+/// with a long URL) are truncated with `…` so alignment stays sane. Full spec
+/// is always visible via `ubix info <name>`.
+const LIST_SPEC_MAX: usize = 48;
+
+/// Truncate `s` to at most `max` chars, appending `…` when shortened.
+fn truncate_ellipsis(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let mut out: String = s.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
 fn format_list(rows: &[(String, String, String)]) -> Vec<String> {
-    let name_w = rows.iter().map(|(n, _, _)| n.len()).max().unwrap_or(0);
-    let spec_w = rows.iter().map(|(_, s, _)| s.len()).max().unwrap_or(0);
+    let name_w = rows.iter().map(|(n, _, _)| n.chars().count()).max().unwrap_or(0);
+    let specs: Vec<String> = rows
+        .iter()
+        .map(|(_, s, _)| truncate_ellipsis(s, LIST_SPEC_MAX))
+        .collect();
+    // Column width = widest (already-capped) spec, so it never exceeds the cap.
+    let spec_w = specs.iter().map(|s| s.chars().count()).max().unwrap_or(0);
     rows.iter()
-        .map(|(name, spec, ver)| format!("{name:<name_w$}  {spec:<spec_w$}  {ver}"))
+        .zip(specs.iter())
+        .map(|((name, _, ver), spec)| format!("{name:<name_w$}  {spec:<spec_w$}  {ver}"))
         .collect()
 }
 
@@ -1018,6 +1040,18 @@ mod tests {
     #[test]
     fn format_list_empty() {
         assert!(format_list(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_list_truncates_long_spec() {
+        let long = format!("http:https://example.com/{}/bin", "x".repeat(200));
+        let rows = vec![("claude".to_string(), long, "(not installed)".to_string())];
+        let lines = format_list(&rows);
+        // Spec is capped at LIST_SPEC_MAX chars and ends with the ellipsis.
+        let spec_part = lines[0].split("  ").nth(1).unwrap();
+        assert_eq!(spec_part.chars().count(), LIST_SPEC_MAX);
+        assert!(spec_part.ends_with('…'));
+        assert!(lines[0].ends_with("(not installed)"));
     }
 
     #[test]
