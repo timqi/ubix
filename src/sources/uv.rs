@@ -71,6 +71,7 @@ pub fn install(
     }
     let args = install_args(tool, &parsed.locator, reinstall);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::step!("uv tool install {}…", parsed.locator);
     // Ensure uv drops entry-point symlinks into our install_dir.
     let bin = install_dir.to_string_lossy().into_owned();
     let out = runner
@@ -108,6 +109,7 @@ pub fn upgrade(
     }
     let args = upgrade_args(&parsed.locator);
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::step!("uv tool upgrade {}…", pkg_base(&parsed.locator));
     // Keep entry-point symlinks in our install_dir (matches install()), so a
     // custom install_dir is honored on upgrade too.
     let bin = install_dir.to_string_lossy().into_owned();

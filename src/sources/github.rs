@@ -74,6 +74,10 @@ impl GithubSource {
 impl Source for GithubSource {
     fn install(&self, tool: &ToolConfig, _runner: &dyn CommandRunner) -> Result<InstallOutcome> {
         let req = self.build_request(tool)?;
+        crate::step!(
+            "downloading & extracting {} via ubi (large assets may take a while)…",
+            req.project
+        );
         let result = self.engine.install(&req)?;
         Ok(InstallOutcome {
             installed_version: result

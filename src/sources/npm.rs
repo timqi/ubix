@@ -147,6 +147,7 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
     }
     let args = global_install_args(&parsed.locator, tool.version.as_deref());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::step!("npm i -g {}…", parsed.locator);
     let out = runner.run("npm", &arg_refs, &[]).context("running npm i -g")?;
     if !out.success() {
         bail!("npm install failed: {}", out.stderr.trim());

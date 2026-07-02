@@ -74,6 +74,7 @@ pub fn install(
         bail!("url source received non-url spec `{}`", tool.spec);
     }
     let url = &parsed.locator;
+    crate::step!("downloading {url}");
     let bytes = http.get_bytes(url).with_context(|| format!("downloading {url}"))?;
     let content_sha = sha256_hex(&bytes);
 

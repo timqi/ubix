@@ -32,5 +32,8 @@ flate2 = "1"
 tar = "0.4"
 xz2 = "0.1"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# Surface ubi's `log`-facade output; small, sync logger honoring RUST_LOG.
+log = "0.4"
+env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 
 [dev-dependencies]

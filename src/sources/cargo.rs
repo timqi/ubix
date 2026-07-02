@@ -67,6 +67,7 @@ pub fn install(
     let root_s = root.to_string_lossy().into_owned();
     let args = install_args(tool, &parsed.locator, &root_s);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::step!("cargo install {} (compiling, may take a while)…", parsed.locator);
     let out = runner
         .run("cargo", &arg_refs, &[])
         .context("running cargo install")?;

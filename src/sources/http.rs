@@ -68,8 +68,11 @@ pub fn resolve_version(
     let Some(vs) = tool.version_source.as_deref() else {
         bail!("http source requires `version` or `version_source`");
     };
+    crate::step!("resolving version via {vs}");
     let latest = query_version_source(vs, http)?;
-    Ok(strip_leading_v(&latest).to_string())
+    let version = strip_leading_v(&latest).to_string();
+    crate::step!("latest = {version}");
+    Ok(version)
 }
 
 /// Query a `version_source` for its latest version. Currently supports
@@ -150,6 +153,7 @@ pub fn install(
         is_musl,
     )?;
 
+    crate::step!("downloading {url}");
     let bytes = http.get_bytes(&url).with_context(|| format!("downloading {url}"))?;
     let content_sha = url_source::sha256_hex(&bytes);
 

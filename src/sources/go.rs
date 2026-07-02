@@ -45,6 +45,7 @@ pub fn install(
     let (module, version) = split_module(&parsed.locator);
     let args = install_args(&module, &version);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    crate::step!("go install {module}@{version}…");
     let gobin = install_dir.to_string_lossy().into_owned();
     let out = runner
         .run("go", &arg_refs, &[("GOBIN", &gobin)])

@@ -71,6 +71,10 @@ pub fn install(
     engine: &dyn ReleaseEngine,
 ) -> Result<InstallOutcome> {
     let req = build_request(tool, tool_name, install_dir)?;
+    crate::step!(
+        "downloading & extracting {} via ubi (large assets may take a while)…",
+        req.project
+    );
     let result = engine.install(&req)?;
     Ok(InstallOutcome {
         installed_version: result.version.unwrap_or_else(|| "latest".to_string()),

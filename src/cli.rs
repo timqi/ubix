@@ -32,6 +32,28 @@ use crate::state::{LockedState, ToolRecord};
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
+
+    /// Suppress progress output (only the final result on stdout).
+    #[arg(short, long, global = true)]
+    pub quiet: bool,
+
+    /// Show more detail, including dependency logs (ubi asset selection, etc.).
+    #[arg(short, long, global = true)]
+    pub verbose: bool,
+}
+
+impl Cli {
+    /// Resolve the effective verbosity from the global flags (`--quiet` wins).
+    pub fn verbosity(&self) -> crate::progress::Verbosity {
+        use crate::progress::Verbosity;
+        if self.quiet {
+            Verbosity::Quiet
+        } else if self.verbose {
+            Verbosity::Verbose
+        } else {
+            Verbosity::Normal
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,14 +176,19 @@ pub struct App {
     pub paths: Paths,
     pub runner: Box<dyn CommandRunner>,
     pub http: Box<dyn HttpClient>,
+    /// Effective verbosity (also mirrored into the global used by `step!`).
+    pub verbosity: crate::progress::Verbosity,
 }
 
 impl App {
-    pub fn new() -> Result<Self> {
+    pub fn new(verbosity: crate::progress::Verbosity) -> Result<Self> {
+        // Keep the global (consulted by the step!/detail! macros) in sync.
+        crate::progress::set_verbosity(verbosity);
         Ok(Self {
             paths: Paths::resolve()?,
             runner: Box::new(SystemRunner::new()),
             http: Box::new(ReqwestClient::new()),
+            verbosity,
         })
     }
 
@@ -216,12 +243,14 @@ impl App {
 
         // Install first, then persist state + config so we never record a failed install.
         let record = self.install_tool(&cfg, &name, &tool)?;
+        let version = record.installed_version.clone();
         locked.state.tools.insert(name.clone(), record);
         locked.save()?;
 
         cfg.tools.insert(name.clone(), tool);
         cfg.save(&cfg_path)?;
-        println!("added `{name}` ({})", parsed.source);
+        // stdout: machine-facing result, augmented with the resolved version.
+        println!("added `{name}` ({}) {version}", parsed.source);
         Ok(())
     }
 
@@ -322,6 +351,7 @@ impl App {
                     )
                     .with_context(|| format!("pruning orphan `{name}`"))?;
                     locked.save()?;
+                    step!("pruning orphan `{name}`");
                     println!("pruned orphan `{name}`");
                 }
             } else {
@@ -344,6 +374,10 @@ impl App {
                     None => println!("would install `{name}` ({})", parsed.source),
                 }
                 continue;
+            }
+            match &installed {
+                Some(_) => step!("converging `{name}`"),
+                None => step!("installing `{name}`"),
             }
             let record = self.install_tool(&cfg, name, tool)?;
             locked.state.tools.insert(name.clone(), record);
@@ -505,6 +539,7 @@ impl App {
     fn cmd_doctor(&self) -> Result<()> {
         let cfg = Config::load_or_default(&self.paths.config_file())?;
         let install_dir = cfg.settings.install_dir_path()?;
+        detail!("verbosity = {:?}", self.verbosity);
         println!("ubix doctor");
         println!("  config: {}", self.paths.config_file().display());
         println!("  state:  {}", self.paths.state_file().display());
@@ -578,6 +613,24 @@ impl App {
         let parsed = cfg.parsed_spec(tool)?;
         let install_dir = cfg.settings.install_dir_path()?;
 
+        // Key step: what we're resolving, plus any pins/filters that shape it.
+        let mut extras: Vec<String> = Vec::new();
+        if let Some(t) = &tool.tag {
+            extras.push(format!("tag={t}"));
+        }
+        if let Some(m) = &tool.matching {
+            extras.push(format!("matching={m}"));
+        }
+        if let Some(v) = &tool.version {
+            extras.push(format!("version={v}"));
+        }
+        let suffix = if extras.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", extras.join(", "))
+        };
+        step!("resolving {}{}", tool.spec, suffix);
+
         let outcome = match parsed.source {
             SourceKind::Github => {
                 let src = GithubSource::for_tool(
@@ -603,6 +656,18 @@ impl App {
                 name,
             )?,
         };
+
+        // Key step: where it landed. Verbose adds the resolved version/asset/sha.
+        for p in &outcome.install_paths {
+            step!("installing → {}", p.display());
+        }
+        detail!("resolved version = {}", outcome.installed_version);
+        if let Some(asset) = &outcome.resolved_asset {
+            detail!("resolved asset = {asset}");
+        }
+        if let Some(sha) = &outcome.sha256 {
+            detail!("sha256 = {sha}");
+        }
 
         // Record go/url modules for reference.
         let module = match parsed.source {
