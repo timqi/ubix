@@ -66,10 +66,9 @@ pub enum Command {
     Add(AddArgs),
     /// Uninstall a tool and remove it from config (only removes state-tracked files).
     Remove(RemoveArgs),
-    /// Upgrade / converge tool(s): install missing, upgrade to latest, converge
-    /// pins, and (with --prune) remove orphans. `--dry-run` reports installed vs
-    /// latest and the action without changing anything. Pinned `tag`/`version`
-    /// tools are converged to the pin (skipped once matched, unless --force).
+    #[command(
+        about = "Install missing, upgrade to latest, and converge pinned tools.\n\nActs on the named tools, or every declared tool with --all (one of the two is required). A tool already at its target version is skipped; --force reinstalls it. Pinned `tag`/`version` tools converge to the pin. --dry-run reports installed vs latest and the chosen action without touching anything. --prune removes orphans (in state but not config)."
+    )]
     Upgrade(UpgradeArgs),
     /// List declared and installed tools.
     List,
@@ -155,6 +154,7 @@ pub struct UpgradeArgs {
     /// Remove orphaned tools in scope (state has it, config does not) (§8.3).
     #[arg(long)]
     pub prune: bool,
+    /// Block waiting for the state lock instead of failing fast.
     #[arg(long)]
     pub wait: bool,
 }
