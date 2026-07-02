@@ -80,7 +80,7 @@ pub enum Command {
     Edit,
     /// Check underlying tools and PATH readiness.
     Doctor,
-    /// Bootstrap a language toolchain (rust|go).
+    /// Bootstrap a language toolchain/runtime (rust|go|python|nodejs).
     Bootstrap(BootstrapArgs),
     /// List supported spec prefixes and their install backends.
     Sources,
@@ -171,7 +171,7 @@ pub struct InfoArgs {
 
 #[derive(Debug, Args)]
 pub struct BootstrapArgs {
-    /// Toolchain to bootstrap: <rust|go>.
+    /// Toolchain/runtime to bootstrap: <rust|go|python|nodejs>.
     pub target: String,
     #[arg(long)]
     pub reinstall: bool,
@@ -592,14 +592,83 @@ impl App {
 
     // ---- bootstrap ----
     fn cmd_bootstrap(&self, args: BootstrapArgs) -> Result<()> {
-        let target: bootstrap::BootstrapTarget = args.target.parse()?;
-        let cfg = Config::load_or_default(&self.paths.config_file())?;
-        let ctx = bootstrap::BootstrapCtx {
-            runner: self.runner.as_ref(),
-            http: self.http.as_ref(),
-            go_root: crate::paths::expand(&cfg.settings.go_root)?,
-        };
-        bootstrap::bootstrap(target, args.reinstall, &ctx)
+        use bootstrap::BootstrapTarget;
+        let target: BootstrapTarget = args.target.parse()?;
+        match target {
+            // python/nodejs need the add/config/state machinery → handled here.
+            BootstrapTarget::Python => self.cmd_bootstrap_python(args.reinstall),
+            BootstrapTarget::Nodejs => self.cmd_bootstrap_nodejs(args.reinstall),
+            // rust/go are pure toolchain fetches → the ctx-only bootstrap.
+            BootstrapTarget::Rust | BootstrapTarget::Go => {
+                let cfg = Config::load_or_default(&self.paths.config_file())?;
+                let ctx = bootstrap::BootstrapCtx {
+                    runner: self.runner.as_ref(),
+                    http: self.http.as_ref(),
+                    go_root: crate::paths::expand(&cfg.settings.go_root)?,
+                };
+                bootstrap::bootstrap(target, args.reinstall, &ctx)
+            }
+        }
+    }
+
+    /// Ensure `name` is installed via the `ubix add` path for `spec` (with the
+    /// given multi-exe list), then return the resolved install_dir. Idempotent:
+    /// skips the add when the tool is already in config AND on PATH, unless
+    /// `reinstall`. Takes the state lock, installs, and writes config+state.
+    fn ensure_added(
+        &self,
+        spec: &str,
+        name: &str,
+        exes: &[&str],
+        reinstall: bool,
+    ) -> Result<std::path::PathBuf> {
+        let cfg_path = self.paths.config_file();
+        let mut locked = LockedState::acquire(&self.paths.state_file(), false)?;
+        let mut cfg = Config::load_or_default(&cfg_path)?;
+        let install_dir = cfg.settings.install_dir_path()?;
+
+        let present = cfg.tools.contains_key(name) && self.runner.which(name);
+        if present && !reinstall {
+            step!("`{name}` already installed (config + PATH); skipping add");
+            return Ok(install_dir);
+        }
+
+        step!("installing `{name}` via {spec}");
+        let mut tool = ToolConfig::from_spec(spec);
+        if !exes.is_empty() {
+            tool.exes = Some(exes.iter().map(|s| s.to_string()).collect());
+        }
+        let record = self.install_tool(&cfg, name, &tool)?;
+        let version = record.installed_version.clone();
+        locked.state.tools.insert(name.to_string(), record);
+        locked.save()?;
+        cfg.tools.insert(name.to_string(), tool);
+        cfg.save(&cfg_path)?;
+        println!("added `{name}` (github) {version}");
+        Ok(install_dir)
+    }
+
+    // ---- bootstrap python (uv + default Python) ----
+    fn cmd_bootstrap_python(&self, reinstall: bool) -> Result<()> {
+        let install_dir =
+            self.ensure_added("github:astral-sh/uv", "uv", &["uv", "uvx"], reinstall)?;
+        run_python_runtime(self.runner.as_ref(), &install_dir)?;
+        println!("bootstrapped python via uv (python/python3 in {})", install_dir.display());
+        Ok(())
+    }
+
+    // ---- bootstrap nodejs (fnm + default LTS node) ----
+    fn cmd_bootstrap_nodejs(&self, reinstall: bool) -> Result<()> {
+        let install_dir = self.ensure_added("github:Schniz/fnm", "fnm", &[], reinstall)?;
+        let default_arg = run_nodejs_runtime(self.runner.as_ref(), &install_dir)?;
+
+        // The stable PATH entry is the fnm alias bin dir (follows LTS jumps).
+        let path_hint = npm::detect_fnm_base(self.runner.as_ref())
+            .map(|base| npm::alias_bin_dir(&base).display().to_string())
+            .unwrap_or_else(|| "<fnm base>/aliases/default/bin".to_string());
+        println!("bootstrapped nodejs via fnm; default node = {default_arg}");
+        println!("add to PATH: {path_hint}");
+        Ok(())
     }
 
     // ---- sources ----
@@ -776,6 +845,67 @@ pub fn resolve_record_version(
             fallback.to_string()
         }
     }
+}
+
+/// Install the latest stable Python as the default via the freshly-installed
+/// uv, invoked by ABSOLUTE path (`<install_dir>/uv`) since install_dir may not
+/// be on PATH yet. Prefers `uv python install --default` (installs latest stable
+/// and creates default `python`/`python3`); falls back to `uv python install`
+/// on older uv that lacks `--default`.
+fn run_python_runtime(runner: &dyn CommandRunner, install_dir: &std::path::Path) -> Result<()> {
+    let uv = install_dir.join("uv");
+    let uv_s = uv.to_string_lossy().into_owned();
+    step!("uv python install --default (latest stable Python)…");
+    let out = runner
+        .run(&uv_s, &["python", "install", "--default"], &[])
+        .context("running uv python install --default")?;
+    if out.success() {
+        return Ok(());
+    }
+    step!("`--default` not accepted; retrying `uv python install`…");
+    let out2 = runner
+        .run(&uv_s, &["python", "install"], &[])
+        .context("running uv python install")?;
+    if !out2.success() {
+        bail!("uv python install failed: {}", out2.stderr.trim());
+    }
+    println!(
+        "note: installed latest Python without --default (older uv); \
+         `uv python install --default` unsupported here"
+    );
+    Ok(())
+}
+
+/// Install the latest LTS node and set it as the fnm default via the
+/// freshly-installed fnm, invoked by ABSOLUTE path (`<install_dir>/fnm`).
+/// Returns the argument passed to `fnm default` (the parsed `vX.Y.Z` or the
+/// `lts-latest` alias fallback).
+fn run_nodejs_runtime(
+    runner: &dyn CommandRunner,
+    install_dir: &std::path::Path,
+) -> Result<String> {
+    let fnm = install_dir.join("fnm");
+    let fnm_s = fnm.to_string_lossy().into_owned();
+
+    step!("fnm install --lts…");
+    let out = runner
+        .run(&fnm_s, &["install", "--lts"], &[])
+        .context("running fnm install --lts")?;
+    if !out.success() {
+        bail!("fnm install --lts failed: {}", out.stderr.trim());
+    }
+    // Exact installed version (parsed from output), else the `lts-latest` alias.
+    let version = bootstrap::parse_semver_v(&out.stdout)
+        .or_else(|| bootstrap::parse_semver_v(&out.stderr));
+    let default_arg = version.unwrap_or_else(|| "lts-latest".to_string());
+    step!("fnm default {default_arg}…");
+    let out = runner
+        .run(&fnm_s, &["default", &default_arg], &[])
+        .context("running fnm default")?;
+    if !out.success() {
+        bail!("fnm default failed: {}", out.stderr.trim());
+    }
+    Ok(default_arg)
 }
 
 /// Which tools a `sync` invocation should act on.
@@ -1320,5 +1450,70 @@ mod tests {
     fn cli_parses_sources_subcommand() {
         let cli = Cli::try_parse_from(["ubix", "sources"]).unwrap();
         assert!(matches!(cli.command, Command::Sources));
+    }
+
+    // ---- bootstrap python/nodejs runtime command construction ----
+    use crate::runner::{CommandOutput, MockRunner};
+    use std::path::Path;
+
+    fn ok_out(stdout: &str) -> CommandOutput {
+        CommandOutput { status: 0, stdout: stdout.into(), stderr: String::new() }
+    }
+
+    #[test]
+    fn nodejs_runtime_absolute_path_and_parsed_version() {
+        let dir = "/home/u/.local/bin";
+        // fnm invoked by ABSOLUTE path; version parsed from install output.
+        let runner = MockRunner::new()
+            .expect(
+                "/home/u/.local/bin/fnm install --lts",
+                ok_out("Installing Node v22.14.0 (x64)\n"),
+            )
+            .expect("/home/u/.local/bin/fnm default v22.14.0", ok_out(""));
+        let arg = run_nodejs_runtime(&runner, Path::new(dir)).unwrap();
+        assert_eq!(arg, "v22.14.0");
+        // Verify arg order + absolute path of the recorded calls.
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[0].program, "/home/u/.local/bin/fnm");
+        assert_eq!(calls[0].args, vec!["install", "--lts"]);
+        assert_eq!(calls[1].program, "/home/u/.local/bin/fnm");
+        assert_eq!(calls[1].args, vec!["default", "v22.14.0"]);
+    }
+
+    #[test]
+    fn nodejs_runtime_falls_back_to_lts_latest_alias() {
+        let dir = "/opt/bin";
+        let runner = MockRunner::new()
+            .expect("/opt/bin/fnm install --lts", ok_out("done, no version line\n"))
+            .expect("/opt/bin/fnm default lts-latest", ok_out(""));
+        let arg = run_nodejs_runtime(&runner, Path::new(dir)).unwrap();
+        assert_eq!(arg, "lts-latest");
+    }
+
+    #[test]
+    fn python_runtime_uses_uv_python_install_default() {
+        let dir = "/home/u/.local/bin";
+        let runner = MockRunner::new()
+            .expect("/home/u/.local/bin/uv python install --default", ok_out(""));
+        run_python_runtime(&runner, Path::new(dir)).unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls[0].program, "/home/u/.local/bin/uv");
+        assert_eq!(calls[0].args, vec!["python", "install", "--default"]);
+    }
+
+    #[test]
+    fn python_runtime_falls_back_without_default_flag() {
+        let dir = "/home/u/.local/bin";
+        // `--default` fails (status != 0) → retry plain `uv python install`.
+        let runner = MockRunner::new()
+            .expect(
+                "/home/u/.local/bin/uv python install --default",
+                CommandOutput { status: 2, stdout: String::new(), stderr: "unexpected argument".into() },
+            )
+            .expect("/home/u/.local/bin/uv python install", ok_out(""));
+        run_python_runtime(&runner, Path::new(dir)).unwrap();
+        let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[1].args, vec!["python", "install"]);
     }
 }

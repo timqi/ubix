@@ -297,7 +297,7 @@ arch_replace   = { amd64 = "x64" }
 ---
 
 ## 6. 工具链引导（D9）
-`bootstrap` **仅用于多文件语言工具链 `rust` / `go`**（无法当单二进制 `add`）。uv / fnm 是普通单文件 release，用普通 `add` 安装（§5.3/§5.4），**不属于 bootstrap**。一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑。
+`bootstrap <rust|go|python|nodejs>`。`rust`/`go` 引导多文件语言工具链（无法当单二进制 `add`）。`python`/`nodejs` 是**便捷编排**：先用普通 `add`（github 源）装好 uv / fnm（幂等、纳入 config 追踪），再让 **uv 装最新稳定版 Python 设默认**（`uv python install --default`）/ **fnm 装最新 LTS 设默认**（`fnm install --lts` + `fnm default <ver>`，修好「无 default node」）。uv / fnm 本身仍是普通 `add` 安装的单文件工具。一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑。
 
 ### 6.1 Rust → rustup
 - `rustup-init` 单文件：`url:` 来源从 `https://static.rust-lang.org/rustup/dist/<target>/rustup-init` 拉取，运行 `rustup-init -y`。
@@ -323,7 +323,7 @@ ubix outdated                   # 各来源最新版 vs 已装（查询见 §7.1
 ubix info <name>                # 来源、asset/module、路径、参数
 ubix edit                       # 打开 config.toml
 ubix doctor                     # 检查 uv/fnm/rustup/go、各 PATH 段、~/.local/bin 就绪
-ubix bootstrap <rust|go> [--reinstall]  # 仅引导语言工具链（uv/fnm 用普通 add，§5.3/5.4）
+ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；python/nodejs=装uv/fnm并设默认runtime（§6）
 ```
 
 ### 7.1 `outdated` 各来源查询

@@ -20,10 +20,16 @@ use crate::http::HttpClient;
 use crate::runner::CommandRunner;
 
 /// Bootstrap targets accepted by `ubix bootstrap <target>`.
+///
+/// `Rust`/`Go` are toolchain fetches handled here (via [`bootstrap`]).
+/// `Python`/`Nodejs` need the add/config/state machinery and are handled in the
+/// CLI/App layer (`cmd_bootstrap`), not here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapTarget {
     Rust,
     Go,
+    Python,
+    Nodejs,
 }
 
 impl std::str::FromStr for BootstrapTarget {
@@ -32,16 +38,21 @@ impl std::str::FromStr for BootstrapTarget {
         Ok(match s.to_ascii_lowercase().as_str() {
             "rust" => BootstrapTarget::Rust,
             "go" => BootstrapTarget::Go,
-            // uv/fnm are plain github releases, not toolchain bootstraps.
+            "python" => BootstrapTarget::Python,
+            "nodejs" => BootstrapTarget::Nodejs,
+            // uv/fnm are plain github releases, not toolchain bootstraps. Use the
+            // language targets (python/nodejs) to install them + a runtime.
             "uv" => bail!(
                 "`uv` is not a bootstrap target; install it with:\n    \
-                 ubix add github:astral-sh/uv --name uv --exes uv,uvx"
+                 ubix add github:astral-sh/uv --name uv --exes uv,uvx\n\
+                 (or `ubix bootstrap python` to also install a default Python)"
             ),
             "fnm" => bail!(
                 "`fnm` is not a bootstrap target; install it with:\n    \
-                 ubix add github:Schniz/fnm --name fnm"
+                 ubix add github:Schniz/fnm --name fnm\n\
+                 (or `ubix bootstrap nodejs` to also install a default LTS node)"
             ),
-            other => bail!("unknown bootstrap target `{other}` (expected rust|go)"),
+            other => bail!("unknown bootstrap target `{other}` (expected rust|go|python|nodejs)"),
         })
     }
 }
@@ -53,12 +64,37 @@ pub struct BootstrapCtx<'a> {
     pub go_root: PathBuf,
 }
 
-/// Run the bootstrap for `target`.
+/// Run the toolchain bootstrap for `target` (rust/go only). python/nodejs are
+/// handled by the CLI layer because they need config/state.
 pub fn bootstrap(target: BootstrapTarget, reinstall: bool, ctx: &BootstrapCtx) -> Result<()> {
     match target {
         BootstrapTarget::Rust => bootstrap_rust(ctx, reinstall),
         BootstrapTarget::Go => bootstrap_go(ctx, reinstall),
+        BootstrapTarget::Python | BootstrapTarget::Nodejs => {
+            unreachable!("python/nodejs are handled in the CLI layer");
+        }
     }
+}
+
+/// Extract a `vX.Y.Z` version from tool output (e.g. `fnm install --lts` prints
+/// `Installing Node v22.14.0 (x64)`). Returns the first match, if any.
+pub fn parse_semver_v(output: &str) -> Option<String> {
+    for line in output.lines() {
+        for tok in line.split(|c: char| c.is_whitespace() || c == '(' || c == ')') {
+            if is_v_semver(tok) {
+                return Some(tok.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn is_v_semver(s: &str) -> bool {
+    let Some(rest) = s.strip_prefix('v') else {
+        return false;
+    };
+    let parts: Vec<&str> = rest.split('.').collect();
+    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 fn bootstrap_rust(ctx: &BootstrapCtx, reinstall: bool) -> Result<()> {
@@ -222,7 +258,20 @@ mod tests {
     fn target_parsing() {
         assert_eq!("rust".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Rust);
         assert_eq!("GO".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Go);
+        assert_eq!("python".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Python);
+        assert_eq!("Nodejs".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Nodejs);
         assert!("brew".parse::<BootstrapTarget>().is_err());
+    }
+
+    #[test]
+    fn parse_semver_v_extracts_version() {
+        assert_eq!(
+            parse_semver_v("Installing Node v22.14.0 (x64)").as_deref(),
+            Some("v22.14.0")
+        );
+        assert_eq!(parse_semver_v("v20.11.1").as_deref(), Some("v20.11.1"));
+        assert_eq!(parse_semver_v("no version here"), None);
+        assert_eq!(parse_semver_v("v22"), None); // not 3-part
     }
 
     #[test]
