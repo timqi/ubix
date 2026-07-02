@@ -66,14 +66,13 @@ pub enum Command {
     Add(AddArgs),
     /// Uninstall a tool and remove it from config (only removes state-tracked files).
     Remove(RemoveArgs),
-    /// Upgrade tool(s) in place. Pinned `tag` tools are skipped unless --force.
+    /// Upgrade / converge tool(s): install missing, upgrade to latest, converge
+    /// pins, and (with --prune) remove orphans. `--dry-run` reports installed vs
+    /// latest and the action without changing anything. Pinned `tag`/`version`
+    /// tools are converged to the pin (skipped once matched, unless --force).
     Upgrade(UpgradeArgs),
-    /// Reconcile system state to config: install missing, converge, prune orphans.
-    Sync(SyncArgs),
     /// List declared and installed tools.
     List,
-    /// Show latest vs installed versions.
-    Outdated,
     /// Show source, paths, and parameters for a tool.
     Info(InfoArgs),
     /// Open config.toml in $EDITOR.
@@ -140,24 +139,20 @@ pub struct RemoveArgs {
 
 #[derive(Debug, Args)]
 pub struct UpgradeArgs {
-    /// Tool name; omit with --all to upgrade everything.
-    pub name: Option<String>,
+    /// Tool names to upgrade/converge; omit with --all to act on every declared
+    /// tool. Names may include orphans (state-only) when combined with --prune.
+    pub names: Vec<String>,
+    /// Act on every declared tool (plus orphans in scope).
     #[arg(long)]
     pub all: bool,
-    /// Re-install pinned-tag tools (§8.4).
+    /// Re-install even when already at the target version / pinned tag (§8.4).
     #[arg(long)]
     pub force: bool,
-    #[arg(long)]
-    pub wait: bool,
-}
-
-#[derive(Debug, Args)]
-pub struct SyncArgs {
-    /// Only sync this tool; default: all declared tools.
-    pub name: Option<String>,
+    /// Report installed vs latest and the chosen action without changing
+    /// anything (read-only; no state lock, no install, no write).
     #[arg(long)]
     pub dry_run: bool,
-    /// Remove orphaned tools (state has it, config does not) (§8.3).
+    /// Remove orphaned tools in scope (state has it, config does not) (§8.3).
     #[arg(long)]
     pub prune: bool,
     #[arg(long)]
@@ -203,9 +198,7 @@ impl App {
             Command::Add(a) => self.cmd_add(a),
             Command::Remove(a) => self.cmd_remove(a),
             Command::Upgrade(a) => self.cmd_upgrade(a),
-            Command::Sync(a) => self.cmd_sync(a),
             Command::List => self.cmd_list(),
-            Command::Outdated => self.cmd_outdated(),
             Command::Info(a) => self.cmd_info(a),
             Command::Edit => self.cmd_edit(),
             Command::Doctor => self.cmd_doctor(),
@@ -281,55 +274,51 @@ impl App {
         Ok(())
     }
 
-    // ---- upgrade ----
+    // ---- upgrade (unified converge / upgrade / report / prune) ----
     fn cmd_upgrade(&self, args: UpgradeArgs) -> Result<()> {
-        let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
         let cfg = Config::load_or_default(&self.paths.config_file())?;
 
-        let targets: Vec<String> = if args.all {
-            cfg.tools.keys().cloned().collect()
-        } else if let Some(n) = &args.name {
-            vec![n.clone()]
-        } else {
-            bail!("specify a tool name or --all");
-        };
-
-        for name in targets {
-            let Some(tool) = cfg.tools.get(&name) else {
-                eprintln!("skip `{name}`: not in config");
-                continue;
-            };
-            // Pinned tag → skip unless --force (§8.4).
-            if tool.tag.is_some() && !args.force {
-                println!(
-                    "skip `{name}`: pinned to tag `{}` (use --force)",
-                    tool.tag.as_deref().unwrap_or("")
-                );
-                continue;
-            }
-            let record = self.upgrade_tool(&cfg, &name, tool)?;
-            locked.state.tools.insert(name.clone(), record);
-            locked.save()?;
-            println!("upgraded `{name}`");
-        }
-        Ok(())
-    }
-
-    // ---- sync (full reconcile: install missing + converge + prune) ----
-    fn cmd_sync(&self, args: SyncArgs) -> Result<()> {
-        let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
-        let cfg = Config::load_or_default(&self.paths.config_file())?;
-
-        // Decide the scope: full sync (no name) or a single tool. An unknown
-        // scoped name (in neither config nor state) is an error.
+        // 1) Select the scope (declared to act on + orphans in scope). Preserves
+        //    user input order; unknown names error.
         let cfg_keys: Vec<String> = cfg.tools.keys().cloned().collect();
-        let state_keys: Vec<String> = locked.state.tools.keys().cloned().collect();
-        let scoped = args.name.is_some();
-        let selection = sync_selection(&cfg_keys, &state_keys, args.name.as_deref())?;
+        // For select_targets we need the state keys; read them up front. dry-run
+        // reads without a lock; otherwise we take the write lock.
+        let dry_run = args.dry_run;
+        // Acquire state: read-only (no lock) on --dry-run, else the write lock.
+        // We deliberately accept that a concurrent writer could change state
+        // between our read and our decisions on --dry-run [C11].
+        let mut locked_opt = if dry_run {
+            None
+        } else {
+            Some(LockedState::acquire(&self.paths.state_file(), args.wait)?)
+        };
+        let ro_state = if dry_run {
+            Some(read_state_no_lock(&self.paths.state_file())?)
+        } else {
+            None
+        };
+        // A single accessor for the current state regardless of lock mode.
+        macro_rules! state {
+            () => {{
+                match (&locked_opt, &ro_state) {
+                    (Some(l), _) => &l.state,
+                    (_, Some(s)) => s,
+                    _ => unreachable!("state is always present"),
+                }
+            }};
+        }
 
-        // 1) npm LTS-jump detection (§5.4): if the live fnm default differs from
-        //    the recorded one, all npm tools must be reinstalled on the new node.
-        let recorded_node = locked.state.runtime.node_default.clone();
+        let state_keys: Vec<String> = state!().tools.keys().cloned().collect();
+        let selection = select_targets(&cfg_keys, &state_keys, &args.names, args.all)?;
+
+        if selection.declared.is_empty() && selection.orphans.is_empty() && !args.all {
+            // select_targets only returns empty when names is empty AND !all.
+            bail!("specify tool names or --all");
+        }
+
+        // 2) LTS-jump detection (§5.4): if the live fnm default differs from the
+        //    recorded one, npm tools in scope must be reinstalled on the new node.
+        let recorded_node = state!().runtime.node_default.clone();
         let live_node = npm::current_default_node(self.runner.as_ref());
         let lts_jumped = npm::lts_jump(recorded_node.as_deref(), live_node.as_deref());
         if lts_jumped && live_node.is_some() {
@@ -340,12 +329,48 @@ impl App {
             );
         }
 
-        // 2) Orphans: in state but not config (§8.3), filtered to the scope.
+        // 3) Backfill the real version for records stuck on the `latest` sentinel,
+        //    by running the installed binary's `--version` (no reinstall, no
+        //    network). Done BEFORE version comparison so the decision sees the
+        //    true installed version. `!dry_run` writes it back.
+        for name in &selection.declared {
+            let Some(rec) = state!().tool(name) else {
+                continue;
+            };
+            // [R1] Only backfill sentinel `"latest"`. If install_paths is empty
+            // the probe cannot run — leave the sentinel in place; the action
+            // decision treats an unresolved sentinel as "allow upgrade".
+            if rec.installed_version != "latest" || rec.install_paths.is_empty() {
+                continue;
+            }
+            let bin = rec.install_paths[0].clone();
+            let Some(ver) = probe_binary_version(self.runner.as_ref(), &bin) else {
+                continue;
+            };
+            if ver == "latest" {
+                continue;
+            }
+            if dry_run {
+                println!("would backfill `{name}` version: {ver}");
+                continue;
+            }
+            if let Some(locked) = locked_opt.as_mut() {
+                if let Some(rec) = locked.state.tools.get_mut(name) {
+                    rec.installed_version = ver.clone();
+                    rec.updated_at = Some(crate::now_iso8601());
+                }
+                locked.save()?;
+            }
+            step!("backfilled `{name}` version: {ver}");
+        }
+
+        // 4) Orphans: in state but not config (§8.3), filtered to scope. Emitted
+        //    BEFORE the declared installs.
         for name in &selection.orphans {
             if args.prune {
-                if args.dry_run {
+                if dry_run {
                     println!("would prune orphan `{name}`");
-                } else {
+                } else if let Some(locked) = locked_opt.as_mut() {
                     // Prune uses a throwaway config so remove_tool can still find
                     // the source from the state record.
                     let mut throwaway = cfg.clone();
@@ -362,94 +387,189 @@ impl App {
                     println!("pruned orphan `{name}`");
                 }
             } else {
-                println!("orphan `{name}`: in state but not config (use `sync --prune` to remove)");
+                println!(
+                    "orphan `{name}`: in state but not config (use `upgrade --prune` to remove)"
+                );
             }
         }
 
-        // 3) Converge declared tools (filtered to the scope).
+        // 5) Per-tool action decision + execution over declared tools.
         let mut changed = 0usize;
-        let mut reinstalled: Vec<String> = Vec::new();
         for name in &selection.declared {
             let tool = &cfg.tools[name];
             let parsed = cfg.parsed_spec(tool)?;
-            let installed = locked.state.tool(name).cloned();
-            let needs = needs_install(&parsed, tool, installed.as_ref(), lts_jumped);
-            if !needs {
-                continue;
-            }
-            if args.dry_run {
-                match installed {
-                    Some(_) => println!("would converge `{name}` ({})", parsed.source),
-                    None => println!("would install `{name}` ({})", parsed.source),
-                }
-                continue;
-            }
-            match &installed {
-                Some(_) => step!("converging `{name}`"),
-                None => step!("installing `{name}`"),
-            }
-            let record = self.install_tool(&cfg, name, tool)?;
-            locked.state.tools.insert(name.clone(), record);
-            locked.save()?;
-            changed += 1;
-            reinstalled.push(name.clone());
-            println!("synced `{name}`");
-        }
+            let installed = state!().tool(name).cloned();
 
-        // 3b) Backfill the real version for records stuck on the `latest`
-        //     sentinel, by running the installed binary's `--version` (no
-        //     reinstall, no network). Tools (re)installed above already recorded
-        //     the real version, so skip them here.
-        for name in &selection.declared {
-            if reinstalled.contains(name) {
-                continue;
-            }
-            let Some(rec) = locked.state.tool(name) else {
-                continue;
-            };
-            if rec.installed_version != "latest" || rec.install_paths.is_empty() {
-                continue;
-            }
-            let bin = rec.install_paths[0].clone();
-            let Some(ver) = probe_binary_version(self.runner.as_ref(), &bin) else {
-                continue;
-            };
-            if ver == "latest" {
-                continue;
-            }
-            if args.dry_run {
-                println!("would backfill `{name}` version: {ver}");
-                continue;
-            }
-            if let Some(rec) = locked.state.tools.get_mut(name) {
-                rec.installed_version = ver.clone();
-                rec.updated_at = Some(crate::now_iso8601());
-            }
-            locked.save()?;
-            step!("backfilled `{name}` version: {ver}");
-        }
+            let action = self.decide_action(
+                &cfg,
+                &parsed,
+                tool,
+                installed.as_ref(),
+                lts_jumped,
+                args.force,
+            )?;
 
-        // 4) Record the (possibly new) node default — ONLY on a full sync. A
-        //    scoped sync reinstalls just one tool, not every npm tool, so leaving
-        //    `node_default` unchanged lets a later full `sync` still detect the
-        //    LTS jump and reinstall the rest.
-        if !scoped {
-            if let Some(live) = live_node {
-                if locked.state.runtime.node_default.as_deref() != Some(live.as_str()) {
-                    locked.state.runtime.node_default = Some(live);
-                    if !args.dry_run {
-                        locked.save()?;
+            match action {
+                UpgradeAction::Skip { reason } => {
+                    if dry_run {
+                        println!("{name:20} {:16} action: skip ({reason})", installed_ver(&installed));
+                    } else {
+                        println!("skip `{name}`: {reason}");
                     }
                 }
+                UpgradeAction::Install { latest } | UpgradeAction::Upgrade { latest } => {
+                    let is_install = installed.is_none();
+                    let verb = if is_install { "install" } else { "upgrade" };
+                    if dry_run {
+                        println!(
+                            "{name:20} {:16} -> {} action: {verb}",
+                            installed_ver(&installed),
+                            latest.as_deref().unwrap_or("latest"),
+                        );
+                        continue;
+                    }
+                    match &installed {
+                        Some(_) => step!("upgrading `{name}`"),
+                        None => step!("installing `{name}`"),
+                    }
+                    // Route pypi through uv::upgrade (in-place); others reinstall.
+                    let record = self.upgrade_tool(&cfg, name, tool)?;
+                    if let Some(locked) = locked_opt.as_mut() {
+                        locked.state.tools.insert(name.clone(), record);
+                        locked.save()?;
+                    }
+                    changed += 1;
+                    println!("{}d `{name}`", verb);
+                }
             }
         }
 
-        if args.dry_run {
+        // 6) Record the (possibly new) node default — ONLY on `--all` and not
+        //    dry-run (aligns with the former `!scoped` semantics). A scoped
+        //    upgrade reinstalls just the named npm tools, not every npm tool, so
+        //    leaving `node_default` unchanged lets a later `upgrade --all` still
+        //    detect the LTS jump and reinstall the rest.
+        if args.all && !dry_run {
+            if let (Some(live), Some(locked)) = (live_node, locked_opt.as_mut()) {
+                if locked.state.runtime.node_default.as_deref() != Some(live.as_str()) {
+                    locked.state.runtime.node_default = Some(live);
+                    locked.save()?;
+                }
+            }
+        }
+
+        if dry_run {
             println!("dry-run complete");
         } else {
-            println!("sync complete: {changed} tool(s) changed");
+            println!("upgrade complete: {changed} tool(s) changed");
         }
         Ok(())
+    }
+
+    /// Decide the action for one declared tool (§8.2/§8.4). All version/tag
+    /// comparisons use [`same_version`] (never `!=`). Queries `latest` only when
+    /// needed (unpinned github/gitlab/template/npm/go with a resolved version).
+    fn decide_action(
+        &self,
+        _cfg: &Config,
+        parsed: &crate::sources::ParsedSpec,
+        tool: &ToolConfig,
+        installed: Option<&ToolRecord>,
+        lts_jumped: bool,
+        force: bool,
+    ) -> Result<UpgradeAction> {
+        // No state record → install (respecting any pin). Fixes the old
+        // pinned+missing bug (never skip an uninstalled pinned tool).
+        let Some(rec) = installed else {
+            return Ok(UpgradeAction::Install { latest: None });
+        };
+
+        // --force always reinstalls (to the target: pin if set, else latest).
+        if force {
+            return Ok(UpgradeAction::Upgrade { latest: None });
+        }
+
+        // npm LTS jump → reinstall all npm tools on the new node.
+        if parsed.source == SourceKind::Npm && lts_jumped {
+            return Ok(UpgradeAction::Upgrade { latest: None });
+        }
+
+        // Pinned tag: converge to the tag; skip once it matches.
+        if let Some(tag) = &tool.tag {
+            if same_version(&rec.installed_version, tag) {
+                return Ok(UpgradeAction::Skip {
+                    reason: format!("pinned to tag `{tag}` (use --force)"),
+                });
+            }
+            return Ok(UpgradeAction::Upgrade { latest: Some(tag.clone()) });
+        }
+
+        // Pinned version (pypi/cargo): converge to the version; skip once matched.
+        if let Some(ver) = &tool.version {
+            if matches!(parsed.source, SourceKind::Pypi | SourceKind::Cargo) {
+                if same_version(&rec.installed_version, ver) {
+                    return Ok(UpgradeAction::Skip {
+                        reason: format!("pinned to version `{ver}` (use --force)"),
+                    });
+                }
+                return Ok(UpgradeAction::Upgrade { latest: Some(ver.clone()) });
+            }
+        }
+
+        // url has no `latest` concept (§5.2): default skip, --force reinstalls
+        // (handled above). No sha256 diff here (out of scope).
+        if parsed.source == SourceKind::Url {
+            return Ok(UpgradeAction::Skip {
+                reason: "url source has no latest concept (use --force to reinstall)".to_string(),
+            });
+        }
+
+        // npm/go with the unresolved `"latest"` sentinel (backfill failed): allow
+        // an upgrade — never compare against the literal `"latest"` string [C1].
+        if matches!(parsed.source, SourceKind::Npm | SourceKind::Go)
+            && rec.installed_version == "latest"
+        {
+            return Ok(UpgradeAction::Upgrade { latest: None });
+        }
+
+        // Unpinned github/gitlab/template/npm/go: query latest and compare.
+        // Route template through template_source::latest; others through
+        // outdated::latest_version.
+        let latest_res = if parsed.source == SourceKind::Template {
+            template_source::latest(tool, self.http.as_ref())
+        } else {
+            outdated::latest_version(self.http.as_ref(), parsed, tool.host.as_deref())
+        };
+        let latest = match latest_res {
+            Ok(Latest::Version(v)) => v,
+            Ok(Latest::NotApplicable) => {
+                // No latest concept for this source → nothing to compare.
+                return Ok(UpgradeAction::Skip {
+                    reason: "no latest version available (use --force to reinstall)".to_string(),
+                });
+            }
+            Err(e) => {
+                // Query failed → can't compare; skip conservatively (unless
+                // --force, already handled). Report the reason.
+                return Ok(UpgradeAction::Skip {
+                    reason: format!("latest query failed ({e})"),
+                });
+            }
+        };
+
+        // installed version "unknown" (sentinel never backfilled) → upgrade
+        // directly (skip the same-version optimization) [C1].
+        if rec.installed_version == "latest" {
+            return Ok(UpgradeAction::Upgrade { latest: Some(latest) });
+        }
+
+        if same_version(&rec.installed_version, &latest) {
+            Ok(UpgradeAction::Skip {
+                reason: format!("already at latest `{latest}`"),
+            })
+        } else {
+            Ok(UpgradeAction::Upgrade { latest: Some(latest) })
+        }
     }
 
     // ---- list ----
@@ -477,54 +597,6 @@ impl App {
             .collect();
         for line in format_list(&rows) {
             println!("{line}");
-        }
-        Ok(())
-    }
-
-    // ---- outdated (§7.1) ----
-    fn cmd_outdated(&self) -> Result<()> {
-        let cfg = Config::load_or_default(&self.paths.config_file())?;
-        let state = read_state_no_lock(&self.paths.state_file())?;
-        if cfg.tools.is_empty() {
-            println!("no tools declared");
-            return Ok(());
-        }
-        for (name, tool) in &cfg.tools {
-            let parsed = match cfg.parsed_spec(tool) {
-                Ok(p) => p,
-                Err(e) => {
-                    println!("{name:20} error: {e}");
-                    continue;
-                }
-            };
-            let installed = state
-                .tools
-                .get(name)
-                .map(|r| r.installed_version.clone())
-                .unwrap_or_else(|| "(none)".into());
-            // template latest depends on the tool's `version_source` config, so
-            // it is routed to the template source; others use the spec-only path.
-            let latest_res = if parsed.source == SourceKind::Template {
-                template_source::latest(tool, self.http.as_ref())
-            } else {
-                outdated::latest_version(self.http.as_ref(), &parsed, tool.host.as_deref())
-            };
-            let latest = match latest_res {
-                Ok(Latest::Version(v)) => v,
-                Ok(Latest::NotApplicable) => "n/a".to_string(),
-                Err(e) => format!("query-failed ({e})"),
-            };
-            // Compare ignoring a leading `v` so a backfilled bare `14.1.1` isn't
-            // falsely flagged against a tag `v14.1.1`.
-            let marker = if latest != "n/a"
-                && installed != "(none)"
-                && !same_version(&latest, &installed)
-            {
-                " *"
-            } else {
-                ""
-            };
-            println!("{name:20} {installed:16} -> {latest}{marker}");
         }
         Ok(())
     }
@@ -1040,84 +1112,91 @@ pub fn same_version(a: &str, b: &str) -> bool {
     strip_v(a) == strip_v(b)
 }
 
-/// Which tools a `sync` invocation should act on.
+/// Render an installed version for the dry-run report, or `(none)` when unset.
+fn installed_ver(installed: &Option<ToolRecord>) -> String {
+    installed
+        .as_ref()
+        .map(|r| r.installed_version.clone())
+        .unwrap_or_else(|| "(none)".into())
+}
+
+/// The per-tool action chosen by `decide_action`. `latest` carries the target
+/// version string for the dry-run report (pin value or queried latest); `None`
+/// means "install/reinstall to whatever the source resolves".
 #[derive(Debug, PartialEq, Eq)]
-pub struct SyncSelection {
-    /// Declared (config) tool names to converge, in config order.
+pub enum UpgradeAction {
+    /// Not installed → install to the target.
+    Install { latest: Option<String> },
+    /// Installed but out of date / forced → (re)install to the target.
+    Upgrade { latest: Option<String> },
+    /// Already at the target (or nothing to compare) → do nothing.
+    Skip { reason: String },
+}
+
+/// Which tools an `upgrade` invocation should act on.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TargetSelection {
+    /// Declared (config) tool names to converge/upgrade, in user-input order
+    /// (or config order for `--all`).
     pub declared: Vec<String>,
-    /// Orphan (state-only) tool names to report/prune, in state order.
+    /// Orphan (state-only) tool names to report/prune, in user-input order (or
+    /// state order for `--all`).
     pub orphans: Vec<String>,
 }
 
-/// Compute the sync scope from config keys, state keys, and an optional tool
-/// name. `config_keys`/`state_keys` should preserve iteration order.
+/// Compute the upgrade scope from config keys, state keys, the requested names,
+/// and `--all`. `config_keys`/`state_keys` preserve iteration order.
 ///
-/// * `name = None` → all declared tools + all orphans (state ∖ config).
-/// * `name = Some(n)`:
-///   * in config → converge just `n` (no orphans).
-///   * else in state (orphan) → prune/report just `n`.
+/// * `all = true` (names empty) → all declared tools + all orphans (state ∖ config).
+/// * `names` non-empty → classify each name in input order:
+///   * in config → declared.
+///   * else in state (orphan) → orphan.
 ///   * in neither → error `no tool \`<n>\` in config or state`.
-pub fn sync_selection(
+///   Order is preserved as given by `names` [R3]. Mixed config+orphan is allowed.
+/// * names empty and `all = false` → empty selection (caller errors).
+pub fn select_targets(
     config_keys: &[String],
     state_keys: &[String],
-    name: Option<&str>,
-) -> Result<SyncSelection> {
-    let is_orphan = |k: &String| !config_keys.iter().any(|c| c == k);
-    match name {
-        None => Ok(SyncSelection {
-            declared: config_keys.to_vec(),
-            orphans: state_keys.iter().filter(|k| is_orphan(k)).cloned().collect(),
-        }),
-        Some(n) => {
-            if config_keys.iter().any(|c| c == n) {
-                Ok(SyncSelection {
-                    declared: vec![n.to_string()],
-                    orphans: Vec::new(),
-                })
-            } else if state_keys.iter().any(|s| s == n) {
-                // Orphan: in state but not config.
-                Ok(SyncSelection {
-                    declared: Vec::new(),
-                    orphans: vec![n.to_string()],
-                })
-            } else {
-                bail!("no tool `{n}` in config or state");
-            }
-        }
-    }
-}
+    names: &[String],
+    all: bool,
+) -> Result<TargetSelection> {
+    let in_config = |n: &str| config_keys.iter().any(|c| c == n);
+    let in_state = |n: &str| state_keys.iter().any(|s| s == n);
 
-/// Decide whether a declared tool needs (re)installing during sync (§8.2).
-///
-/// * missing from state → install.
-/// * npm source and an LTS jump occurred → reinstall (§5.4).
-/// * pinned `tag` (github/gitlab) differs from the installed version → converge.
-/// * pinned `version` (pypi/cargo) differs from the installed version → converge.
-fn needs_install(
-    parsed: &crate::sources::ParsedSpec,
-    tool: &ToolConfig,
-    installed: Option<&ToolRecord>,
-    lts_jumped: bool,
-) -> bool {
-    let Some(rec) = installed else {
-        return true;
-    };
-    if parsed.source == SourceKind::Npm && lts_jumped {
-        return true;
+    if names.is_empty() {
+        if all {
+            return Ok(TargetSelection {
+                declared: config_keys.to_vec(),
+                orphans: state_keys
+                    .iter()
+                    .filter(|k| !in_config(k))
+                    .cloned()
+                    .collect(),
+            });
+        }
+        return Ok(TargetSelection {
+            declared: Vec::new(),
+            orphans: Vec::new(),
+        });
     }
-    if let Some(tag) = &tool.tag {
-        if &rec.installed_version != tag {
-            return true;
+
+    // Named subset: classify in input order, preserving duplicates-free order.
+    let mut declared = Vec::new();
+    let mut orphans = Vec::new();
+    for n in names {
+        if in_config(n) {
+            if !declared.iter().any(|d| d == n) {
+                declared.push(n.clone());
+            }
+        } else if in_state(n) {
+            if !orphans.iter().any(|o| o == n) {
+                orphans.push(n.clone());
+            }
+        } else {
+            bail!("no tool `{n}` in config or state");
         }
     }
-    if let Some(ver) = &tool.version {
-        if matches!(parsed.source, SourceKind::Pypi | SourceKind::Cargo)
-            && &rec.installed_version != ver
-        {
-            return true;
-        }
-    }
-    false
+    Ok(TargetSelection { declared, orphans })
 }
 
 /// Format `ubix list` rows (name, spec, version) into aligned lines. The name
@@ -1320,75 +1399,102 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_sync_flags() {
-        let cli = Cli::try_parse_from(["ubix", "sync", "--dry-run", "--prune"]).unwrap();
+    fn cli_parses_upgrade_flags() {
+        let cli =
+            Cli::try_parse_from(["ubix", "upgrade", "--all", "--dry-run", "--prune"]).unwrap();
         match cli.command {
-            Command::Sync(a) => {
-                assert!(a.dry_run && a.prune);
-                assert_eq!(a.name, None);
+            Command::Upgrade(a) => {
+                assert!(a.all && a.dry_run && a.prune);
+                assert!(a.names.is_empty());
             }
-            _ => panic!("expected sync"),
+            _ => panic!("expected upgrade"),
         }
     }
 
     #[test]
-    fn cli_parses_sync_optional_name() {
-        // Bare `sync` → no name.
-        match Cli::try_parse_from(["ubix", "sync"]).unwrap().command {
-            Command::Sync(a) => assert_eq!(a.name, None),
-            _ => panic!("expected sync"),
-        }
-        // `sync foo` → name = foo.
-        match Cli::try_parse_from(["ubix", "sync", "foo"]).unwrap().command {
-            Command::Sync(a) => assert_eq!(a.name.as_deref(), Some("foo")),
-            _ => panic!("expected sync"),
-        }
-        // `sync foo --prune --dry-run` → name + flags.
-        match Cli::try_parse_from(["ubix", "sync", "foo", "--prune", "--dry-run"])
-            .unwrap()
-            .command
-        {
-            Command::Sync(a) => {
-                assert_eq!(a.name.as_deref(), Some("foo"));
-                assert!(a.prune && a.dry_run);
+    fn cli_parses_upgrade_multi_names() {
+        // `upgrade foo bar` → two variadic names.
+        match Cli::try_parse_from(["ubix", "upgrade", "foo", "bar"]).unwrap().command {
+            Command::Upgrade(a) => {
+                assert_eq!(a.names, vec!["foo".to_string(), "bar".to_string()]);
+                assert!(!a.all);
             }
-            _ => panic!("expected sync"),
+            _ => panic!("expected upgrade"),
+        }
+        // `upgrade foo --force` → name + flag.
+        match Cli::try_parse_from(["ubix", "upgrade", "foo", "--force"]).unwrap().command {
+            Command::Upgrade(a) => {
+                assert_eq!(a.names, vec!["foo".to_string()]);
+                assert!(a.force);
+            }
+            _ => panic!("expected upgrade"),
+        }
+        // Bare `upgrade` → no names, no --all (cmd errors at runtime).
+        match Cli::try_parse_from(["ubix", "upgrade"]).unwrap().command {
+            Command::Upgrade(a) => {
+                assert!(a.names.is_empty() && !a.all);
+            }
+            _ => panic!("expected upgrade"),
         }
     }
 
     #[test]
-    fn sync_selection_no_name_is_all() {
+    fn select_targets_all_is_config_plus_orphans() {
         let cfg = vec!["eza".to_string(), "ruff".to_string()];
         let state = vec!["eza".to_string(), "orphan".to_string()];
-        let sel = sync_selection(&cfg, &state, None).unwrap();
+        let sel = select_targets(&cfg, &state, &[], true).unwrap();
         assert_eq!(sel.declared, vec!["eza", "ruff"]);
         assert_eq!(sel.orphans, vec!["orphan"]);
     }
 
     #[test]
-    fn sync_selection_known_config_name() {
+    fn select_targets_known_config_name() {
         let cfg = vec!["eza".to_string(), "ruff".to_string()];
         let state = vec!["eza".to_string()];
-        let sel = sync_selection(&cfg, &state, Some("ruff")).unwrap();
+        let sel = select_targets(&cfg, &state, &["ruff".to_string()], false).unwrap();
         assert_eq!(sel.declared, vec!["ruff"]);
         assert!(sel.orphans.is_empty());
     }
 
     #[test]
-    fn sync_selection_orphan_name() {
+    fn select_targets_orphan_name() {
         let cfg = vec!["eza".to_string()];
         let state = vec!["eza".to_string(), "gone".to_string()];
-        let sel = sync_selection(&cfg, &state, Some("gone")).unwrap();
+        let sel = select_targets(&cfg, &state, &["gone".to_string()], false).unwrap();
         assert!(sel.declared.is_empty());
         assert_eq!(sel.orphans, vec!["gone"]);
     }
 
     #[test]
-    fn sync_selection_unknown_name_errors() {
+    fn select_targets_unknown_name_errors() {
         let cfg = vec!["eza".to_string()];
         let state = vec!["eza".to_string()];
-        let err = sync_selection(&cfg, &state, Some("nope")).unwrap_err();
+        let err = select_targets(&cfg, &state, &["nope".to_string()], false).unwrap_err();
         assert!(err.to_string().contains("no tool `nope` in config or state"), "{err}");
+    }
+
+    #[test]
+    fn select_targets_mixed_config_and_orphan_preserves_order() {
+        // tool1 ∈ config, tool2 ∈ orphan; order must follow the input names.
+        let cfg = vec!["tool1".to_string(), "zzz".to_string()];
+        let state = vec!["tool2".to_string()];
+        let sel = select_targets(
+            &cfg,
+            &state,
+            &["tool1".to_string(), "tool2".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(sel.declared, vec!["tool1"]);
+        assert_eq!(sel.orphans, vec!["tool2"]);
+    }
+
+    #[test]
+    fn select_targets_empty_no_all_is_empty() {
+        let cfg = vec!["eza".to_string()];
+        let state = vec!["eza".to_string()];
+        let sel = select_targets(&cfg, &state, &[], false).unwrap();
+        assert!(sel.declared.is_empty() && sel.orphans.is_empty());
     }
 
     use crate::sources::{ParsedSpec, SourceKind};
@@ -1478,44 +1584,211 @@ mod tests {
         }
     }
 
-    #[test]
-    fn needs_install_when_missing() {
-        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
-        let tool = ToolConfig::from_spec("github:o/r");
-        assert!(needs_install(&parsed, &tool, None, false));
+    // ---- action decision (decide_action) ----
+
+    use crate::http::MockHttp;
+
+    /// Build a test `App` with a mock http client and runner. Paths point at a
+    /// throwaway dir; `decide_action` only touches http/runner (never the FS).
+    fn test_app(http: MockHttp) -> App {
+        App {
+            paths: Paths { config_dir: "/tmp/ubix-test".into(), data_dir: "/tmp/ubix-test".into() },
+            runner: Box::new(MockRunner::new()),
+            http: Box::new(http),
+            verbosity: crate::progress::Verbosity::Quiet,
+        }
+    }
+
+    /// Run `decide_action` for a tool with no config/state extras beyond `tool`.
+    fn decide(
+        app: &App,
+        parsed: &ParsedSpec,
+        tool: &ToolConfig,
+        installed: Option<&ToolRecord>,
+        lts_jumped: bool,
+        force: bool,
+    ) -> UpgradeAction {
+        let cfg = Config::default();
+        app.decide_action(&cfg, parsed, tool, installed, lts_jumped, force).unwrap()
     }
 
     #[test]
-    fn skip_when_present_and_unpinned() {
-        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
-        let tool = ToolConfig::from_spec("github:o/r");
-        assert!(!needs_install(&parsed, &tool, Some(&rec("latest")), false));
-    }
-
-    #[test]
-    fn converge_when_pinned_tag_differs() {
+    fn action_missing_pinned_installs() {
+        // Pinned+missing must install (fixes the old skip-when-pinned bug).
+        let app = test_app(MockHttp::new());
         let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
         let mut tool = ToolConfig::from_spec("github:o/r");
         tool.tag = Some("v2".into());
-        assert!(needs_install(&parsed, &tool, Some(&rec("v1")), false));
-        // Same tag → skip.
-        assert!(!needs_install(&parsed, &tool, Some(&rec("v2")), false));
+        assert_eq!(
+            decide(&app, &parsed, &tool, None, false, false),
+            UpgradeAction::Install { latest: None }
+        );
     }
 
     #[test]
-    fn npm_reinstalls_on_lts_jump() {
-        let parsed = ParsedSpec { source: SourceKind::Npm, locator: "pnpm".into() };
-        let tool = ToolConfig::from_spec("npm:pnpm");
-        assert!(needs_install(&parsed, &tool, Some(&rec("latest")), true));
-        assert!(!needs_install(&parsed, &tool, Some(&rec("latest")), false));
+    fn action_pinned_tag_same_version_skips() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
+        let mut tool = ToolConfig::from_spec("github:o/r");
+        // Installed bare `1.0.0` vs tag `v1.0.0` → same_version → skip.
+        tool.tag = Some("v1.0.0".into());
+        match decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, false) {
+            UpgradeAction::Skip { .. } => {}
+            other => panic!("expected skip, got {other:?}"),
+        }
     }
 
     #[test]
-    fn pypi_converges_on_version_change() {
+    fn action_pinned_tag_differs_upgrades() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
+        let mut tool = ToolConfig::from_spec("github:o/r");
+        tool.tag = Some("v2".into());
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("v1")), false, false),
+            UpgradeAction::Upgrade { latest: Some("v2".into()) }
+        );
+    }
+
+    #[test]
+    fn action_force_reinstalls_even_when_pinned_match() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
+        let mut tool = ToolConfig::from_spec("github:o/r");
+        tool.tag = Some("v1".into());
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("v1")), false, true),
+            UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn action_pypi_pinned_version_converges() {
+        let app = test_app(MockHttp::new());
         let parsed = ParsedSpec { source: SourceKind::Pypi, locator: "ruff".into() };
         let mut tool = ToolConfig::from_spec("pypi:ruff");
         tool.version = Some("0.7.0".into());
-        assert!(needs_install(&parsed, &tool, Some(&rec("0.6.0")), false));
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("0.6.0")), false, false),
+            UpgradeAction::Upgrade { latest: Some("0.7.0".into()) }
+        );
+        // Same version → skip.
+        match decide(&app, &parsed, &tool, Some(&rec("0.7.0")), false, false) {
+            UpgradeAction::Skip { .. } => {}
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_npm_lts_jump_reinstalls() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Npm, locator: "pnpm".into() };
+        let tool = ToolConfig::from_spec("npm:pnpm");
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("latest")), true, false),
+            UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn action_npm_sentinel_latest_allows_upgrade() {
+        // npm record stuck on the literal `"latest"` sentinel (backfill failed):
+        // allow an upgrade — never compare against the literal string.
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec { source: SourceKind::Npm, locator: "pnpm".into() };
+        let tool = ToolConfig::from_spec("npm:pnpm");
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("latest")), false, false),
+            UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn action_go_sentinel_latest_allows_upgrade() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec {
+            source: SourceKind::Go,
+            locator: "example.com/cmd/tool".into(),
+        };
+        let tool = ToolConfig::from_spec("go:example.com/cmd/tool@latest");
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("latest")), false, false),
+            UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn action_unpinned_github_same_latest_skips() {
+        let http = MockHttp::new().with_text(
+            "https://api.github.com/repos/eza-community/eza/releases/latest",
+            r#"{"tag_name":"v0.23.4"}"#,
+        );
+        let app = test_app(http);
+        let parsed = ParsedSpec {
+            source: SourceKind::Github,
+            locator: "eza-community/eza".into(),
+        };
+        let tool = ToolConfig::from_spec("github:eza-community/eza");
+        // Installed bare `0.23.4` vs latest `v0.23.4` → same_version → skip.
+        match decide(&app, &parsed, &tool, Some(&rec("0.23.4")), false, false) {
+            UpgradeAction::Skip { .. } => {}
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_unpinned_github_diff_latest_upgrades() {
+        let http = MockHttp::new().with_text(
+            "https://api.github.com/repos/eza-community/eza/releases/latest",
+            r#"{"tag_name":"v0.23.4"}"#,
+        );
+        let app = test_app(http);
+        let parsed = ParsedSpec {
+            source: SourceKind::Github,
+            locator: "eza-community/eza".into(),
+        };
+        let tool = ToolConfig::from_spec("github:eza-community/eza");
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("v0.20.0")), false, false),
+            UpgradeAction::Upgrade { latest: Some("v0.23.4".into()) }
+        );
+    }
+
+    #[test]
+    fn action_unpinned_github_unknown_installed_upgrades() {
+        // installed sentinel `"latest"` never backfilled → upgrade directly.
+        let http = MockHttp::new().with_text(
+            "https://api.github.com/repos/eza-community/eza/releases/latest",
+            r#"{"tag_name":"v0.23.4"}"#,
+        );
+        let app = test_app(http);
+        let parsed = ParsedSpec {
+            source: SourceKind::Github,
+            locator: "eza-community/eza".into(),
+        };
+        let tool = ToolConfig::from_spec("github:eza-community/eza");
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("latest")), false, false),
+            UpgradeAction::Upgrade { latest: Some("v0.23.4".into()) }
+        );
+    }
+
+    #[test]
+    fn action_url_skips_unless_forced() {
+        let app = test_app(MockHttp::new());
+        let parsed = ParsedSpec {
+            source: SourceKind::Url,
+            locator: "https://x/y.tar.gz".into(),
+        };
+        let tool = ToolConfig::from_spec("url:https://x/y.tar.gz");
+        match decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, false) {
+            UpgradeAction::Skip { .. } => {}
+            other => panic!("expected skip, got {other:?}"),
+        }
+        assert_eq!(
+            decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, true),
+            UpgradeAction::Upgrade { latest: None }
+        );
     }
 
     #[test]

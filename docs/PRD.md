@@ -14,14 +14,14 @@
 |---|------|
 | D1 | **实现语言 = Rust**，直接依赖 `ubi` library crate（v0.9+，`UbiBuilder` API），复用其资产匹配 / 解压启发式。 |
 | D2 | **配置与状态两层分离**：`config.toml` 放 `~/.config/ubix/`（人手写、进 dotfiles）；`state.toml` 放 `~/.local/share/ubix/`（机器写、不进 dotfiles）。 |
-| D3 | **幂等**：CLI 子命令负责写配置并即时安装；`sync` 让系统状态收敛到配置声明，可反复执行。 |
+| D3 | **幂等**：CLI 子命令负责写配置并即时安装；`upgrade --all` 让系统状态收敛到配置声明，可反复执行。 |
 | D4 | **npm/fnm**：fnm 装并 `default` 到 Node 最新 LTS；全局包装在该 default node 上；把 fnm **运行时探测到的** alias bin 目录加入 PATH（不逐包软链）。 |
 | D5 | **配置紧凑语法**：每个工具用 `spec = "$source:$locator"` 一行声明，需要参数时补字段；CLI `ubix add <spec>` 复用同一语法。 |
 | D6 | **Token 环境变量**：`UBIX_GITHUB_TOKEN` / `UBIX_GITLAB_TOKEN`。 |
 | D7 | **cargo 来源落地 `~/.local/bin`**：透传 `cargo install --root ~/.local`；卸载 `cargo uninstall --root ~/.local`，生命周期由 cargo 账本（`~/.local/.crates.toml`）管理。 |
 | D8 | **go 来源落地 `~/.local/bin`**：`GOBIN=~/.local/bin go install`；go 无账本，由 ubix `state.toml` 记账与卸载。 |
 | D9 | **工具链引导**：`ubix bootstrap rust|go` 一次性引导；后续版本管理交回 rustup / go 的 `GOTOOLCHAIN`。**Go GOROOT 默认 `~/.local/share/go`**。 |
-| D10 | **孤儿处理**（在 config 已删、state 仍在）：`sync` 默认**只报告不删**；`sync --prune` 才卸载孤儿。见 §8.3。 |
+| D10 | **孤儿处理**（在 config 已删、state 仍在）：`upgrade` 默认**只报告不删**；`upgrade --prune` 才卸载孤儿。见 §8.3。 |
 | D11 | **锁定 `tag` 后 upgrade**：`upgrade` 对已 pin `tag` 的工具默认**跳过并提示**，`--force` 才重装同 tag。见 §8.4。 |
 | D12 | **并发安全**：所有写操作对 `state.toml` 加**排他 advisory 文件锁**（flock），获取不到锁默认 fail-fast（`--wait` 可等待）。见 §8.6。 |
 | D13 | **schema 版本**：`config.toml` 与 `state.toml` 均带 `schema_version`（当前 = 1），不匹配时按迁移策略处理。见 §4.6。 |
@@ -47,7 +47,7 @@
 2. 多来源统一：release 二进制（复用 ubi 启发式）/ 直链 / PyPI(uv) / npm(fnm) / cargo / go。
 3. 尽可能全部落到 `~/.local/bin`，**原地升级**（装最新、删旧），不分版本目录、不做 shims。
 4. 缺失的底层工具（uv、fnm、rustup、go）可由 ubix 引导安装。
-5. 幂等：`sync` 让系统状态收敛到配置声明。
+5. 幂等：`upgrade --all` 让系统状态收敛到配置声明。
 6. 生命周期完整：安装 / 升级 / **可追踪** / **可干净卸载**。
 
 ### 1.3 非目标
@@ -67,10 +67,10 @@
 ## 2. 用户与场景
 - 主用户：单人开发者 / 运维，管理自己的 `~/.local/bin`。
 - 场景：
-  - 新机器初始化：`ubix sync` 恢复全部工具。
+  - 新机器初始化：`ubix upgrade --all` 恢复全部工具。
   - 加新工具：`ubix add github:owner/repo` / `pypi:ruff` / `npm:pnpm` / `cargo:xx` / `go:...@latest`。
-  - 例行升级：`ubix upgrade [name|--all]`。
-  - 查状态：`ubix list` / `ubix outdated`。
+  - 例行升级：`ubix upgrade [name...|--all]`。
+  - 查状态：`ubix list` / `ubix upgrade --all --dry-run`。
   - 引导工具链：`ubix bootstrap rust|go`。
 
 ---
@@ -243,11 +243,11 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - **多入口 `exes`**（如 uv/uvx）：实现策略 = **`extract_all()` 解出全部到临时目录，再按 `exes` 白名单挑选、原子移动进 `install_dir`，其余丢弃**（避免多次网络下载）。若归档结构不支持，则回退为对每个 exe 各调一次 ubi。`state.toml` 的 `install_paths` 记录全部入口。
 - **自建 GitLab**：`host="https://gitlab.fish"` → ubix 拼 `https://gitlab.fish/api/v4` 传 `UbiBuilder::api_base_url()` 并 `forge(GitLab)`。
 - Token：`UBIX_GITHUB_TOKEN` / `UBIX_GITLAB_TOKEN` → ubi `.github_token()/.gitlab_token()`（匿名 GitHub API 仅 60 req/h）。
-- **版本记账**：`tag` 已 pin → 记 pin 值。未 pin 时，由于 ubi 0.9 不暴露它解析到的实际 tag，unpinned github/gitlab 会在安装时**额外发一次 releases-API 查询**取真实最新 tag 记入 `installed_version`（复用 `outdated::latest_version`，honors `UBIX_GITHUB_TOKEN`/`UBIX_GITLAB_TOKEN`）；仅当该查询失败时才回退记 `latest`。这样 `list`/`outdated` 能显示真实版本、且 `installed==latest` 时正确判为未过期。
+- **版本记账**：`tag` 已 pin → 记 pin 值。未 pin 时，由于 ubi 0.9 不暴露它解析到的实际 tag，unpinned github/gitlab 会在安装时**额外发一次 releases-API 查询**取真实最新 tag 记入 `installed_version`（复用 `outdated::latest_version`，honors `UBIX_GITHUB_TOKEN`/`UBIX_GITLAB_TOKEN`）；仅当该查询失败时才回退记 `latest`。这样 `list`/`upgrade --dry-run` 能显示真实版本、且 `installed==latest` 时正确判为未过期。
 
 ### 5.2 url 直链
 - 无 release API 时的兜底：下载给定 URL，按扩展名走 §5.1 格式处理与提取（`extract_all` + `exe`/`exes` 挑选）。
-- **无 latest 概念**：视为固定版本，`outdated` 跳过、`upgrade` 需手动改 URL。state 记录 URL 与下载内容 sha256 以判定是否变化。
+- **无 latest 概念**：视为固定版本，`upgrade --dry-run` 报告为 `n/a`/skip、`upgrade` 需手动改 URL（`--force` 才重装）。state 记录 URL 与下载内容 sha256 以判定是否变化。
 
 ### 5.3 pypi（uv tool）
 - 前置 `uv`：**不做特殊 bootstrap**——uv 本身就是普通 GitHub 单文件 release。缺失时报错并**列出可复制的安装 spec**：`ubix add github:astral-sh/uv --name uv --exes uv,uvx`。
@@ -260,7 +260,7 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - **前置 default node 校验**：任何 npm 操作前先 `fnm exec --using=default -- node --version` 确认存在可用的 fnm default node；缺失则报错 `no fnm default node set; run \`ubix bootstrap nodejs\` first`。
 - **PATH 目录运行时探测**：**不硬编码** `~/.local/share/fnm`。通过 `fnm env --json`（或读 `FNM_DIR`，并处理 legacy `~/.fnm` 回退）取得实际 base，得到稳定 alias bin 目录 `<base>/aliases/default/bin` 加入 PATH。alias 是软链，LTS 大版本升级自动跟随。
 - 包操作**一律经 fnm default node 执行**：`fnm exec --using=default -- npm i -g <pkg>[@version]` / `… npm rm -g <pkg>`。**绝不**直接跑裸 `npm`——PATH 上的 `npm` 可能是版本管理器（如 mise/asdf）的 shim，指向另一个 node，会把全局包装错地方、而 ubix 记的是 fnm alias-bin 路径导致找不到。走 `fnm exec` 保证用的是 fnm default node 的 npm。
-- **LTS 跃迁检测**：state 记录 `_runtime.node_default`；每次 `sync`/`upgrade` 读 `fnm current`/`fnm default` 实际版本，与记录值比较；不同则在新 default 上**按 config 重装所有 `npm` 来源工具**并更新记录，保持幂等（重装同样经 `fnm exec --using=default` 且先校验 default node）。
+- **LTS 跃迁检测**：state 记录 `_runtime.node_default`；每次 `upgrade` 读 `fnm current`/`fnm default` 实际版本，与记录值比较；不同则在新 default 上**重装 scope 内的 `npm` 来源工具**并（仅 `--all` 时）更新记录，保持幂等（重装同样经 `fnm exec --using=default` 且先校验 default node）。
 - 副作用（已接受）：node/npm/npx 及所有全局 npm 包入口都会进 PATH，不落 `~/.local/bin`。
 
 ### 5.5 cargo（源码，D7）
@@ -281,7 +281,7 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - **libc 变体**：Linux musl 上若设了 `url_musl` 用之，否则用 `url`（复用平台 libc 探测）。
 - **格式**：按渲染后 URL 扩展名走 §5.2 的解压/提取；无扩展（如 `/claude`）→ 裸二进制。支持 `exe`/`exes`/`rename`。
 - **state**：`source="http"`，记 resolved 版本、渲染后的 asset 名、sha256、locator(模板)。
-- **outdated**：设了 `version_source` → 查其最新对比已装；否则 `n/a`。
+- **latest 查询（`upgrade --dry-run`/升级决策）**：设了 `version_source` → 查其最新对比已装；否则 `n/a`。
 - **升级**：重解析版本后重装（pin `tag` 时按 §8.4 跳过）。
 - 配置示例（claude-code）：
 ```toml
@@ -316,17 +316,19 @@ ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--ve
       # spec 语法同 §4.2；写入 config 并立即安装
       # 同名工具已存在时默认报错（提示用 upgrade 或 --force）；--force 才覆盖参数并重装（§8.10）
 ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
-ubix upgrade [name | --all] [--force]   # 原地升级；pin tag 默认跳过（D11）
-ubix sync [name] [--dry-run] [--prune] [--wait]  # 幂等对账；给 name 只对账该工具，默认全部
+ubix upgrade [name... | --all] [--force] [--dry-run] [--prune] [--wait]
+      # 统一收敛/升级/报告/清孤儿：装缺失、升到最新、收敛 pin、（--prune）清孤儿
+      # 多名变参；无 name 且无 --all → 报错；pin tag/version 默认收敛后跳过（--force 才重装，D11）
+      # --dry-run：只读报告 installed vs latest + 动作（= 旧 outdated，查询见 §7.1），不写不装
+      # --prune：清 scope 内孤儿（state 有、config 无，§8.3）
 ubix list                       # 已声明工具：名称 / spec / 已装版本
-ubix outdated                   # 各来源最新版 vs 已装（查询见 §7.1）
 ubix info <name>                # 来源、asset/module、路径、参数
 ubix edit                       # 打开 config.toml
 ubix doctor                     # 检查 uv/fnm/rustup/go、各 PATH 段、~/.local/bin 就绪
 ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；python/nodejs=装uv/fnm并设默认runtime（§6）
 ```
 
-### 7.1 `outdated` 各来源查询
+### 7.1 `upgrade --dry-run` 各来源 latest 查询
 | 来源 | 最新版查询 |
 |---|---|
 | github | Releases API（复用 ubi 的 latest 解析） |
@@ -346,15 +348,16 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 新版本装到同一路径覆盖、删旧文件；不留历史版本、无版本目录、无 shims。
 
 ### 8.2 幂等
-`sync` 可反复执行；已是目标版本则跳过；npm LTS 跃迁触发重装（§5.4）。
-- **版本回填**：早期安装的记录可能是 `installed_version = "latest"` 哨兵。`sync` 会对处于该哨兵、且 `install_paths` 非空的工具运行已装二进制的 `--version`（依次尝试 `--version`/`-V`/`version`，从 stdout+stderr 里扫首个 `v?MAJOR.MINOR.PATCH[后缀]`，保留前导 `v`）回填真实版本——**不重装、不联网**；扫不到则保持 `latest`。本次已（重）装的工具由安装流程记真实版本，回填跳过。`--dry-run` 只提示不写。全量 `sync` 与限定 `sync <name>` 都适用。
-- `outdated` 的过期判定**忽略一个前导 `v`**（`same_version`），使回填出的裸 `14.1.1` 不会被误判为落后于 tag `v14.1.1`。
+`upgrade --all` 可反复执行；已是目标版本则跳过；npm LTS 跃迁触发重装（§5.4）。
+未装工具（含 pin 的 tag/version）→ 安装；未 pin 工具查 latest，与已装比较（`same_version`）后决定升级或跳过。所有版本/tag 比较都用 `same_version`（忽略一个前导 `v`），不做字面 `!=`。
+- **版本回填**：早期安装的记录可能是 `installed_version = "latest"` 哨兵。`upgrade` 在**版本比较之前**对处于该哨兵、且 `install_paths` 非空的工具运行已装二进制的 `--version`（依次尝试 `--version`/`-V`/`version`，从 stdout+stderr 里扫首个 `v?MAJOR.MINOR.PATCH[后缀]`，保留前导 `v`）回填真实版本——**不重装、不联网**；扫不到（或 `install_paths` 为空 probe 无法运行）则保持 `latest`，此时视版本为“未知”走 allow-upgrade 兜底（npm/go 哨兵同理，绝不与字面 `"latest"` 比较）。`--dry-run` 只提示不写。全量 `--all` 与限定 `upgrade <name...>` 都适用。
+- 过期判定**忽略一个前导 `v`**（`same_version`），使回填出的裸 `14.1.1` 不会被误判为落后于 tag `v14.1.1`。
 
 ### 8.3 孤儿处理（D10）
-state 有、config 无的工具：`sync` 默认**仅列出警告**；`sync --prune` 才按来源卸载并从 state 移除。
+state 有、config 无的工具：`upgrade` 默认**仅列出警告**；`upgrade --prune` 才按来源卸载并从 state 移除。孤儿处理限定在 scope 内（`--all` 覆盖全部孤儿，`upgrade <name...>` 只处理命名的孤儿）。
 
-### 8.4 pin tag 升级（D11）
-工具已 pin `tag`：`upgrade` 默认跳过并提示“已锁定 <tag>”；`--force` 才重装同 tag（用于修复损坏文件）。
+### 8.4 pin tag/version 升级（D11）
+工具已 pin `tag`/`version`：`upgrade` 收敛到该 pin，一旦已装版本匹配即跳过并提示“已锁定 <pin>”；`--force` 才重装（用于修复损坏文件）。未装的 pin 工具照常安装到该 pin。
 
 ### 8.5 remove 安全（D14）
 `remove` 只处理 `state.toml` 记录、由 ubix 安装的 `install_paths`。若目标不在 state（如用户预先手放的同名文件）→ **拒绝删除**并提示。`--force` 的语义是**先 adopt（把该文件登记进 state）再删除**，即显式承认“接管并移除”；不提供“删任意未记录文件”的能力。
@@ -364,7 +367,7 @@ state 有、config 无的工具：`sync` 默认**仅列出警告**；`sync --pru
 
 ### 8.7 原子替换与失败恢复（D15）
 - release/url/go：先下载/编译到临时文件 → 校验 → 原子 `rename` 替换。校验/替换成功后**才**更新 `state.toml`。
-- **恢复契约**：若在更新 state 前任一步失败（网络中断、chmod 失败、磁盘满），state 不被写入，下次 `sync` 自动重试；已存在的可用旧二进制不被破坏。
+- **恢复契约**：若在更新 state 前任一步失败（网络中断、chmod 失败、磁盘满），state 不被写入，下次 `upgrade` 自动重试；已存在的可用旧二进制不被破坏。
 
 ### 8.8 校验和发现
 按优先级扫描同 release 资产：`<asset>.sha256` → `<asset>.sha256sum` → 合并文件 `checksums.txt` / `SHA256SUMS`（解析其中匹配 `<asset>` 的行）。找到则验证并写 `state.sha256`；找不到记 `checksum = "none"`（不阻断安装，`doctor` 可提示）。
