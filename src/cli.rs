@@ -70,6 +70,9 @@ pub struct AddArgs {
     /// Rename the installed executable.
     #[arg(long)]
     pub rename: Option<String>,
+    /// Overwrite an existing tool of the same name (reinstall + replace config entry).
+    #[arg(long)]
+    pub force: bool,
     /// Block waiting for the state lock instead of failing fast.
     #[arg(long)]
     pub wait: bool,
@@ -172,6 +175,14 @@ impl App {
         let parsed = parse_spec(&args.spec, default_source)
             .with_context(|| format!("invalid spec `{}`", args.spec))?;
         let name = args.name.clone().unwrap_or_else(|| derive_name(&parsed.locator));
+
+        // Existence guard: refuse to clobber an existing declaration unless --force.
+        if cfg.tools.contains_key(&name) && !args.force {
+            bail!(
+                "tool `{name}` already exists in config; use `ubix upgrade {name}` to reinstall, \
+                 or `ubix add --force` to overwrite its parameters"
+            );
+        }
 
         // Install first, then persist state + config so we never record a failed install.
         let record = self.install_tool(&cfg, &name, &tool)?;
@@ -650,6 +661,21 @@ mod tests {
                 assert_eq!(a.spec, "github:owner/repo");
                 assert_eq!(a.tag.as_deref(), Some("v1"));
             }
+            _ => panic!("expected add"),
+        }
+    }
+
+    #[test]
+    fn cli_add_force_defaults_false_and_parses() {
+        let plain = Cli::try_parse_from(["ubix", "add", "github:owner/repo"]).unwrap();
+        match plain.command {
+            Command::Add(a) => assert!(!a.force, "force should default to false"),
+            _ => panic!("expected add"),
+        }
+        let forced =
+            Cli::try_parse_from(["ubix", "add", "github:owner/repo", "--force"]).unwrap();
+        match forced.command {
+            Command::Add(a) => assert!(a.force),
             _ => panic!("expected add"),
         }
     }

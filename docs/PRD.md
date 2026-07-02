@@ -270,8 +270,9 @@ node_default      = "v22.14.0"
 
 ## 7. CLI 接口
 ```
-ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--version V]
+ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--version V] [--force]
       # spec 语法同 §4.2；写入 config 并立即安装
+      # 同名工具已存在时默认报错（提示用 upgrade 或 --force）；--force 才覆盖参数并重装（§8.10）
 ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
 ubix upgrade [name | --all] [--force]   # 原地升级；pin tag 默认跳过（D11）
 ubix sync [--dry-run] [--prune] [--wait]  # 幂等对账；--prune 删孤儿（D10）
@@ -327,6 +328,9 @@ state 有、config 无的工具：`sync` 默认**仅列出警告**；`sync --pru
 
 ### 8.9 PATH 自检
 `doctor` 检查以下是否在 `$PATH`，缺失给出写入 shell rc 的建议：`~/.local/bin`、`~/.cargo/bin`、fnm alias bin（运行时探测）、`~/.local/share/go/bin`。
+
+### 8.10 add 已存在保护
+`add` 计算出的工具 key 若已在 `config.toml` 中存在，默认**报错并中止**（在安装前，不触网），提示改用 `upgrade <name>`（重装）或 `add --force`（有意覆盖）。`--force` 时整条替换该 config 条目并重装。此举避免静默覆盖已设参数（如 `exe`/`matching`）。注意 key 由 locator 末段派生，`--name` 可显式指定；不同 key 会新建并存条目而非覆盖。
 
 ---
 
