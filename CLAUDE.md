@@ -8,7 +8,8 @@ principles and pointers, not a changelog.
 A declarative binary/CLI installer & tracker. Users declare tools in
 `config.toml`; ubix installs/upgrades/removes them across many sources and
 records results in `state.toml`. Wraps `ubi` for GitHub/GitLab release assets;
-has its own handlers for pypi(uv), npm(fnm), cargo, go, url, and templated URLs.
+has its own handlers for pypi(uv), npm(fnm), cargo, go, pixi(conda), url, and
+templated URLs.
 Full spec: `docs/PRD.md`. Aqua generator: `docs/aqua-plan.md`.
 
 ## Build / test / lint
@@ -32,14 +33,21 @@ lto, strip, panic=abort).
 - `config.rs` / `state.rs` — `config.toml` / `state.toml` models. `state` holds
   the `LockedState` flock guard.
 - `sources/` — one module per source. `mod.rs` defines `SourceKind`, spec
-  parsing (`parse_spec`), the `Source` trait, and `InstallOutcome`. `template.rs`
-  is the templated-URL source (`http:` is a back-compat alias).
+  parsing (`parse_spec`), the `Source` trait, and `InstallOutcome`. The `url`
+  source is unified: `url.rs::install` IS the general template flow (resolve
+  version → render → download → extract); a fixed URL is just the degenerate
+  template (no placeholders → version "url" sentinel, no render, plus sidecar
+  checksum discovery). `template.rs` holds the render/version-resolution helpers
+  it calls (`is_templated`/`resolve_version`/`render_url`/`latest`), NOT an
+  install path. `template:`/`http:` are back-compat spec aliases for `url:`.
 - `engine.rs` — `ReleaseEngine` trait + `UbiEngine` (drives ubi on a
   current-thread tokio runtime) + `atomic_install` / `sha256_*`.
 - `aqua/` — aqua-registry integration as a **config generator** (NOT a runtime
   source): fetch registry.yaml → resolve branch/platform → synthesize a
   `github:` `ToolConfig`. `prune.rs` simulates ubi's asset picker.
 - `outdated.rs` — latest-version queries (pure parsers + `HttpClient` dispatch).
+- `prefix_dev.rs` — prefix.dev GraphQL client (conda latest-version + package
+  search) for the `pixi` source; pure query builders/parsers + POST dispatch.
 - `bootstrap.rs` — rust/go toolchain fetches (python/nodejs handled in `cli.rs`).
 - `archive.rs`, `checksum.rs`, `paths.rs`, `platform.rs`, `progress.rs`,
   `runner.rs`, `http.rs` — utilities/seams.
@@ -70,8 +78,17 @@ fixture-based test. All tests are offline.
   sentinel (`PlatformString::resolve` maps `""`→`None`). Never DROP a platform
   key from a partial matching map — `resolve` errors on a missing key.
 - **npm goes through `fnm exec --using=default -- npm …`** — never bare `npm`.
-- **uv/cargo/npm removal is tool-managed** (`uv tool uninstall`, etc.); only
-  github/gitlab/url/go removal unlinks tracked files directly.
+- **uv/cargo/npm/pixi removal is tool-managed** (`uv tool uninstall`,
+  `pixi global uninstall`, etc.); only github/gitlab/url/go removal unlinks
+  tracked files directly.
+- **pixi has no bin-dir redirect** (unlike uv's `UV_TOOL_BIN_DIR`): binaries land
+  as trampolines in `$PIXI_HOME/bin` (default `~/.pixi/bin`), which is what we
+  track — NOT `install_dir`. pixi locators are conda MatchSpecs and may be
+  channel-qualified (`pixi:bioconda::samtools`; bare name → conda-forge).
+- **pixi metadata comes from the prefix.dev GraphQL API** (`prefix_dev.rs`, POST
+  via the `HttpClient` seam): `latest_version` powers `outdated`/`upgrade`;
+  `search` powers `ubix search --pixi` across ALL prefix.dev channels. conda has
+  no per-package REST endpoint — do not reach for anaconda.org.
 
 ## Working style
 

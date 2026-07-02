@@ -72,10 +72,19 @@ pub fn latest_version(
             let body = http.get_text(&url)?;
             Ok(Latest::Version(parse_go(&body)?))
         }
+        SourceKind::Pixi => {
+            // conda has no per-package REST endpoint; use the prefix.dev GraphQL
+            // API. Channel comes from a `channel::name` locator (default conda-forge).
+            let (channel, name) = crate::sources::pixi::split_channel(&spec.locator);
+            match crate::prefix_dev::latest_version(http, &channel, &name)? {
+                Some(v) => Ok(Latest::Version(v)),
+                None => Ok(Latest::NotApplicable),
+            }
+        }
+        // url latest depends on the tool's config (templated → version_source/pin),
+        // not the spec alone; the CLI routes url tools to `sources::template::latest`
+        // when templated, else treats them as n/a. A bare spec here is n/a.
         SourceKind::Url => Ok(Latest::NotApplicable),
-        // template latest depends on the tool's `version_source` config, not the
-        // spec alone; the CLI routes template tools to `sources::template::latest`.
-        SourceKind::Template => Ok(Latest::NotApplicable),
     }
 }
 

@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 
 use crate::config::Config;
 use crate::runner::CommandRunner;
-use crate::sources::{cargo, npm, parse_spec, unlink_tracked, uv, SourceKind};
+use crate::sources::{cargo, npm, parse_spec, pixi, unlink_tracked, uv, SourceKind};
 use crate::state::{State, ToolRecord};
 
 /// Remove a tool from state (uninstalling / deleting its files) and from config.
@@ -96,6 +96,12 @@ fn uninstall_record(
             let locator = resolve_locator(record, cfg, name);
             let args = npm::global_remove_args(&locator);
             run_uninstall(runner, "fnm", &args, "npm rm -g via fnm default node")?;
+        }
+        Some(SourceKind::Pixi) => {
+            // Tool-managed: `pixi global uninstall` (never rm the trampoline).
+            let locator = resolve_locator(record, cfg, name);
+            let args = pixi::uninstall_args(&locator);
+            run_uninstall(runner, "pixi", &args, "pixi global uninstall")?;
         }
         // github / gitlab / url / go / unknown → unlink tracked files.
         _ => {

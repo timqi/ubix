@@ -8,12 +8,19 @@ use anyhow::{bail, Context, Result};
 
 /// Abstraction over HTTP GET. Only what ubix needs: fetch text (JSON APIs,
 /// checksum files) and fetch bytes (downloads).
-pub trait HttpClient {
+/// `Send + Sync` so `&dyn HttpClient` can be shared across scoped threads (the
+/// combined `search` fans out aqua + pixi queries concurrently).
+pub trait HttpClient: Send + Sync {
     /// GET `url` and return the body as a UTF-8 string. Non-2xx is an error.
     fn get_text(&self, url: &str) -> Result<String>;
 
     /// GET `url` and return the raw bytes. Non-2xx is an error.
     fn get_bytes(&self, url: &str) -> Result<Vec<u8>>;
+
+    /// POST a JSON `body` to `url` (Content-Type: application/json) and return
+    /// the response body as a UTF-8 string. Non-2xx is an error. Used for the
+    /// prefix.dev GraphQL API (conda latest-version + package search).
+    fn post_json(&self, url: &str, body: &str) -> Result<String>;
 }
 
 /// Production client backed by an async reqwest driven on a current-thread
@@ -92,6 +99,29 @@ impl HttpClient for ReqwestClient {
             Ok(bytes.to_vec())
         })
     }
+
+    fn post_json(&self, url: &str, body: &str) -> Result<String> {
+        let client = self.client()?;
+        let rt = Self::runtime()?;
+        let url = url.to_string();
+        let body = body.to_string();
+        rt.block_on(async move {
+            let resp = client
+                .post(&url)
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .with_context(|| format!("POST {url}"))?;
+            let status = resp.status();
+            if !status.is_success() {
+                bail!("POST {url} returned HTTP {status}");
+            }
+            resp.text()
+                .await
+                .with_context(|| format!("reading body of {url}"))
+        })
+    }
 }
 
 /// Fixture-based mock for unit tests. Maps exact URLs to canned bodies. Part of
@@ -101,6 +131,7 @@ impl HttpClient for ReqwestClient {
 pub struct MockHttp {
     text: HashMap<String, String>,
     bytes: HashMap<String, Vec<u8>>,
+    post: HashMap<String, String>,
 }
 
 #[allow(dead_code)]
@@ -118,6 +149,12 @@ impl MockHttp {
         self.bytes.insert(url.to_string(), body);
         self
     }
+
+    /// Canned response for a `post_json` call to `url` (request body ignored).
+    pub fn with_post(mut self, url: &str, body: &str) -> Self {
+        self.post.insert(url.to_string(), body.to_string());
+        self
+    }
 }
 
 impl HttpClient for MockHttp {
@@ -132,6 +169,13 @@ impl HttpClient for MockHttp {
         match self.bytes.get(url) {
             Some(b) => Ok(b.clone()),
             None => bail!("MockHttp: no canned bytes for `{url}`"),
+        }
+    }
+
+    fn post_json(&self, url: &str, _body: &str) -> Result<String> {
+        match self.post.get(url) {
+            Some(b) => Ok(b.clone()),
+            None => bail!("MockHttp: no canned POST response for `{url}`"),
         }
     }
 }

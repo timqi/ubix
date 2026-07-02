@@ -30,6 +30,7 @@ pub enum BootstrapTarget {
     Go,
     Python,
     Nodejs,
+    Pixi,
 }
 
 impl std::str::FromStr for BootstrapTarget {
@@ -40,6 +41,7 @@ impl std::str::FromStr for BootstrapTarget {
             "go" => BootstrapTarget::Go,
             "python" => BootstrapTarget::Python,
             "nodejs" => BootstrapTarget::Nodejs,
+            "pixi" => BootstrapTarget::Pixi,
             // uv/fnm are plain github releases, not toolchain bootstraps. Use the
             // language targets (python/nodejs) to install them + a runtime.
             "uv" => bail!(
@@ -52,7 +54,9 @@ impl std::str::FromStr for BootstrapTarget {
                  ubix add github:Schniz/fnm --name fnm\n\
                  (or `ubix bootstrap nodejs` to also install a default LTS node)"
             ),
-            other => bail!("unknown bootstrap target `{other}` (expected rust|go|python|nodejs)"),
+            other => {
+                bail!("unknown bootstrap target `{other}` (expected rust|go|python|nodejs|pixi)")
+            }
         })
     }
 }
@@ -70,8 +74,8 @@ pub fn bootstrap(target: BootstrapTarget, reinstall: bool, ctx: &BootstrapCtx) -
     match target {
         BootstrapTarget::Rust => bootstrap_rust(ctx, reinstall),
         BootstrapTarget::Go => bootstrap_go(ctx, reinstall),
-        BootstrapTarget::Python | BootstrapTarget::Nodejs => {
-            unreachable!("python/nodejs are handled in the CLI layer");
+        BootstrapTarget::Python | BootstrapTarget::Nodejs | BootstrapTarget::Pixi => {
+            unreachable!("python/nodejs/pixi are handled in the CLI layer");
         }
     }
 }
@@ -283,6 +287,7 @@ mod tests {
         assert_eq!("GO".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Go);
         assert_eq!("python".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Python);
         assert_eq!("Nodejs".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Nodejs);
+        assert_eq!("pixi".parse::<BootstrapTarget>().unwrap(), BootstrapTarget::Pixi);
         assert!("brew".parse::<BootstrapTarget>().is_err());
     }
 

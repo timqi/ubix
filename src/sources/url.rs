@@ -1,7 +1,14 @@
-//! Direct-URL source (§5.2, M6): download an archive/binary, extract, select the
-//! wanted executable(s), atomically install into `install_dir`. No `latest`
-//! concept — the URL is a fixed version; we record the content sha256 so a later
-//! change to the URL's bytes can be detected.
+//! The `url` source (§5.2, M6): download an archive/binary, extract, select the
+//! wanted executable(s), atomically install into `install_dir`.
+//!
+//! A `url:` locator may be a FIXED URL or a URL TEMPLATE with
+//! `{version}`/`{os}`/`{arch}` placeholders — a plain URL is just the degenerate
+//! template. [`install`] auto-detects which via [`crate::sources::template::is_templated`]:
+//! * templated → resolve version (pin / `version_source`) + render the URL via
+//!   [`crate::sources::template::resolve_and_render`], then download.
+//! * fixed → download the URL as-is. No `latest` concept; we record the content
+//!   sha256 so a later change to the URL's bytes is detectable, and probe for a
+//!   sidecar checksum.
 
 use std::path::{Path, PathBuf};
 
@@ -11,7 +18,8 @@ use crate::archive;
 use crate::config::ToolConfig;
 use crate::engine::atomic_install;
 use crate::http::HttpClient;
-use crate::sources::{parse_spec, InstallOutcome, SourceKind};
+use crate::runner::CommandRunner;
+use crate::sources::{parse_spec, template, InstallOutcome, SourceKind};
 
 /// Select which extracted files to install and under what final names.
 ///
@@ -61,11 +69,16 @@ pub fn select_exes<'a>(
     }
 }
 
-/// Install from a direct URL. `http` fetches the bytes; extraction and atomic
-/// install happen locally. `default_name` is the tool key.
+/// Install a `url` tool. This is the general (template-capable) flow — a fixed
+/// URL is just the degenerate template with no placeholders: version resolution
+/// and rendering are skipped, and the URL is fetched as-is. A templated locator
+/// (placeholders / `version_source` / libc split) resolves a version and renders
+/// the download URL via the `template` helpers first. `http` fetches the bytes;
+/// extraction and atomic install happen locally. `default_name` is the tool key.
 pub fn install(
     tool: &ToolConfig,
     http: &dyn HttpClient,
+    runner: &dyn CommandRunner,
     install_dir: &Path,
     default_name: &str,
 ) -> Result<InstallOutcome> {
@@ -73,21 +86,29 @@ pub fn install(
     if parsed.source != SourceKind::Url {
         bail!("url source received non-url spec `{}`", tool.spec);
     }
-    let url = &parsed.locator;
+    let templated = template::is_templated(&parsed.locator, tool);
+
+    // Resolve the version + effective URL. Fixed URL → "url" sentinel, no render;
+    // templated → delegate the resolve+render spine to the `template` helpers.
+    let (installed_version, url) = if templated {
+        template::resolve_and_render(tool, http, runner, &parsed.locator)?
+    } else {
+        ("url".to_string(), parsed.locator.clone())
+    };
+
     crate::step!("downloading {url}");
-    let bytes = http.get_bytes(url).with_context(|| format!("downloading {url}"))?;
+    let bytes = http.get_bytes(&url).with_context(|| format!("downloading {url}"))?;
     let content_sha = sha256_hex(&bytes);
 
-    // Checksum discovery (§8.8): look for a sidecar next to the URL and verify.
-    // A mismatch is fatal; absence is non-fatal (recorded as "none").
-    match discover_and_verify(http, url, &content_sha) {
-        Ok(Some(())) => { /* verified */ }
-        Ok(None) => { /* no sidecar found → checksum "none" */ }
-        Err(e) => return Err(e),
+    // Checksum sidecar discovery (§8.8) for fixed URLs: a mismatch is fatal,
+    // absence is non-fatal. A templated URL points at a generated path that
+    // doesn't ship sidecars, so it's skipped there (matches prior behavior).
+    if !templated {
+        discover_and_verify(http, &url, &content_sha)?;
     }
 
     let install_paths = install_from_bytes(
-        url,
+        &url,
         &bytes,
         install_dir,
         tool.exe.as_deref(),
@@ -96,9 +117,17 @@ pub fn install(
         default_name,
     )?;
 
+    // resolved_asset: fixed → the full URL; templated → the rendered filename.
+    let resolved_asset = if templated {
+        let asset = url.split(['?', '#']).next().unwrap_or(&url);
+        Some(asset.rsplit('/').next().unwrap_or(asset).to_string())
+    } else {
+        Some(url.clone())
+    };
+
     Ok(InstallOutcome {
-        installed_version: "url".to_string(),
-        resolved_asset: Some(url.clone()),
+        installed_version,
+        resolved_asset,
         install_paths,
         // Record the content sha256 so a change to the URL's bytes is detectable.
         sha256: Some(content_sha),
@@ -277,7 +306,7 @@ mod tests {
             .with_text(&format!("{url}.sha256"), &format!("{sha}  rawtool\n"));
         let dir = tempfile::tempdir().unwrap();
         let tool = ToolConfig::from_spec(format!("url:{url}"));
-        let out = install(&tool, &http, dir.path(), "rawtool").unwrap();
+        let out = install(&tool, &http, &crate::runner::MockRunner::new(), dir.path(), "rawtool").unwrap();
         assert_eq!(out.sha256.as_deref(), Some(sha.as_str()));
     }
 
@@ -292,7 +321,7 @@ mod tests {
             .with_text(&format!("{url}.sha256"), &format!("{bad}  rawtool\n"));
         let dir = tempfile::tempdir().unwrap();
         let tool = ToolConfig::from_spec(format!("url:{url}"));
-        let err = install(&tool, &http, dir.path(), "rawtool").unwrap_err();
+        let err = install(&tool, &http, &crate::runner::MockRunner::new(), dir.path(), "rawtool").unwrap_err();
         assert!(err.to_string().contains("verifying"), "{err}");
     }
 
@@ -325,7 +354,7 @@ mod tests {
         let mut tool = ToolConfig::from_spec(format!("url:{url}"));
         tool.exe = Some("tool".into());
         tool.rename = Some("mytool".into());
-        let out = install(&tool, &http, dir.path(), "default").unwrap();
+        let out = install(&tool, &http, &crate::runner::MockRunner::new(), dir.path(), "default").unwrap();
         assert_eq!(out.install_paths, vec![dir.path().join("mytool")]);
         assert!(dir.path().join("mytool").is_file());
     }
@@ -373,7 +402,7 @@ mod tests {
         let install_dir = tempfile::tempdir().unwrap();
 
         let tool = ToolConfig::from_spec(format!("url:{url}"));
-        let out = install(&tool, &http, install_dir.path(), "tool").unwrap();
+        let out = install(&tool, &http, &crate::runner::MockRunner::new(), install_dir.path(), "tool").unwrap();
         assert_eq!(out.install_paths.len(), 1);
         assert!(out.install_paths[0].is_file());
         assert_eq!(out.installed_version, "url");

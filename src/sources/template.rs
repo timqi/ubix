@@ -1,13 +1,13 @@
-//! Templated-URL source (`template:`, aqua-style templated URL + version
-//! discovery). The legacy prefix `http:` is a kept-for-compat alias.
+//! Templating helpers for the `url` source. A `url:` locator is a URL that MAY
+//! contain `{version}`/`{os}`/`{arch}` placeholders; a plain URL is just the
+//! degenerate template with no placeholders. This module holds the render +
+//! version-resolution helpers (`is_templated`, `resolve_version`, `render_url`,
+//! `resolve_and_render`, `latest`); the actual install/download lives in
+//! `url.rs`, which calls [`resolve_and_render`] for templated tools and
+//! dispatches via [`is_templated`]. Canonical templated case: claude-code
+//! (binary on a templated GCS URL, version from GitHub tags).
 //!
-//! Distinct from the fixed-URL `url` source: the locator is a URL *template*
-//! with `{version}`, `{os}`, `{arch}` variables rendered at install time, and
-//! the version can be discovered from a `version_source` (e.g. a GitHub tag)
-//! rather than pinned. Canonical case: claude-code (binary on a templated GCS
-//! URL, version from GitHub tags).
-
-use std::path::Path;
+//! `template:`/`http:` remain kept-for-compat spec aliases for `url:`.
 
 use anyhow::{bail, Context, Result};
 
@@ -16,7 +16,7 @@ use crate::http::HttpClient;
 use crate::outdated::{self, Latest};
 use crate::platform;
 use crate::runner::CommandRunner;
-use crate::sources::{parse_spec, url as url_source, InstallOutcome, SourceKind};
+use crate::sources::{parse_spec, SourceKind};
 
 /// Render a URL template, substituting `{version}`, `{os}`, `{arch}`. `os`/`arch`
 /// are the effective (post-replace) tokens. Any other `{token}` → error.
@@ -165,54 +165,39 @@ pub fn render_url(
     render_template(template, version, &os, &arch)
 }
 
-/// Install an http-source tool. `default_name` is the tool key.
-pub fn install(
+/// Whether a `url` tool needs the templated path: the URL carries a
+/// `{version}`/`{os}`/`{arch}` placeholder, or a template-only field is set
+/// (`version_source`, `url_musl`, `os_replace`/`arch_replace`). A plain fixed URL
+/// (none of these) takes the direct-download path in `url.rs`.
+pub fn is_templated(locator: &str, tool: &ToolConfig) -> bool {
+    locator.contains('{')
+        || tool.version_source.is_some()
+        || tool.url_musl.is_some()
+        || tool.os_replace.is_some()
+        || tool.arch_replace.is_some()
+}
+
+/// Resolve the version and render the download URL for a templated `url` tool —
+/// the templating spine, kept here so `url::install` stays a plain
+/// download-and-install flow. Callers gate on [`is_templated`]. Returns
+/// `(resolved_version, rendered_url)`.
+pub fn resolve_and_render(
     tool: &ToolConfig,
     http: &dyn HttpClient,
     runner: &dyn CommandRunner,
-    install_dir: &Path,
-    default_name: &str,
-) -> Result<InstallOutcome> {
-    let parsed = parse_spec(&tool.spec, SourceKind::Template)?;
-    if parsed.source != SourceKind::Template {
-        bail!("template source received non-template spec `{}`", tool.spec);
-    }
-
+    locator: &str,
+) -> Result<(String, String)> {
     let version = resolve_version(tool, http)?;
     let is_musl = platform::is_musl(runner);
     let url = render_url(
         tool,
-        &parsed.locator,
+        locator,
         &version,
         platform::goos(),
         platform::goarch(),
         is_musl,
     )?;
-
-    crate::step!("downloading {url}");
-    let bytes = http.get_bytes(&url).with_context(|| format!("downloading {url}"))?;
-    let content_sha = url_source::sha256_hex(&bytes);
-
-    let install_paths = url_source::install_from_bytes(
-        &url,
-        &bytes,
-        install_dir,
-        tool.exe.as_deref(),
-        tool.exes.as_deref(),
-        tool.rename.as_deref(),
-        default_name,
-    )?;
-
-    // Rendered filename (last path segment) for state.resolved_asset.
-    let asset = url.split(['?', '#']).next().unwrap_or(&url);
-    let asset = asset.rsplit('/').next().unwrap_or(asset).to_string();
-
-    Ok(InstallOutcome {
-        installed_version: version,
-        resolved_asset: Some(asset),
-        install_paths,
-        sha256: Some(content_sha),
-    })
+    Ok((version, url))
 }
 
 /// Latest version for `outdated` (§7.1). A `version`/`tag` pin is the latest by
@@ -232,6 +217,7 @@ pub fn latest(tool: &ToolConfig, http: &dyn HttpClient) -> Result<Latest> {
 mod tests {
     use super::*;
     use crate::http::MockHttp;
+    use crate::platform;
     use crate::runner::MockRunner;
     use std::collections::BTreeMap;
 
@@ -344,7 +330,7 @@ mod tests {
         let http = MockHttp::new().with_bytes(url, b"bin".to_vec());
         let runner = MockRunner::new();
         let dir = tempfile::tempdir().unwrap();
-        let out = install(&tool, &http, &runner, dir.path(), "tool").unwrap();
+        let out = crate::sources::url::install(&tool, &http, &runner, dir.path(), "tool").unwrap();
         assert_eq!(out.installed_version, "1.0.0");
         assert_eq!(out.install_paths, vec![dir.path().join("tool")]);
     }
@@ -383,7 +369,7 @@ mod tests {
         let runner = MockRunner::new();
         let dir = tempfile::tempdir().unwrap();
 
-        let out = install(&tool, &http, &runner, dir.path(), "claude").unwrap();
+        let out = crate::sources::url::install(&tool, &http, &runner, dir.path(), "claude").unwrap();
         assert_eq!(out.installed_version, "1.0.88");
         assert_eq!(out.resolved_asset.as_deref(), Some("claude"));
         assert_eq!(out.install_paths, vec![dir.path().join("claude")]);

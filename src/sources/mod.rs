@@ -5,6 +5,7 @@ pub mod github;
 pub mod gitlab;
 pub mod go;
 pub mod npm;
+pub mod pixi;
 pub mod template;
 pub mod url;
 pub mod uv;
@@ -23,14 +24,19 @@ use crate::state::ToolRecord;
 pub enum SourceKind {
     Github,
     Gitlab,
+    /// Direct download of an archive/binary. The locator is a URL that MAY carry
+    /// `{version}`/`{os}`/`{arch}` placeholders — a plain URL is just the
+    /// degenerate template with no placeholders. Templating (placeholders,
+    /// `version_source`, `url_musl`, `os_replace`/`arch_replace`) is auto-detected
+    /// at install time. Legacy `template:`/`http:` prefixes are kept-for-compat
+    /// aliases for `url:` (see `FromStr`).
     Url,
-    /// Templated URL + version discovery. Canonical prefix `template:`; the
-    /// legacy `http:` prefix is a kept-for-compat alias (see `FromStr`).
-    Template,
     Pypi,
     Npm,
     Cargo,
     Go,
+    /// conda packages via `pixi global`.
+    Pixi,
 }
 
 /// Human-facing description of a source kind, shown by `ubix sources`.
@@ -57,11 +63,11 @@ impl SourceKind {
             SourceKind::Github,
             SourceKind::Gitlab,
             SourceKind::Url,
-            SourceKind::Template,
             SourceKind::Pypi,
             SourceKind::Npm,
             SourceKind::Cargo,
             SourceKind::Go,
+            SourceKind::Pixi,
         ]
     }
 
@@ -71,11 +77,11 @@ impl SourceKind {
             SourceKind::Github => "github",
             SourceKind::Gitlab => "gitlab",
             SourceKind::Url => "url",
-            SourceKind::Template => "template",
             SourceKind::Pypi => "pypi",
             SourceKind::Npm => "npm",
             SourceKind::Cargo => "cargo",
             SourceKind::Go => "go",
+            SourceKind::Pixi => "pixi",
         }
     }
 
@@ -96,15 +102,10 @@ impl SourceKind {
                 "~/.local/bin",
             ),
             SourceKind::Url => (
-                "built-in download (fixed link)",
-                "download a fixed archive/binary URL; no version discovery",
-                "url:https://example.com/x-linux-x86_64.tar.gz",
-                "~/.local/bin",
-            ),
-            SourceKind::Template => (
-                "built-in download + version discovery (templated URL)",
-                "templated URL with {version}/{os}/{arch}; version from version_source",
-                "template:https://host/{version}/{os}-{arch}/bin",
+                "built-in download (fixed or templated URL)",
+                "download an archive/binary URL; optional {version}/{os}/{arch} \
+                 placeholders with version from a pin or version_source",
+                "url:https://host/{version}/{os}-{arch}/bin",
                 "~/.local/bin",
             ),
             SourceKind::Pypi => (
@@ -131,6 +132,13 @@ impl SourceKind {
                 "go:example.com/cmd/tool@latest",
                 "~/.local/bin (GOBIN)",
             ),
+            SourceKind::Pixi => (
+                "pixi global",
+                "install conda CLI tools via `pixi global install`; \
+                 channel-qualify with `channel::name` (bare → conda-forge)",
+                "pixi:ripgrep",
+                "$PIXI_HOME/bin (default ~/.pixi/bin; add to PATH)",
+            ),
         };
         SourceInfo {
             prefix: self.as_str(),
@@ -150,14 +158,15 @@ impl FromStr for SourceKind {
             "github" => SourceKind::Github,
             "gitlab" => SourceKind::Gitlab,
             "url" => SourceKind::Url,
-            "template" => SourceKind::Template,
-            // `http:` is a kept-for-compat alias for the templated-URL source
-            // (existing configs may still use it). Canonical output is `template`.
-            "http" => SourceKind::Template,
+            // `template:` and `http:` are kept-for-compat aliases for `url:`
+            // (existing configs may still use them). Canonical output is `url`.
+            "template" => SourceKind::Url,
+            "http" => SourceKind::Url,
             "pypi" => SourceKind::Pypi,
             "npm" => SourceKind::Npm,
             "cargo" => SourceKind::Cargo,
             "go" => SourceKind::Go,
+            "pixi" => SourceKind::Pixi,
             other => bail!("unknown source prefix `{other}:` (expected one of {})", known_prefixes()),
         })
     }
@@ -256,17 +265,12 @@ fn validate_locator(kind: SourceKind, locator: &str) -> Result<()> {
             }
         }
         SourceKind::Url => {
+            // A fixed URL or a URL TEMPLATE (may contain {version}/{os}/{arch}).
             if !(locator.starts_with("http://") || locator.starts_with("https://")) {
                 bail!("url locator `{locator}` must be an http(s) URL");
             }
         }
-        SourceKind::Template => {
-            // locator is a URL TEMPLATE (may contain {version}/{os}/{arch}).
-            if !(locator.starts_with("http://") || locator.starts_with("https://")) {
-                bail!("template locator `{locator}` must be an http(s) URL template");
-            }
-        }
-        SourceKind::Pypi | SourceKind::Npm | SourceKind::Cargo => {
+        SourceKind::Pypi | SourceKind::Npm | SourceKind::Cargo | SourceKind::Pixi => {
             if locator.contains(char::is_whitespace) {
                 bail!("{kind} package name `{locator}` must not contain whitespace");
             }
@@ -329,11 +333,13 @@ mod tests {
             p("url:https://example.com/x-linux-x86_64.tar.gz").source,
             SourceKind::Url
         );
-        assert_eq!(p("template:https://h/{version}/bin").source, SourceKind::Template);
+        // `template:`/`http:` are aliases that parse to Url.
+        assert_eq!(p("template:https://h/{version}/bin").source, SourceKind::Url);
         assert_eq!(p("pypi:ruff").source, SourceKind::Pypi);
         assert_eq!(p("npm:pnpm").source, SourceKind::Npm);
         assert_eq!(p("cargo:somecli").source, SourceKind::Cargo);
         assert_eq!(p("go:example.com/cmd/tool@latest").source, SourceKind::Go);
+        assert_eq!(p("pixi:ripgrep").source, SourceKind::Pixi);
     }
 
     #[test]
@@ -344,21 +350,23 @@ mod tests {
     }
 
     #[test]
-    fn template_prefix_holds_url_template() {
+    fn template_prefix_is_url_alias_and_keeps_template_locator() {
         let parsed = p("template:https://h/{version}/{os}-{arch}/claude");
-        assert_eq!(parsed.source, SourceKind::Template);
+        assert_eq!(parsed.source, SourceKind::Url);
         assert_eq!(parsed.locator, "https://h/{version}/{os}-{arch}/claude");
     }
 
     #[test]
-    fn http_prefix_is_backcompat_alias_for_template() {
-        // Legacy `http:` still parses to Template (kept-for-compat alias), but
-        // the canonical string is `template`.
-        let parsed = p("http:https://h/{version}/{os}-{arch}/claude");
-        assert_eq!(parsed.source, SourceKind::Template);
-        assert_eq!(parsed.locator, "https://h/{version}/{os}-{arch}/claude");
-        assert_eq!(SourceKind::Template.as_str(), "template");
-        assert_eq!(SourceKind::Template.to_string(), "template");
+    fn http_and_template_prefixes_are_backcompat_aliases_for_url() {
+        // Legacy `http:`/`template:` parse to Url (kept-for-compat aliases); the
+        // canonical string is `url`.
+        for spec in ["http:https://h/{version}/x", "template:https://h/{version}/x"] {
+            let parsed = p(spec);
+            assert_eq!(parsed.source, SourceKind::Url);
+            assert_eq!(parsed.locator, "https://h/{version}/x");
+        }
+        assert_eq!(SourceKind::Url.as_str(), "url");
+        assert_eq!(SourceKind::Url.to_string(), "url");
     }
 
     #[test]
@@ -426,10 +434,10 @@ mod tests {
     }
 
     #[test]
-    fn unknown_prefix_hint_lists_template() {
+    fn unknown_prefix_hint_lists_url() {
         // Regression: the hint is derived from all() so it never drifts.
         let err = parse_spec("brew:wget", SourceKind::Github).unwrap_err();
-        assert!(err.to_string().contains("template"), "{err}");
+        assert!(err.to_string().contains("url"), "{err}");
     }
 
     #[test]
@@ -438,11 +446,11 @@ mod tests {
             SourceKind::Github,
             SourceKind::Gitlab,
             SourceKind::Url,
-            SourceKind::Template,
             SourceKind::Pypi,
             SourceKind::Npm,
             SourceKind::Cargo,
             SourceKind::Go,
+            SourceKind::Pixi,
         ] {
             assert_eq!(k.as_str().parse::<SourceKind>().unwrap(), k);
         }
@@ -457,11 +465,11 @@ mod tests {
                 SourceKind::Github
                 | SourceKind::Gitlab
                 | SourceKind::Url
-                | SourceKind::Template
                 | SourceKind::Pypi
                 | SourceKind::Npm
                 | SourceKind::Cargo
-                | SourceKind::Go => {}
+                | SourceKind::Go
+                | SourceKind::Pixi => {}
             }
         }
         // `all()` has no duplicates and matches the known count.

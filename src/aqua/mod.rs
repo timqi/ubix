@@ -42,8 +42,8 @@ pub fn resolve_package(
 
     // Only github_release is supported at the top level (plan §2/§9). `type:
     // http` packages (templated URL, e.g. claude-code) can't be synthesized as
-    // `github:`, but ubix's `template:` source covers them — emit a ready-to-use
-    // `ubix add 'template:…'` command instead of a dead-end error.
+    // `github:`, but ubix's `url:` source covers them — emit a ready-to-use
+    // `ubix add 'url:…'` command instead of a dead-end error.
     match pkg.type_.as_deref() {
         Some("github_release") | None => {}
         Some("http") => bail!(hint::http_hint(&pkg, owner, repo)),
@@ -226,7 +226,7 @@ packages:
     }
 
     #[test]
-    fn http_type_emits_template_hint() {
+    fn http_type_emits_url_hint() {
         let yaml = r#"
 packages:
   - type: http
@@ -240,8 +240,8 @@ packages:
         let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
         let err = resolve_package(&http, "x", "y", None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("template:"), "{msg}");
-        assert!(msg.contains("ubix add 'template:https://example.com/{version}/{os}-{arch}/y'"), "{msg}");
+        assert!(msg.contains("url:"), "{msg}");
+        assert!(msg.contains("ubix add 'url:https://example.com/{version}/{os}-{arch}/y'"), "{msg}");
         assert!(msg.contains("--version-source github:x/y"), "{msg}");
     }
 }

@@ -13,15 +13,21 @@
 //! copied verbatim from `ubi-0.9/src/{os,arch,picker}.rs` to preserve fidelity.
 //!
 //! ## Drop rule (per platform)
-//! Drop `matching` when ubi, WITHOUT any matching, would pick an asset that is
-//! viable for the platform (its name matches the platform OS). We check both
-//! libc modes (glibc and musl) because a generated config is portable across
-//! hosts. When ubi can't pick without matching, we keep `matching` only if
-//! matching would actually rescue that mode; otherwise the mode is hopeless
-//! regardless (e.g. a glibc-only tool on a musl host) and doesn't justify
-//! keeping `matching`. A viable pick may differ from aqua's curated choice
-//! (e.g. ubi picks the `gnu` build where aqua preferred `musl`) — both run, and
-//! ubi does host-correct libc filtering, so this is safe.
+//! Drop `matching` when ubi, WITHOUT any matching, would pick the SAME TOOL that
+//! aqua's curated `matching` selects. We check both libc modes (glibc and musl)
+//! because a generated config is portable across hosts. Per mode:
+//! * curated pick fails (mode hopeless even with matching, e.g. a glibc-only tool
+//!   on a musl host) → matching can't help; skip the mode.
+//! * curated pick succeeds but ubi's unaided pick is a DIFFERENT tool (or fails)
+//!   → matching is required. This is the key case for multi-binary repos like
+//!   `openai/codex`, whose release ships `codex`, `codex-app-server`, `bwrap`,
+//!   `argument-comment-lint`, … all with the same platform triple: ubi's unaided
+//!   alphabetical tiebreak lands on `argument-comment-lint`, so without matching
+//!   the wrong program installs.
+//! * unaided pick is the same tool as curated → matching redundant. "Same tool"
+//!   ignores libc/format differences (e.g. ubi's `gnu` build where aqua preferred
+//!   `musl`) — both are the wanted program and ubi does host-correct libc
+//!   filtering, so this is safe.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -225,6 +231,30 @@ fn pick_from_matches(
     matches.into_iter().next()
 }
 
+/// The "tool stem" of an asset name: everything before the first platform token
+/// (arch / OS / libc), lowercased and trimmed of trailing separators. Builds of
+/// the SAME tool share a stem (`codex-x86_64-…-gnu` and `codex-…-musl` → `codex`),
+/// while distinct binaries in the same release differ (`codex` vs `codex-app-server`
+/// vs `argument-comment-lint`). Used to tell "different libc/format" (safe to
+/// prune) from "different program" (matching required).
+fn tool_stem(asset: &str) -> String {
+    let lower = asset.to_ascii_lowercase();
+    let mut cut = lower.len();
+    for re in [
+        &*LINUX_RE, &*MACOS_RE, &*ANDROID_RE, &*ALL_ARCHES_RE, &*GLIBC_RE, &*MUSL_RE,
+    ] {
+        if let Some(m) = re.find(&lower) {
+            cut = cut.min(m.start());
+        }
+    }
+    lower[..cut].trim_end_matches(['-', '_', '.', ' ']).to_string()
+}
+
+/// Whether two asset names are builds of the same tool (same stem).
+fn same_tool(a: &str, b: &str) -> bool {
+    tool_stem(a) == tool_stem(b)
+}
+
 /// Whether `matching` is actually needed for `goos-goarch`, given the real asset
 /// list. See the module docs for the rule.
 pub fn matching_needed(assets: &[String], goos: &str, goarch: &str, aqua_matching: &str) -> bool {
@@ -242,19 +272,18 @@ pub fn matching_needed(assets: &[String], goos: &str, goarch: &str, aqua_matchin
     }
 
     for is_musl in [false, true] {
+        // The curated (correct) asset for this mode. `None` → the mode is hopeless
+        // even WITH matching (e.g. glibc-only tool on a musl host), so matching
+        // can't rescue it → skip.
+        let Some(curated) = simulate_pick(assets, goos, goarch, is_musl, Some(aqua_matching)) else {
+            continue;
+        };
+        // Matching is required unless ubi's UNAIDED pick is the same tool: a
+        // different program (multi-binary repo) or an outright failure both mean
+        // dropping matching would install the wrong thing / nothing.
         match simulate_pick(assets, goos, goarch, is_musl, None) {
-            Some(name) if os_re(goos).is_match(&name) => {
-                // Fine without matching in this mode.
-            }
-            _ => {
-                // No viable pick without matching. Keep matching only if it
-                // would rescue this mode; otherwise the mode is hopeless anyway.
-                if let Some(name) = simulate_pick(assets, goos, goarch, is_musl, Some(aqua_matching)) {
-                    if os_re(goos).is_match(&name) {
-                        return true;
-                    }
-                }
-            }
+            Some(unaided) if same_tool(&unaided, &curated) => {}
+            _ => return true,
         }
     }
     false
@@ -338,6 +367,53 @@ mod tests {
             "tool-aarch64-unknown-linux-gnu.tar.gz",
         ]);
         assert!(!matching_needed(&assets, "linux", "amd64", "-x86_64-unknown-linux-gnu.tar.gz"));
+    }
+
+    #[test]
+    fn multi_binary_repo_keeps_matching() {
+        // openai/codex-style: the release ships several distinct programs, each
+        // with the same platform triple. Without matching, ubi's alphabetical
+        // tiebreak lands on `argument-comment-lint`, not `codex` → matching needed.
+        let assets = v(&[
+            "argument-comment-lint-x86_64-unknown-linux-gnu.tar.gz",
+            "argument-comment-lint-aarch64-unknown-linux-gnu.tar.gz",
+            "bwrap-x86_64-unknown-linux-musl.tar.gz",
+            "bwrap-aarch64-unknown-linux-musl.tar.gz",
+            "codex-x86_64-unknown-linux-musl.tar.gz",
+            "codex-aarch64-unknown-linux-musl.tar.gz",
+            "codex-app-server-x86_64-unknown-linux-musl.tar.gz",
+            "codex-exec-x86_64-unknown-linux-musl.tar.gz",
+            "codex-x86_64-apple-darwin.tar.gz",
+            "codex-aarch64-apple-darwin.tar.gz",
+            "codex-app-server-aarch64-apple-darwin.tar.gz",
+        ]);
+        // linux/amd64: unaided pick is `argument-comment-lint` (alphabetical
+        // tiebreak), a different tool → matching required.
+        assert!(matching_needed(&assets, "linux", "amd64", "codex-x86_64-unknown-linux-musl.tar.gz"));
+        // darwin/arm64: ubi's macOS-arm preference picks the first aarch64 asset
+        // (`codex-…`, which precedes `codex-app-server-…`) → same tool, prunable.
+        assert!(!matching_needed(&assets, "darwin", "arm64", "codex-aarch64-apple-darwin.tar.gz"));
+        // Sanity: the curated substring still resolves to the codex binary.
+        assert_eq!(
+            simulate_pick(&assets, "linux", "amd64", false, Some("codex-x86_64-unknown-linux-musl.tar.gz")).as_deref(),
+            Some("codex-x86_64-unknown-linux-musl.tar.gz")
+        );
+    }
+
+    #[test]
+    fn tool_stem_splits_on_platform_token() {
+        assert_eq!(tool_stem("codex-x86_64-unknown-linux-musl.tar.gz"), "codex");
+        assert_eq!(tool_stem("codex-app-server-x86_64-unknown-linux-musl.tar.gz"), "codex-app-server");
+        assert_eq!(tool_stem("argument-comment-lint-x86_64-unknown-linux-gnu.tar.gz"), "argument-comment-lint");
+        // libc/format variants of one tool share a stem.
+        assert!(same_tool(
+            "fd-v10.2.0-x86_64-unknown-linux-gnu.tar.gz",
+            "fd-v10.2.0-x86_64-unknown-linux-musl.tar.gz",
+        ));
+        assert!(!same_tool(
+            "codex-x86_64-unknown-linux-musl.tar.gz",
+            "codex-app-server-x86_64-unknown-linux-musl.tar.gz",
+        ));
     }
 
     #[test]

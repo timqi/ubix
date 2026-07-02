@@ -1,11 +1,11 @@
-//! Best-effort `template:` hint for aqua packages ubix can't synthesize as a
+//! Best-effort `url:` hint for aqua packages ubix can't synthesize as a
 //! `github:` config (currently `type: http`).
 //!
 //! ubix can't install a `type: http` aqua package through the github_release
-//! path, but its `template:` source covers the exact same shape — a templated
+//! path, but its `url:` source covers the exact same shape — a templated
 //! download URL plus version discovery (the canonical case is claude-code). So
 //! instead of a dead-end "add a github: entry manually", we translate the
-//! registry.yaml into a ready-to-paste `ubix add 'template:…'` command.
+//! registry.yaml into a ready-to-paste `ubix add 'url:…'` command.
 
 use std::collections::BTreeMap;
 
@@ -119,7 +119,7 @@ fn version_source_arg(raw: Option<&str>, owner: &str, repo: &str) -> String {
 }
 
 /// Build the multi-line `type: http` hint. Always names the registry.yaml; when
-/// a URL is extractable, appends a ready-to-paste `ubix add 'template:…'`.
+/// a URL is extractable, appends a ready-to-paste `ubix add 'url:…'`.
 pub fn http_hint(pkg: &Package, owner: &str, repo: &str) -> String {
     let f = extract(pkg);
     let reg = registry_url(owner, repo);
@@ -129,8 +129,8 @@ pub fn http_hint(pkg: &Package, owner: &str, repo: &str) -> String {
         return format!(
             "`{owner}/{repo}` is an aqua `type: http` package (binary on a templated URL, \
              not a GitHub release), which `search` can't synthesize as `github:`.\n\
-             ubix's `template:` source handles this shape — inspect the URL/files in\n  {reg}\n\
-             then run `ubix add 'template:<url with {{version}}/{{os}}/{{arch}}>' …` \
+             ubix's `url:` source handles this shape — inspect the URL/files in\n  {reg}\n\
+             then run `ubix add 'url:<url with {{version}}/{{os}}/{{arch}}>' …` \
              (see `ubix sources`)."
         );
     };
@@ -150,7 +150,7 @@ pub fn http_hint(pkg: &Package, owner: &str, repo: &str) -> String {
         ),
     };
 
-    let mut cmd = format!("ubix add 'template:{url}' \\\n  --name {name} \\\n");
+    let mut cmd = format!("ubix add 'url:{url}' \\\n  --name {name} \\\n");
     if let Some(l) = exe_line {
         cmd.push_str(&l);
     }
@@ -176,7 +176,7 @@ pub fn http_hint(pkg: &Package, owner: &str, repo: &str) -> String {
     format!(
         "`{owner}/{repo}` is an aqua `type: http` package (binary on a templated URL, \
          not a GitHub release), so `search` can't synthesize a `github:` config.\n\
-         Use ubix's `template:` source instead — translated from the registry.yaml:\n\n\
+         Use ubix's `url:` source instead — translated from the registry.yaml:\n\n\
          {cmd}\n\n\
          Verify/tweak against {reg}"
     )
@@ -219,12 +219,12 @@ packages:
     }
 
     #[test]
-    fn claude_code_generates_template_command() {
+    fn claude_code_generates_url_command() {
         let pkg = parse(CLAUDE);
         let hint = http_hint(&pkg, "anthropics", "claude-code");
-        // Ready-to-paste template add with the ubix-tokenized URL.
+        // Ready-to-paste url add with the ubix-tokenized URL.
         assert!(hint.contains(
-            "ubix add 'template:https://storage.googleapis.com/x/claude-code-releases/{version}/{os}-{arch}/claude'"
+            "ubix add 'url:https://storage.googleapis.com/x/claude-code-releases/{version}/{os}-{arch}/claude'"
         ), "{hint}");
         assert!(hint.contains("--name claude"), "{hint}");
         assert!(hint.contains("--exe claude"), "{hint}");
@@ -248,7 +248,7 @@ packages:
 "#,
         );
         let hint = http_hint(&pkg, "x", "y");
-        assert!(hint.contains("template:"), "{hint}");
+        assert!(hint.contains("url:"), "{hint}");
         assert!(hint.contains("registry.yaml") || hint.contains("aqua-registry"), "{hint}");
         // No concrete generated command (no resolved flags) — just guidance.
         assert!(!hint.contains("--version-source"), "{hint}");

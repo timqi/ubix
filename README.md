@@ -44,14 +44,16 @@ Make sure `~/.local/bin` is on your `PATH` (`ubix doctor` checks this).
 |---|---|---|
 | `github` | ubi (GitHub Releases) | `github:eza-community/eza` |
 | `gitlab` | ubi (GitLab Releases; `--host` for self-hosted) | `gitlab:group/repo` |
-| `url` | built-in download (fixed link) | `url:https://…/x-linux.tar.gz` |
-| `template` | built-in download + version discovery (templated URL) | `template:https://…/{version}/{os}-{arch}/bin` |
+| `url` | built-in download; fixed URL **or** templated URL (`{version}`/`{os}`/`{arch}`) | `url:https://…/x-linux.tar.gz` · `url:https://…/{version}/{os}-{arch}/bin` |
 | `pypi` | `uv tool install` | `pypi:ruff` |
 | `npm` | `npm -g` on fnm's default LTS node | `npm:pnpm` |
 | `cargo` | `cargo install --root ~/.local` | `cargo:ripgrep` |
 | `go` | `GOBIN=~/.local/bin go install` | `go:example.com/cmd/tool@latest` |
+| `pixi` | `pixi global install` (conda; prefix.dev) | `pixi:ripgrep` · `pixi:bioconda::samtools` |
 
 A bare `owner/repo` uses `settings.default_source` (default `github`).
+The legacy `template:` and `http:` prefixes are kept-for-compat aliases for
+`url:` (a plain URL is just a template with no placeholders).
 Run `ubix sources` for the live list.
 
 ## Commands
@@ -62,12 +64,14 @@ ubix add <spec> [--name N] [--matching S] [--exe E] [--exes A,B] [--tag T]
 ubix upgrade [names…] [--all] [--force] [--dry-run] [--prune]
 ubix remove <name> [--force]
 ubix list
-ubix info <name>
+ubix info <name | spec>        # declared tool → local info; a spec (github:…/pixi:…) → remote metadata to vet it
 ubix edit                       # open config.toml in $EDITOR
 ubix doctor                     # check tools + PATH readiness
-ubix bootstrap <rust|go|python|nodejs> [--reinstall]
+ubix bootstrap <rust|go|python|nodejs|pixi> [--reinstall]
 ubix sources
-ubix search <owner/repo | query> [--add] [--name N]   # aqua-registry → github: config
+ubix search <query> [--add] [--name N] [--aqua|--pixi] [--channel C]
+                                # searches aqua-registry (github:) AND prefix.dev (pixi:) in parallel;
+                                # prints each hit's ready-to-run `ubix add` command
 ```
 
 Global: `-q/--quiet`, `-v/--verbose`.
@@ -81,7 +85,10 @@ ubix add github:astral-sh/uv --name uv --exes uv,uvx
 ubix upgrade --all --dry-run     # preview installed vs latest
 ubix upgrade --all               # install missing + upgrade
 ubix upgrade --prune ruff        # also drop orphans in scope
-ubix search ripgrep --add        # find via aqua-registry and install
+ubix search ripgrep              # aqua + prefix.dev results side by side, each with its `ubix add` cmd
+ubix search eza --aqua --add     # single exact match → install it directly
+ubix search samtools --pixi --channel bioconda   # scope to one conda channel → pixi:bioconda::samtools
+ubix search ripgrep --add        # exact match ambiguous across backends → lists `ubix add` cmds to run
 ```
 
 ## Upgrade semantics
@@ -101,6 +108,8 @@ ubix search ripgrep --add        # find via aqua-registry and install
 - `rust` → rustup-init (`rustc`/`cargo` in `~/.cargo/bin`)
 - `go` → latest stable Go into `$GOROOT` (default `~/.local/share/go`)
 - `python` / `nodejs` → a default runtime (uv / fnm) for the pypi/npm sources
+- `pixi` → installs `pixi` (from `github:prefix-dev/pixi`) for the pixi source;
+  `pixi global` tools land in `$PIXI_HOME/bin` (default `~/.pixi/bin`, add to PATH)
 
 `uv` and `fnm` themselves are ordinary GitHub-release tools — install them with
 `ubix add` (each source prints the exact spec when missing).

@@ -13,7 +13,7 @@ use crate::remove;
 use crate::runner::{CommandRunner, SystemRunner};
 use crate::sources::github::GithubSource;
 use crate::sources::template as template_source;
-use crate::sources::{cargo, gitlab, go, npm, parse_spec, url, uv, Source, SourceKind};
+use crate::sources::{cargo, gitlab, go, npm, parse_spec, pixi, url, uv, Source, SourceKind};
 use crate::state::{LockedState, ToolRecord};
 
 /// ubix — declarative binary/CLI tool installer & tracker.
@@ -79,7 +79,7 @@ pub enum Command {
     Edit,
     /// Check underlying tools and PATH readiness.
     Doctor,
-    /// Bootstrap a language toolchain/runtime (rust|go|python|nodejs).
+    /// Bootstrap a language toolchain/runtime (rust|go|python|nodejs|pixi).
     Bootstrap(BootstrapArgs),
     /// List supported spec prefixes and their install backends.
     Sources,
@@ -172,7 +172,7 @@ pub struct InfoArgs {
 
 #[derive(Debug, Args)]
 pub struct BootstrapArgs {
-    /// Toolchain/runtime to bootstrap: <rust|go|python|nodejs>.
+    /// Toolchain/runtime to bootstrap: <rust|go|python|nodejs|pixi>.
     pub target: String,
     #[arg(long)]
     pub reinstall: bool,
@@ -188,6 +188,17 @@ pub struct SearchArgs {
     /// Explicit tool name (defaults to the aqua command name / repo).
     #[arg(long)]
     pub name: Option<String>,
+    /// Only search conda packages (prefix.dev, all channels). By default search
+    /// queries BOTH aqua-registry (github:) and prefix.dev (pixi:) in parallel.
+    #[arg(long, conflicts_with = "aqua")]
+    pub pixi: bool,
+    /// Only search the aqua-registry (github:). By default both backends run.
+    #[arg(long)]
+    pub aqua: bool,
+    /// With pixi results: restrict to a single channel (e.g. `bioconda`,
+    /// `robostack`). Omit to search every prefix.dev channel.
+    #[arg(long)]
+    pub channel: Option<String>,
     /// Block waiting for the state lock instead of failing fast (with --add).
     #[arg(long)]
     pub wait: bool,
@@ -629,7 +640,7 @@ impl App {
         if let Some(ver) = &tool.version {
             if matches!(
                 parsed.source,
-                SourceKind::Pypi | SourceKind::Cargo | SourceKind::Npm
+                SourceKind::Pypi | SourceKind::Cargo | SourceKind::Npm | SourceKind::Pixi
             ) {
                 if same_version(&rec.installed_version, ver) {
                     return Ok(UpgradeAction::Skip {
@@ -640,14 +651,6 @@ impl App {
             }
         }
 
-        // url has no `latest` concept (§5.2): default skip, --force reinstalls
-        // (handled above). No sha256 diff here (out of scope).
-        if parsed.source == SourceKind::Url {
-            return Ok(UpgradeAction::Skip {
-                reason: "url source has no latest concept (use --force to reinstall)".to_string(),
-            });
-        }
-
         // npm/go with the unresolved `"latest"` sentinel (backfill failed): allow
         // an upgrade — never compare against the literal `"latest"` string [C1].
         if matches!(parsed.source, SourceKind::Npm | SourceKind::Go)
@@ -656,13 +659,16 @@ impl App {
             return Ok(UpgradeAction::Upgrade { latest: None });
         }
 
-        // Unpinned github/gitlab/template/npm/go: query latest and compare.
-        // Route template through template_source::latest; others through
+        // Query latest and compare. A templated `url` resolves via its pin /
+        // version_source (template_source::latest); a fixed URL has no latest
+        // concept (n/a → the skip below). Everything else goes through
         // outdated::latest_version.
-        let latest_res = if parsed.source == SourceKind::Template {
-            template_source::latest(tool, self.http.as_ref())
-        } else {
-            outdated::latest_version(self.http.as_ref(), parsed, tool.host.as_deref())
+        let latest_res = match parsed.source {
+            SourceKind::Url if template_source::is_templated(&parsed.locator, tool) => {
+                template_source::latest(tool, self.http.as_ref())
+            }
+            SourceKind::Url => Ok(Latest::NotApplicable),
+            _ => outdated::latest_version(self.http.as_ref(), parsed, tool.host.as_deref()),
         };
         let latest = match latest_res {
             Ok(Latest::Version(v)) => v,
@@ -729,9 +735,20 @@ impl App {
     fn cmd_info(&self, args: InfoArgs) -> Result<()> {
         let cfg = Config::load_or_default(&self.paths.config_file())?;
         let state = read_state_no_lock(&self.paths.state_file())?;
-        let Some(tool) = cfg.tools.get(&args.name) else {
-            bail!("tool `{}` is not declared in config", args.name);
-        };
+        // Declared tool → local info. Otherwise, if the argument parses as a spec
+        // (e.g. `github:neovim/neovim`, `pixi:vim`), fetch remote metadata to help
+        // vet the spec before adding it.
+        if !cfg.tools.contains_key(&args.name) {
+            let default_source = cfg.settings.default_source_kind()?;
+            return match parse_spec(&args.name, default_source) {
+                Ok(parsed) => self.info_spec(&args.name, &parsed),
+                Err(e) => bail!(
+                    "`{}` is neither a declared tool nor a recognizable spec ({e})",
+                    args.name
+                ),
+            };
+        }
+        let tool = cfg.tools.get(&args.name).expect("checked above");
         let parsed = cfg.parsed_spec(tool)?;
         println!("name:    {}", args.name);
         println!("source:  {}", parsed.source);
@@ -761,7 +778,141 @@ impl App {
         } else {
             println!("(not installed)");
         }
+        // Also surface the live upstream metadata (latest version, assets,
+        // summary, …) so `info` reflects reality, not just the recorded state.
+        println!("--- upstream ({}) ---", parsed.source);
+        self.info_remote(&parsed, tool);
         Ok(())
+    }
+
+    /// `ubix info <spec>`: fetch remote metadata for an un-declared spec to help
+    /// the user vet it before `ubix add`. Best-effort — a failed lookup prints a
+    /// note rather than erroring, so the parsed spec is always shown.
+    fn info_spec(&self, spec: &str, parsed: &crate::sources::ParsedSpec) -> Result<()> {
+        println!("spec:    {spec}");
+        println!("source:  {}", parsed.source);
+        println!("locator: {}", parsed.locator);
+        self.info_remote(parsed, &ToolConfig::from_spec(spec));
+        Ok(())
+    }
+
+    /// Print the remote metadata for a parsed spec (aqua/GitHub, prefix.dev, or a
+    /// registry latest-version). Best-effort: each lookup prints a note on error.
+    /// `tool` supplies url-templating fields when known (declared tools).
+    fn info_remote(&self, parsed: &crate::sources::ParsedSpec, tool: &ToolConfig) {
+        let loc = &parsed.locator;
+        match parsed.source {
+            SourceKind::Github => self.info_github(loc),
+            SourceKind::Pixi => self.info_pixi(loc),
+            SourceKind::Gitlab => {
+                println!("repo:    https://gitlab.com/{loc}");
+                self.info_latest(parsed);
+            }
+            SourceKind::Pypi => {
+                println!("homepage: https://pypi.org/project/{}", pkg_base(loc));
+                self.info_latest(parsed);
+            }
+            SourceKind::Npm => {
+                println!("homepage: https://www.npmjs.com/package/{loc}");
+                self.info_latest(parsed);
+            }
+            SourceKind::Cargo => {
+                println!("homepage: https://crates.io/crates/{}", pkg_base(loc));
+                self.info_latest(parsed);
+            }
+            SourceKind::Go => {
+                let m = loc.split('@').next().unwrap_or(loc);
+                println!("homepage: https://pkg.go.dev/{m}");
+                self.info_latest(parsed);
+            }
+            SourceKind::Url => {
+                let templated = template_source::is_templated(loc, tool);
+                println!("kind:    {}", if templated { "templated URL" } else { "fixed URL" });
+                if templated {
+                    self.info_latest_url(tool);
+                } else {
+                    println!("note:    fixed url carries no registry metadata; open the URL to verify");
+                }
+            }
+        }
+    }
+
+    /// Latest for a templated url tool via its `version_source`/pin.
+    fn info_latest_url(&self, tool: &ToolConfig) {
+        match template_source::latest(tool, self.http.as_ref()) {
+            Ok(Latest::Version(v)) => println!("latest:  {v}"),
+            Ok(Latest::NotApplicable) => println!("latest:  n/a (no version_source/pin)"),
+            Err(e) => println!("latest:  (query failed: {e})"),
+        }
+    }
+
+    /// Print the latest version for a spec via the registry query seam.
+    fn info_latest(&self, parsed: &crate::sources::ParsedSpec) {
+        match outdated::latest_version(self.http.as_ref(), parsed, None) {
+            Ok(Latest::Version(v)) => println!("latest:  {v}"),
+            Ok(Latest::NotApplicable) => println!("latest:  n/a"),
+            Err(e) => println!("latest:  (query failed: {e})"),
+        }
+    }
+
+    /// GitHub vetting: repo URL, latest release tag, and the release's asset names
+    /// (so the user can confirm a binary exists for their platform).
+    fn info_github(&self, locator: &str) {
+        println!("repo:    https://github.com/{locator}");
+        let url = format!("https://api.github.com/repos/{locator}/releases/latest");
+        let body = match self.http.get_text(&url) {
+            Ok(b) => b,
+            Err(e) => {
+                println!("latest release: (query failed: {e})");
+                return;
+            }
+        };
+        if let Ok(tag) = outdated::parse_github(&body) {
+            println!("latest release: {tag}");
+        }
+        if let Ok(assets) = outdated::parse_github_asset_names(&body) {
+            let (goos, goarch) = (crate::platform::goos(), crate::platform::goarch());
+            println!("assets ({} total; your platform is {goos}/{goarch}):", assets.len());
+            for a in assets.iter().take(15) {
+                println!("  {a}");
+            }
+            if assets.len() > 15 {
+                println!("  … and {} more", assets.len() - 15);
+            }
+        }
+    }
+
+    /// prefix.dev vetting: summary, description, latest version, and the platforms
+    /// the latest build publishes for.
+    fn info_pixi(&self, locator: &str) {
+        let (channel, name) = crate::sources::pixi::split_channel(locator);
+        println!("channel: {channel}");
+        let found = match crate::prefix_dev::package_info(self.http.as_ref(), &channel, &name) {
+            Ok(f) => f,
+            Err(e) => {
+                println!("latest:  (query failed: {e})");
+                return;
+            }
+        };
+        match found {
+            Some(info) => {
+                if let Some(s) = &info.summary {
+                    println!("summary: {s}");
+                }
+                if let Some(d) = &info.description {
+                    let d = d.trim();
+                    let short: String = d.chars().take(300).collect();
+                    let ell = if d.chars().count() > 300 { "…" } else { "" };
+                    println!("description: {short}{ell}");
+                }
+                println!("latest:  {}", info.version.as_deref().unwrap_or("n/a"));
+                if !info.platforms.is_empty() {
+                    println!("platforms: {}", info.platforms.join(", "));
+                }
+                println!("verify:  https://prefix.dev/channels/{channel}/packages/{name}");
+            }
+            None => println!("latest:  (not found on prefix.dev channel `{channel}`)"),
+        }
     }
 
     // ---- edit ----
@@ -809,6 +960,17 @@ impl App {
         if let Some(base) = npm::detect_fnm_base(self.runner.as_ref()) {
             segments.push(npm::alias_bin_dir(&base));
         }
+        // pixi exposes `pixi global` tools in $PIXI_HOME/bin (not install_dir), so
+        // check that dir too — but only when pixi is actually in play (installed,
+        // or a pixi: tool is declared) to avoid noise for non-pixi users.
+        let uses_pixi = self.runner.which("pixi")
+            || cfg
+                .tools
+                .values()
+                .any(|t| t.spec.trim_start().starts_with("pixi:"));
+        if uses_pixi {
+            segments.push(pixi::pixi_bin_dir());
+        }
 
         for seg in &segments {
             let ok = path_contains(seg);
@@ -819,7 +981,7 @@ impl App {
         }
 
         // Underlying tools.
-        for tool in ["uv", "fnm", "rustup", "go", "cargo", "npm"] {
+        for tool in ["uv", "fnm", "rustup", "go", "cargo", "npm", "pixi"] {
             let present = self.runner.which(tool);
             println!("  [{}] {tool}", if present { "ok" } else { "--" });
         }
@@ -831,9 +993,10 @@ impl App {
         use bootstrap::BootstrapTarget;
         let target: BootstrapTarget = args.target.parse()?;
         match target {
-            // python/nodejs need the add/config/state machinery → handled here.
+            // python/nodejs/pixi need the add/config/state machinery → handled here.
             BootstrapTarget::Python => self.cmd_bootstrap_python(args.reinstall),
             BootstrapTarget::Nodejs => self.cmd_bootstrap_nodejs(args.reinstall),
+            BootstrapTarget::Pixi => self.cmd_bootstrap_pixi(args.reinstall),
             // rust/go are pure toolchain fetches → the ctx-only bootstrap.
             BootstrapTarget::Rust | BootstrapTarget::Go => {
                 let cfg = Config::load_or_default(&self.paths.config_file())?;
@@ -907,6 +1070,17 @@ impl App {
         Ok(())
     }
 
+    // ---- bootstrap pixi (prefix-dev/pixi github release) ----
+    fn cmd_bootstrap_pixi(&self, reinstall: bool) -> Result<()> {
+        // pixi is a plain GitHub-release binary; install it via the normal add
+        // path so it's tracked/upgradable like any other tool.
+        self.ensure_added("github:prefix-dev/pixi", "pixi", &[], reinstall)?;
+        let bin = pixi::pixi_bin_dir();
+        println!("bootstrapped pixi; `pixi global` tools install to {}", bin.display());
+        println!("add to PATH: {}", bin.display());
+        Ok(())
+    }
+
     // ---- sources ----
     fn cmd_sources(&self) -> Result<()> {
         for line in format_sources() {
@@ -915,103 +1089,142 @@ impl App {
         Ok(())
     }
 
-    // ---- search (aqua generator) ----
+    // ---- search (aqua-registry github: + prefix.dev pixi:, run in parallel) ----
     fn cmd_search(&self, args: SearchArgs) -> Result<()> {
-        // `owner/repo` → direct per-pkg lookup; otherwise a root-index search.
-        let (owner, repo) = if args.query.contains('/') {
-            split_owner_repo(args.query.trim())?
-        } else {
-            let (o, r) = self.resolve_search_query(&args.query)?;
-            (o, r)
-        };
+        let query = args.query.trim().to_string();
 
-        let (name, tool) =
-            crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+        // Explicit `owner/repo` → precise aqua GitHub lookup (full snippet +
+        // per-platform matching preview); the combined list can't show that detail.
+        if query.contains('/') {
+            let (owner, repo) = split_owner_repo(&query)?;
+            let (name, tool) =
+                crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+            if args.add {
+                return self.persist_and_install(name, tool, false, args.wait);
+            }
+            print_aqua_snippet(&name, &tool);
+            return Ok(());
+        }
+
+        // Which backends? Default = BOTH; `--pixi`/`--aqua` narrow to one.
+        let want_aqua = !args.pixi || args.aqua;
+        let want_pixi = !args.aqua || args.pixi;
+
+        // Fan aqua + pixi out concurrently. Each is best-effort: a failed backend
+        // contributes nothing but never sinks the other. Only `&dyn HttpClient`
+        // (Send+Sync) crosses the thread boundary — not `self`.
+        let http = self.http.as_ref();
+        let channel = args.channel.as_deref();
+        let (aqua_res, pixi_res) = std::thread::scope(|s| {
+            let a = want_aqua.then(|| s.spawn(|| aqua_candidates(http, &query)));
+            let p = want_pixi.then(|| s.spawn(|| crate::prefix_dev::search(http, &query, channel, 25)));
+            // A panicked finder becomes a graceful Err (release builds are
+            // panic=abort, so re-panicking here would kill the whole process).
+            let a = a.map(|h| h.join().unwrap_or_else(|_| bail!("aqua search thread panicked")));
+            let p = p.map(|h| h.join().unwrap_or_else(|_| bail!("pixi search thread panicked")));
+            (a, p)
+        });
+
+        let mut cands: Vec<SearchHit> = Vec::new();
+        match aqua_res {
+            Some(Ok(list)) => cands.extend(list.into_iter().map(SearchHit::Aqua)),
+            Some(Err(e)) => step!("aqua search unavailable: {e}"),
+            None => {}
+        }
+        match pixi_res {
+            Some(Ok(list)) => cands.extend(list.into_iter().map(SearchHit::Pixi)),
+            Some(Err(e)) => step!("pixi search unavailable: {e}"),
+            None => {}
+        }
+        if cands.is_empty() {
+            bail!("no package matching `{query}` in aqua-registry or prefix.dev");
+        }
 
         if args.add {
-            return self.persist_and_install(name, tool, false, args.wait);
+            return self.add_from_search(&query, cands, args.name.as_deref(), args.wait);
         }
-
-        // Default: print the generated snippet + a one-line platform preview.
-        print!("{}", crate::aqua::generate_snippet(&name, &tool));
-        let (goos, goarch) = (crate::platform::goos(), crate::platform::goarch());
-        if tool.matching.is_none() {
-            // matching was pruned (or never needed): ubi auto-selects the asset.
-            println!("# no matching needed: ubi selects the asset for {goos}-{goarch} automatically");
-        } else {
-            match crate::aqua::current_platform_matching(&tool) {
-                // Non-empty filter → show it.
-                Some(m) if !m.is_empty() => {
-                    println!("# on {goos}-{goarch}: matches asset containing `{m}`")
-                }
-                // Present but pruned to "" (supported, ubi auto-selects here).
-                Some(_) => println!(
-                    "# no matching needed: ubi selects the asset for {goos}-{goarch} automatically"
-                ),
-                None => println!(
-                    "# note: {goos}-{goarch} is not among the supported platforms for this package"
-                ),
-            }
-        }
+        print_search_results(&query, &cands);
         Ok(())
     }
 
-    /// Resolve a fuzzy `search <name>` query to a single `owner/repo` via the
-    /// root-index cache. Refreshes the cache from upstream first (best-effort);
-    /// on a failed refresh, falls back to the existing cache, and only errors if
-    /// there is no cache to fall back to. Multiple candidates → list them and
-    /// bail; none → bail.
-    fn resolve_search_query(&self, query: &str) -> Result<(String, String)> {
-        let cache = crate::aqua::registry::root_cache_path();
-        let text = match crate::aqua::registry::update(self.http.as_ref()) {
-            Ok((_, n)) => {
-                step!("refreshed aqua root index ({n} bytes)");
-                crate::aqua::registry::read_root_cache(&cache)?
-                    .context("root index cache missing after update")?
-            }
-            Err(e) => match crate::aqua::registry::read_root_cache(&cache)? {
-                Some(t) => {
-                    step!("aqua root index refresh failed ({e}); using cached index");
-                    t
-                }
-                None => bail!("aqua root index unavailable (refresh failed: {e}, no cache)"),
-            },
+    /// `--add` over combined results: install the unambiguous choice. An exact
+    /// name match wins; failing that, a lone candidate is taken; otherwise the
+    /// list is printed and we bail asking the user to narrow the choice.
+    fn add_from_search(
+        &self,
+        query: &str,
+        cands: Vec<SearchHit>,
+        name_override: Option<&str>,
+        wait: bool,
+    ) -> Result<()> {
+        let exact: Vec<usize> = cands
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.name() == query)
+            .map(|(i, _)| i)
+            .collect();
+        let idx = if exact.len() == 1 {
+            exact[0]
+        } else if exact.is_empty() && cands.len() == 1 {
+            0
+        } else {
+            print_search_results(query, &cands);
+            bail!(
+                "`{query}` is ambiguous across {} candidates; narrow with --aqua/--pixi \
+                 and/or an exact name, or run one of the `ubix add` commands above",
+                cands.len()
+            );
         };
-        let mut hits = crate::aqua::search_index(&text, query);
-        match hits.len() {
-            0 => bail!("no aqua package matching `{query}`"),
-            1 => {
-                let c = hits.remove(0);
-                Ok((c.owner, c.repo))
+
+        match &cands[idx] {
+            SearchHit::Aqua(c) => {
+                let (name, tool) = crate::aqua::resolve_package(
+                    self.http.as_ref(),
+                    &c.owner,
+                    &c.repo,
+                    name_override,
+                )?;
+                self.persist_and_install(name, tool, false, wait)
             }
-            _ => {
-                // Exact repo-name match disambiguates a strong single hit.
-                if let Some(exact) = hits.iter().find(|c| c.repo == query) {
-                    return Ok((exact.owner.clone(), exact.repo.clone()));
-                }
-                let mut msg = format!("multiple aqua packages match `{query}`:\n");
-                for c in &hits {
-                    msg.push_str(&format!("  {}/{}\n", c.owner, c.repo));
-                }
-                msg.push_str("re-run with the exact `owner/repo`");
-                bail!(msg);
+            SearchHit::Pixi(h) => {
+                let name = name_override.map(str::to_string).unwrap_or_else(|| h.name.clone());
+                let tool = ToolConfig::from_spec(format!("pixi:{}", pixi_locator(h)));
+                self.persist_and_install(name, tool, false, wait)
             }
         }
     }
 
     // ---- install / upgrade dispatch ----
 
-    /// Upgrade a tool. pypi uses `uv tool upgrade`; other sources reinstall in
-    /// place (which is an in-place upgrade for release/go/cargo/npm).
+    /// Upgrade a tool. pypi/pixi upgrade via their tool manager; other sources
+    /// reinstall in place (an in-place upgrade for release/go/cargo/npm).
     fn upgrade_tool(&self, cfg: &Config, name: &str, tool: &ToolConfig) -> Result<ToolRecord> {
         let parsed = cfg.parsed_spec(tool)?;
-        if parsed.source == SourceKind::Pypi {
+        // A pinned pixi tool must CONVERGE to its pin: `pixi global update` ignores
+        // the pin and jumps to latest, so reinstall via `pixi global install pkg=version`.
+        if parsed.source == SourceKind::Pixi && tool.version.is_some() {
+            return self.install_tool(cfg, name, tool);
+        }
+        if matches!(parsed.source, SourceKind::Pypi | SourceKind::Pixi) {
             let install_dir = cfg.settings.install_dir_path();
-            let outcome = uv::upgrade(tool, self.runner.as_ref(), &install_dir)?;
+            let outcome = if parsed.source == SourceKind::Pixi {
+                pixi::upgrade(tool, self.runner.as_ref())?
+            } else {
+                uv::upgrade(tool, self.runner.as_ref(), &install_dir)?
+            };
+            // Backfill the real version (pixi reports a "latest" sentinel) so an
+            // already-current tool isn't needlessly re-upgraded on every run.
+            let installed_version = resolve_record_version(
+                self.http.as_ref(),
+                &parsed,
+                tool.tag.as_deref(),
+                tool.host.as_deref(),
+                &outcome.installed_version,
+            );
             let now = crate::now_iso8601();
             return Ok(ToolRecord {
                 source: parsed.source.to_string(),
-                installed_version: outcome.installed_version,
+                installed_version,
                 locator: Some(parsed.locator.clone()),
                 resolved_asset: outcome.resolved_asset,
                 module: None,
@@ -1064,11 +1277,11 @@ impl App {
                 gitlab::install(tool, name, install_dir, &UbiEngine::new())?
             }
             SourceKind::Pypi => uv::install(tool, self.runner.as_ref(), &install_dir, false)?,
+            SourceKind::Pixi => pixi::install(tool, self.runner.as_ref())?,
             SourceKind::Npm => npm::install(tool, self.runner.as_ref())?,
             SourceKind::Cargo => cargo::install(tool, self.runner.as_ref(), &install_dir)?,
             SourceKind::Go => go::install(tool, self.runner.as_ref(), &install_dir)?,
-            SourceKind::Url => url::install(tool, self.http.as_ref(), &install_dir, name)?,
-            SourceKind::Template => template_source::install(
+            SourceKind::Url => url::install(
                 tool,
                 self.http.as_ref(),
                 self.runner.as_ref(),
@@ -1134,6 +1347,128 @@ fn read_state_no_lock(path: &std::path::Path) -> Result<crate::state::State> {
     crate::state::State::from_toml(&text)
 }
 
+/// One combined-search candidate: a GitHub repo (aqua-registry) or a conda
+/// package (prefix.dev). Each renders the command a user should run next.
+enum SearchHit {
+    Aqua(crate::aqua::registry::Candidate),
+    Pixi(crate::prefix_dev::Hit),
+}
+
+impl SearchHit {
+    /// The bare name used for exact-match selection (repo / package name).
+    fn name(&self) -> &str {
+        match self {
+            SearchHit::Aqua(c) => &c.repo,
+            SearchHit::Pixi(h) => &h.name,
+        }
+    }
+
+    /// The command to run next for this hit.
+    ///
+    /// * aqua → `ubix search <owner>/<repo> --aqua`: aqua synthesizes
+    ///   `matching`/`exe`/etc. from the registry, so the user should inspect that
+    ///   generated config first. NOT `ubix add owner/repo` — that installs via the
+    ///   plain github source and SKIPS the aqua synthesis, which is misleading.
+    /// * pixi → `ubix add pixi:<locator>`: the spec installs exactly this package.
+    fn suggest_cmd(&self) -> String {
+        match self {
+            SearchHit::Aqua(c) => format!("ubix search {}/{} --aqua", c.owner, c.repo),
+            SearchHit::Pixi(h) => format!("ubix add pixi:{}", pixi_locator(h)),
+        }
+    }
+
+    /// A left-hand descriptor for the results table.
+    fn descriptor(&self) -> String {
+        match self {
+            SearchHit::Aqua(c) => format!("{}/{}", c.owner, c.repo),
+            SearchHit::Pixi(h) => format!("{}::{} ({})", h.channel, h.name, h.version),
+        }
+    }
+}
+
+/// The pixi locator for a hit: bare `name` for conda-forge (the default), else
+/// conda's `channel::name` so install + latest-query target the right channel.
+fn pixi_locator(h: &crate::prefix_dev::Hit) -> String {
+    if h.channel == crate::prefix_dev::DEFAULT_CHANNEL {
+        h.name.clone()
+    } else {
+        format!("{}::{}", h.channel, h.name)
+    }
+}
+
+/// Fetch aqua-registry candidates for a fuzzy `query` (repo-name substring).
+/// Refreshes the root index (best-effort); falls back to a cached index, and
+/// only errors when there is no cache at all. Returns all hits (may be empty).
+fn aqua_candidates(
+    http: &dyn HttpClient,
+    query: &str,
+) -> Result<Vec<crate::aqua::registry::Candidate>> {
+    let cache = crate::aqua::registry::root_cache_path();
+    let text = match crate::aqua::registry::update(http) {
+        Ok((_, n)) => {
+            step!("refreshed aqua root index ({n} bytes)");
+            crate::aqua::registry::read_root_cache(&cache)?
+                .context("root index cache missing after update")?
+        }
+        Err(e) => match crate::aqua::registry::read_root_cache(&cache)? {
+            Some(t) => {
+                step!("aqua root index refresh failed ({e}); using cached index");
+                t
+            }
+            None => bail!("aqua root index unavailable (refresh failed: {e}, no cache)"),
+        },
+    };
+    Ok(crate::aqua::search_index(&text, query))
+}
+
+/// Print combined search results, grouped by source, each with its `ubix add`
+/// command. An exact name match is starred so `--add` behavior is predictable.
+fn print_search_results(query: &str, cands: &[SearchHit]) {
+    let width = cands.iter().map(|c| c.descriptor().len()).max().unwrap_or(0).min(48);
+    let mut printed_aqua = false;
+    let mut printed_pixi = false;
+    for c in cands {
+        match c {
+            SearchHit::Aqua(_) if !printed_aqua => {
+                println!("# github (aqua-registry)");
+                printed_aqua = true;
+            }
+            SearchHit::Pixi(_) if !printed_pixi => {
+                println!("# conda (prefix.dev)");
+                printed_pixi = true;
+            }
+            _ => {}
+        }
+        let star = if c.name() == query { " *" } else { "  " };
+        println!("{star}{:<width$}   {}", c.descriptor(), c.suggest_cmd(), width = width);
+    }
+    println!(
+        "# * = exact match. github hits → `ubix search … --aqua` to inspect the synthesized \
+         config; pixi hits → `ubix add …`. Or append --add to install the exact match."
+    );
+}
+
+/// Print the synthesized aqua `github:` snippet plus a one-line platform preview.
+fn print_aqua_snippet(name: &str, tool: &ToolConfig) {
+    print!("{}", crate::aqua::generate_snippet(name, tool));
+    let (goos, goarch) = (crate::platform::goos(), crate::platform::goarch());
+    if tool.matching.is_none() {
+        println!("# no matching needed: ubi selects the asset for {goos}-{goarch} automatically");
+        return;
+    }
+    match crate::aqua::current_platform_matching(tool) {
+        Some(m) if !m.is_empty() => {
+            println!("# on {goos}-{goarch}: matches asset containing `{m}`")
+        }
+        Some(_) => println!(
+            "# no matching needed: ubi selects the asset for {goos}-{goarch} automatically"
+        ),
+        None => println!(
+            "# note: {goos}-{goarch} is not among the supported platforms for this package"
+        ),
+    }
+}
+
 /// Determine the version string to record after a successful install.
 ///
 /// * `tag` pinned → the tag (no query).
@@ -1150,6 +1485,19 @@ pub fn resolve_record_version(
 ) -> String {
     if let Some(t) = tag {
         return t.to_string();
+    }
+    // pixi: a pinned version arrives as a non-"latest" fallback and is kept as-is;
+    // an unpinned install ("latest" sentinel) is backfilled from prefix.dev so
+    // `outdated` can compare an accurate version next run.
+    if parsed.source == SourceKind::Pixi {
+        if fallback != "latest" {
+            return fallback.to_string();
+        }
+        let (channel, name) = crate::sources::pixi::split_channel(&parsed.locator);
+        return match crate::prefix_dev::latest_version(http, &channel, &name) {
+            Ok(Some(v)) => v,
+            _ => fallback.to_string(),
+        };
     }
     if !matches!(parsed.source, SourceKind::Github | SourceKind::Gitlab) {
         return fallback.to_string();
@@ -1513,6 +1861,11 @@ pub fn split_owner_repo(s: &str) -> Result<(String, String)> {
         bail!("expected `owner/repo`, got `{s}`");
     }
     Ok((segs[0].to_string(), segs[1].to_string()))
+}
+
+/// Bare package name for registry homepage links: strip a `@`/`=` version pin.
+fn pkg_base(locator: &str) -> &str {
+    locator.split(['@', '=']).next().unwrap_or(locator)
 }
 
 /// Derive a tool name from a locator: last path segment, stripped of `@version`.

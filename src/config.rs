@@ -183,7 +183,8 @@ pub struct ToolConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub locked: Option<bool>,
 
-    // ---- template (templated URL + version discovery; legacy prefix `http:`) ----
+    // ---- url templating (setting any of these makes a `url:` tool templated;
+    //      legacy prefixes `template:`/`http:` are aliases for `url:`) ----
     /// Alternate URL template used on Linux+musl (glibc uses the primary `url`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub url_musl: Option<String>,

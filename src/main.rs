@@ -19,6 +19,7 @@ mod http;
 mod outdated;
 mod paths;
 mod platform;
+mod prefix_dev;
 mod remove;
 mod runner;
 mod sources;

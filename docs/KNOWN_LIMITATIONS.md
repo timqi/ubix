@@ -5,7 +5,14 @@ These are real but were deferred because a correct fix needs a design decision,
 external-tool validation, or a seam/API change beyond a local edit. The common
 case works today; each note records the edge and why it was left.
 
-## Package managers (uv / npm)
+## Package managers (uv / npm / pixi)
+- **pixi tracked `install_paths` assume the trampoline is named after the package.**
+  `pixi global install` names its `$PIXI_HOME/bin` trampolines after the package's
+  ENTRY POINTS, not the package (e.g. `ripgrep` → `rg`, `python-dotenv` → `dotenv`).
+  ubix records `$PIXI_HOME/bin/<pkg>`, so `ubix info`/`list` may show a path that
+  doesn't exist when they differ. Removal is unaffected (tool-managed via
+  `pixi global uninstall <pkg>`). A correct fix needs to parse `pixi global list`
+  output or diff the bin dir around install. (`src/sources/pixi.rs`)
 - **`uv tool upgrade` relies on uv retaining install-time constraints.** A pinned
   PyPI tool (`version`/`extras`/`with`) stays converged only because `uv tool
   upgrade` honors the recorded requirement. If that assumption ever breaks, switch
