@@ -25,6 +25,9 @@ pub struct ReleaseRequest {
     pub matching: Option<String>,
     /// Executable name inside the archive; defaults to the tool key.
     pub exe: Option<String>,
+    /// Multi-entry executables to extract from a single archive (§5.1). When
+    /// non-empty, the engine uses ubi's `extract_all` and selects these names.
+    pub exes: Vec<String>,
     /// Rename installed exe to this.
     pub rename: Option<String>,
     /// Final directory to install into (absolute).
@@ -42,8 +45,8 @@ pub struct ReleaseRequest {
 /// What the engine installed.
 #[derive(Debug, Clone)]
 pub struct EngineResult {
-    /// Final absolute path of the installed executable.
-    pub install_path: PathBuf,
+    /// All installed paths (multiple for `exes`; one otherwise; primary first).
+    pub install_paths: Vec<PathBuf>,
     pub sha256: String,
     /// The tag/version ubi resolved, if known (best-effort).
     pub version: Option<String>,
@@ -76,25 +79,54 @@ impl ReleaseEngine for UbiEngine {
 
         run_ubi(req, &staging_dir)?;
 
-        // 2) Locate the produced executable in the staging dir.
-        let staged_exe = locate_staged_exe(&staging_dir, req)?;
+        std::fs::create_dir_all(&req.install_dir)
+            .with_context(|| format!("creating install_dir {}", req.install_dir.display()))?;
 
-        // 3) Verify: non-empty file, then compute sha256.
+        // Multi-entry `exes` path (§5.1): extract_all produced the whole archive
+        // into staging; select the whitelisted names and atomically install each.
+        if !req.exes.is_empty() {
+            let extracted = crate::archive::collect_files(&staging_dir)?;
+            let mut install_paths = Vec::new();
+            for want in &req.exes {
+                let src = extracted
+                    .iter()
+                    .find(|p| p.file_name().map(|f| f == want.as_str()).unwrap_or(false))
+                    .with_context(|| {
+                        format!("`exes` entry `{want}` not found in extracted archive")
+                    })?;
+                if std::fs::metadata(src).map(|m| m.len()).unwrap_or(0) == 0 {
+                    bail!("staged executable {} is empty", src.display());
+                }
+                let dst = req.install_dir.join(want);
+                atomic_install(src, &dst)?;
+                install_paths.push(dst);
+            }
+            // sha256 of the primary entry for the state record.
+            let primary = install_paths
+                .first()
+                .cloned()
+                .context("exes produced no install paths")?;
+            let sha = sha256_file(&primary)?;
+            return Ok(EngineResult {
+                install_paths,
+                sha256: sha,
+                version: req.tag.clone(),
+            });
+        }
+
+        // Single-exe path.
+        let staged_exe = locate_staged_exe(&staging_dir, req)?;
         let meta = std::fs::metadata(&staged_exe)
             .with_context(|| format!("stat staged file {}", staged_exe.display()))?;
         if meta.len() == 0 {
             bail!("staged executable {} is empty", staged_exe.display());
         }
         let sha = sha256_file(&staged_exe)?;
-
-        // 4) Atomic replace into install_dir.
-        std::fs::create_dir_all(&req.install_dir)
-            .with_context(|| format!("creating install_dir {}", req.install_dir.display()))?;
         let final_path = req.install_dir.join(&req.final_name);
         atomic_install(&staged_exe, &final_path)?;
 
         Ok(EngineResult {
-            install_path: final_path,
+            install_paths: vec![final_path],
             sha256: sha,
             version: req.tag.clone(),
         })
@@ -115,11 +147,19 @@ fn run_ubi(req: &ReleaseRequest, staging_dir: &Path) -> Result<()> {
     if let Some(m) = &req.matching {
         builder = builder.matching(m);
     }
-    if let Some(e) = &req.exe {
-        builder = builder.exe(e);
-    }
-    if let Some(r) = &req.rename {
-        builder = builder.rename_exe_to(r);
+    if !req.exes.is_empty() {
+        // Multi-entry: extract the entire archive so we can select several entry
+        // points. `rename_exe_to` is incompatible with `extract_all` in ubi
+        // (build() errors), so it is NOT applied here — callers forbid combining
+        // `exes` + `rename` at build-request time.
+        builder = builder.extract_all();
+    } else {
+        if let Some(e) = &req.exe {
+            builder = builder.exe(e);
+        }
+        if let Some(r) = &req.rename {
+            builder = builder.rename_exe_to(r);
+        }
     }
     // `token()` is forge-agnostic (ubi routes it by forge type). We pass
     // whichever token the caller supplied for the active forge.
@@ -196,7 +236,10 @@ fn locate_staged_exe(staging_dir: &Path, req: &ReleaseRequest) -> Result<PathBuf
 /// Atomically move `src` to `dst`. Tries a plain rename first (same filesystem),
 /// falling back to copy + rename via a temp in the destination directory when
 /// the source is on a different filesystem (the common tempdir case).
-fn atomic_install(src: &Path, dst: &Path) -> Result<()> {
+///
+/// Shared by the ubi engine and the `url` source so both get the same
+/// stage-then-atomic-rename correctness guarantee (§8.7 / D15).
+pub fn atomic_install(src: &Path, dst: &Path) -> Result<()> {
     // Ensure exec bit on unix before publishing.
     #[cfg(unix)]
     {
@@ -247,9 +290,14 @@ fn atomic_install(src: &Path, dst: &Path) -> Result<()> {
 /// Compute the hex sha256 of a file.
 pub fn sha256_file(path: &Path) -> Result<String> {
     let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+/// Compute the hex sha256 of a byte slice.
+pub fn sha256_bytes(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(format!("{:x}", hasher.finalize()))
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]
@@ -298,6 +346,7 @@ mod tests {
             tag: None,
             matching: None,
             exe: None,
+            exes: Vec::new(),
             rename: None,
             install_dir: staging.path().to_path_buf(),
             final_name: "repo".into(),
@@ -320,6 +369,7 @@ mod tests {
             tag: None,
             matching: None,
             exe: None,
+            exes: Vec::new(),
             rename: None,
             install_dir: staging.path().to_path_buf(),
             final_name: "repo".into(),

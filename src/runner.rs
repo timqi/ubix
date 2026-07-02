@@ -86,6 +86,19 @@ impl CommandRunner for SystemRunner {
 /// Deterministic mock runner for unit tests. Later milestones use this to test
 /// uv/fnm/cargo/go handlers without touching the system. It is part of the
 /// established test seam and is currently exercised only from tests.
+/// A single recorded invocation (program, args, env overrides).
+#[allow(dead_code)]
+#[derive(Debug, Clone, Default)]
+pub struct RecordedCall {
+    pub program: String,
+    pub args: Vec<String>,
+    pub envs: Vec<(String, String)>,
+}
+
+/// Deterministic mock runner for unit tests. Later milestones use this to test
+/// uv/fnm/cargo/go handlers without touching the system. It is part of the
+/// established test seam and is currently exercised only from tests. It also
+/// records every invocation (including env overrides) so tests can assert them.
 #[allow(dead_code)]
 #[derive(Debug, Default)]
 pub struct MockRunner {
@@ -93,6 +106,8 @@ pub struct MockRunner {
     pub responses: HashMap<String, CommandOutput>,
     /// Programs considered present on PATH.
     pub present: Vec<String>,
+    /// Recorded invocations, newest last.
+    pub calls: std::cell::RefCell<Vec<RecordedCall>>,
 }
 
 #[allow(dead_code)]
@@ -111,6 +126,11 @@ impl MockRunner {
         self.present.push(program.to_string());
         self
     }
+
+    /// The most recent recorded call, if any.
+    pub fn last_call(&self) -> Option<RecordedCall> {
+        self.calls.borrow().last().cloned()
+    }
 }
 
 impl CommandRunner for MockRunner {
@@ -118,8 +138,13 @@ impl CommandRunner for MockRunner {
         &self,
         program: &str,
         args: &[&str],
-        _envs: &[(&str, &str)],
+        envs: &[(&str, &str)],
     ) -> Result<CommandOutput> {
+        self.calls.borrow_mut().push(RecordedCall {
+            program: program.to_string(),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            envs: envs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+        });
         let key = if args.is_empty() {
             program.to_string()
         } else {

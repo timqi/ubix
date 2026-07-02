@@ -1,7 +1,12 @@
-//! Source abstraction: spec parsing plus the `Source` trait each per-source
-//! handler will implement in later milestones.
+//! Source abstraction: spec parsing plus the per-source handlers.
 
+pub mod cargo;
 pub mod github;
+pub mod gitlab;
+pub mod go;
+pub mod npm;
+pub mod url;
+pub mod uv;
 
 use std::fmt;
 use std::str::FromStr;
@@ -38,22 +43,6 @@ impl SourceKind {
         }
     }
 
-    /// Whether this source is implemented in M1.
-    pub fn is_implemented(self) -> bool {
-        matches!(self, SourceKind::Github)
-    }
-
-    /// Milestone in which the source lands (for the "not yet implemented" message).
-    pub fn milestone(self) -> &'static str {
-        match self {
-            SourceKind::Github => "M1",
-            SourceKind::Gitlab => "M2",
-            SourceKind::Pypi => "M3",
-            SourceKind::Npm => "M4",
-            SourceKind::Cargo | SourceKind::Go => "M5",
-            SourceKind::Url => "M6",
-        }
-    }
 }
 
 impl FromStr for SourceKind {
@@ -182,42 +171,27 @@ pub struct InstallOutcome {
     pub sha256: Option<String>,
 }
 
-/// Common interface every per-source handler implements. Later milestones add
-/// pypi/npm/cargo/go handlers behind this same trait; M1 ships github only.
+/// Interface for release-family handlers driven by the engine (github). The
+/// command/HTTP-based sources (uv/npm/cargo/go/url) expose free `install`
+/// functions instead, since they need the `CommandRunner`/`HttpClient` seams
+/// and per-source options rather than a uniform object.
 pub trait Source {
     /// Resolve and install the tool, returning what was installed.
     fn install(&self, tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallOutcome>;
-
-    /// Upgrade in place (may be identical to install for most sources).
-    /// Part of the source trait surface; the CLI upgrade path calls `install`
-    /// in M1 and per-source overrides arrive in later milestones.
-    #[allow(dead_code)]
-    fn upgrade(&self, tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallOutcome> {
-        self.install(tool, runner)
-    }
-
-    /// Remove installed files. Default: delete the tracked `install_paths`.
-    fn remove(&self, record: &ToolRecord) -> Result<()> {
-        for p in &record.install_paths {
-            if p.exists() {
-                std::fs::remove_file(p)
-                    .map_err(|e| anyhow::anyhow!("removing {}: {e}", p.display()))?;
-            }
-        }
-        Ok(())
-    }
 }
 
-/// Return the handler for a source kind, or a clean "not yet implemented" error.
-pub fn handler_for(kind: SourceKind) -> Result<Box<dyn Source>> {
-    match kind {
-        SourceKind::Github => Ok(Box::new(github::GithubSource::new())),
-        other => bail!(
-            "source `{other}:` is not yet implemented ({}); \
-             recognized but unavailable in this build",
-            other.milestone()
-        ),
+/// Unlink a record's tracked files directly (safe: they are ubix-tracked).
+/// Used for file-based sources (github/gitlab/url/go) whose removal is just an
+/// unlink. Tool-managed sources (uv/cargo/npm) are handled by the CLI via their
+/// own uninstall commands.
+pub fn unlink_tracked(record: &ToolRecord) -> Result<()> {
+    for p in &record.install_paths {
+        if p.exists() {
+            std::fs::remove_file(p)
+                .map_err(|e| anyhow::anyhow!("removing {}: {e}", p.display()))?;
+        }
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -296,14 +270,17 @@ mod tests {
     }
 
     #[test]
-    fn unimplemented_handler_is_clean_error() {
-        // `handler_for` returns a boxed trait object (no Debug) on Ok, so match
-        // rather than `unwrap_err`.
-        let msg = match handler_for(SourceKind::Pypi) {
-            Ok(_) => panic!("pypi should be unimplemented"),
-            Err(e) => e.to_string(),
-        };
-        assert!(msg.contains("not yet implemented"), "{msg}");
-        assert!(msg.contains("M3"), "{msg}");
+    fn roundtrip_all_kinds_as_str() {
+        for k in [
+            SourceKind::Github,
+            SourceKind::Gitlab,
+            SourceKind::Url,
+            SourceKind::Pypi,
+            SourceKind::Npm,
+            SourceKind::Cargo,
+            SourceKind::Go,
+        ] {
+            assert_eq!(k.as_str().parse::<SourceKind>().unwrap(), k);
+        }
     }
 }

@@ -1,32 +1,32 @@
 //! `remove` safety logic (§8.5 / D14): only delete state-tracked files that
 //! ubix installed; `--force` adopts an untracked file into state, then removes.
+//!
+//! Removal strategy by source (§8.7 matrix):
+//! * github / gitlab / url / go → unlink the tracked `install_paths`.
+//! * pypi(uv) → `uv tool uninstall` (never rm the symlink — that leaks the venv).
+//! * cargo → `cargo uninstall --root <root>`.
+//! * npm(fnm) → `npm rm -g <pkg>`.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 
 use crate::config::Config;
-use crate::sources::{handler_for, SourceKind};
+use crate::runner::CommandRunner;
+use crate::sources::{cargo, npm, parse_spec, unlink_tracked, uv, SourceKind};
 use crate::state::{State, ToolRecord};
 
-/// Remove a tool from state (deleting its installed files) and from config.
-///
-/// * If the tool is tracked in state → delete its `install_paths`, drop record.
-/// * If NOT tracked:
-///   * without `force` → refuse (do not delete files ubix did not install).
-///   * with `force` → adopt the config-derived install path into state, then
-///     delete it ("adopt-then-remove", §8.5).
+/// Remove a tool from state (uninstalling / deleting its files) and from config.
 pub fn remove_tool(
     cfg: &mut Config,
     state: &mut State,
+    runner: &dyn CommandRunner,
     name: &str,
     force: bool,
 ) -> Result<()> {
     let in_config = cfg.tools.contains_key(name);
     let tracked = state.tool(name).cloned();
 
-    match tracked {
-        Some(record) => {
-            delete_record_files(&record, state, name)?;
-        }
+    let record = match tracked {
+        Some(record) => record,
         None => {
             if !force {
                 bail!(
@@ -34,9 +34,6 @@ pub fn remove_tool(
                      Re-run with --force to adopt and remove."
                 );
             }
-            // Adopt: derive the would-be install path from config, register it,
-            // then delete. Requires the tool to be declared in config so we can
-            // compute the install path safely.
             let Some(tool) = cfg.tools.get(name) else {
                 bail!(
                     "`{name}` is neither tracked in state nor declared in config; nothing to adopt"
@@ -50,19 +47,22 @@ pub fn remove_tool(
                 .or_else(|| tool.exe.clone())
                 .unwrap_or_else(|| name.to_string());
             let path = install_dir.join(&final_name);
-            let adopted = ToolRecord {
+            ToolRecord {
                 source: parsed.source.to_string(),
                 installed_version: "adopted".to_string(),
+                locator: Some(parsed.locator.clone()),
                 resolved_asset: None,
                 module: None,
                 install_paths: vec![path],
                 sha256: None,
                 installed_at: Some(crate::now_iso8601()),
                 updated_at: Some(crate::now_iso8601()),
-            };
-            delete_record_files(&adopted, state, name)?;
+            }
         }
-    }
+    };
+
+    uninstall_record(cfg, &record, runner, name)?;
+    state.tools.remove(name);
 
     if in_config {
         cfg.tools.remove(name);
@@ -70,35 +70,81 @@ pub fn remove_tool(
     Ok(())
 }
 
-/// Delete a record's tracked files (via the source handler when possible) and
-/// remove the record from state.
-fn delete_record_files(record: &ToolRecord, state: &mut State, name: &str) -> Result<()> {
-    // Prefer the source-specific remove (e.g. uv needs `uv tool uninstall`).
-    // In M1 only github exists; its remove just unlinks tracked files.
-    match record.source.parse::<SourceKind>() {
-        Ok(kind) if kind.is_implemented() => {
-            let handler = handler_for(kind)?;
-            handler.remove(record)?;
+/// Perform the source-appropriate uninstall (does NOT touch state).
+fn uninstall_record(
+    cfg: &Config,
+    record: &ToolRecord,
+    runner: &dyn CommandRunner,
+    name: &str,
+) -> Result<()> {
+    let kind = record.source.parse::<SourceKind>().ok();
+    match kind {
+        Some(SourceKind::Pypi) => {
+            let locator = resolve_locator(record, cfg, name);
+            let args = uv::uninstall_args(&locator);
+            run_uninstall(runner, "uv", &args, "uv tool uninstall")?;
         }
+        Some(SourceKind::Cargo) => {
+            let locator = resolve_locator(record, cfg, name);
+            let install_dir = cfg.settings.install_dir_path()?;
+            let root = cargo::root_for(&install_dir);
+            let args = cargo::uninstall_args(&locator, &root.to_string_lossy());
+            run_uninstall(runner, "cargo", &args, "cargo uninstall")?;
+        }
+        Some(SourceKind::Npm) => {
+            let locator = resolve_locator(record, cfg, name);
+            let args = npm::global_remove_args(&locator);
+            run_uninstall(runner, "npm", &args, "npm rm -g")?;
+        }
+        // github / gitlab / url / go / unknown → unlink tracked files.
         _ => {
-            // Unknown/unimplemented source recorded in state: fall back to
-            // unlinking the tracked paths directly (safe: they are tracked).
-            for p in &record.install_paths {
-                if p.exists() {
-                    std::fs::remove_file(p)
-                        .map_err(|e| anyhow::anyhow!("removing {}: {e}", p.display()))?;
-                }
-            }
+            unlink_tracked(record)?;
         }
     }
-    state.tools.remove(name);
     Ok(())
+}
+
+fn run_uninstall(
+    runner: &dyn CommandRunner,
+    program: &str,
+    args: &[String],
+    label: &str,
+) -> Result<()> {
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let out = runner
+        .run(program, &refs, &[])
+        .with_context(|| format!("running {label}"))?;
+    if !out.success() {
+        bail!("{label} failed: {}", out.stderr.trim());
+    }
+    Ok(())
+}
+
+/// Resolve the package/crate name to uninstall. Prefer the locator recorded in
+/// state at install time (survives even when the config key differs from the
+/// package and even after the config entry is gone, e.g. an orphan prune);
+/// fall back to parsing the config spec, then to the tool key.
+fn resolve_locator(record: &ToolRecord, cfg: &Config, name: &str) -> String {
+    if let Some(loc) = &record.locator {
+        if !loc.is_empty() {
+            return loc.clone();
+        }
+    }
+    locator_from_config(cfg, name).unwrap_or_else(|| name.to_string())
+}
+
+/// Resolve the source locator (package/crate/module name) for a config tool.
+fn locator_from_config(cfg: &Config, name: &str) -> Option<String> {
+    let tool = cfg.tools.get(name)?;
+    let parsed = parse_spec(&tool.spec, cfg.settings.default_source_kind().ok()?).ok()?;
+    Some(parsed.locator)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::ToolConfig;
+    use crate::runner::{CommandOutput, MockRunner};
 
     fn cfg_with(name: &str, spec: &str) -> Config {
         let mut c = Config::default();
@@ -106,42 +152,103 @@ mod tests {
         c
     }
 
+    fn record(source: &str, paths: Vec<std::path::PathBuf>) -> ToolRecord {
+        ToolRecord {
+            source: source.into(),
+            installed_version: "v1".into(),
+            locator: None,
+            resolved_asset: None,
+            module: None,
+            install_paths: paths,
+            sha256: None,
+            installed_at: None,
+            updated_at: None,
+        }
+    }
+
     #[test]
     fn refuse_untracked_without_force() {
         let mut cfg = cfg_with("eza", "github:eza-community/eza");
         let mut state = State::default();
-        let err = remove_tool(&mut cfg, &mut state, "eza", false).unwrap_err();
+        let runner = MockRunner::new();
+        let err = remove_tool(&mut cfg, &mut state, &runner, "eza", false).unwrap_err();
         assert!(err.to_string().contains("not tracked"), "{err}");
-        // Config must be untouched on refusal.
         assert!(cfg.tools.contains_key("eza"));
     }
 
     #[test]
-    fn removes_tracked_file() {
+    fn removes_tracked_github_file() {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("eza");
         std::fs::write(&bin, b"binary").unwrap();
-
         let mut cfg = cfg_with("eza", "github:eza-community/eza");
         let mut state = State::default();
-        state.tools.insert(
-            "eza".into(),
-            ToolRecord {
-                source: "github".into(),
-                installed_version: "v1".into(),
-                resolved_asset: None,
-                module: None,
-                install_paths: vec![bin.clone()],
-                sha256: None,
-                installed_at: None,
-                updated_at: None,
-            },
-        );
+        state.tools.insert("eza".into(), record("github", vec![bin.clone()]));
 
-        remove_tool(&mut cfg, &mut state, "eza", false).unwrap();
-        assert!(!bin.exists(), "tracked file should be deleted");
+        let runner = MockRunner::new();
+        remove_tool(&mut cfg, &mut state, &runner, "eza", false).unwrap();
+        assert!(!bin.exists());
         assert!(state.tool("eza").is_none());
         assert!(!cfg.tools.contains_key("eza"));
+    }
+
+    #[test]
+    fn pypi_uses_uv_tool_uninstall() {
+        let mut cfg = cfg_with("ruff", "pypi:ruff");
+        let mut state = State::default();
+        state.tools.insert("ruff".into(), record("pypi", vec![]));
+        let runner = MockRunner::new().with_present("uv").expect(
+            "uv tool uninstall ruff",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        remove_tool(&mut cfg, &mut state, &runner, "ruff", false).unwrap();
+        assert!(state.tool("ruff").is_none());
+    }
+
+    #[test]
+    fn cargo_uses_cargo_uninstall() {
+        let mut cfg = cfg_with("ripgrep", "cargo:ripgrep");
+        cfg.settings.install_dir = "/home/u/.local/bin".into();
+        let mut state = State::default();
+        state.tools.insert("ripgrep".into(), record("cargo", vec![]));
+        let runner = MockRunner::new().expect(
+            "cargo uninstall --root /home/u/.local ripgrep",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        remove_tool(&mut cfg, &mut state, &runner, "ripgrep", false).unwrap();
+        assert!(state.tool("ripgrep").is_none());
+    }
+
+    #[test]
+    fn orphan_prune_uses_recorded_locator_not_key() {
+        // An orphan: no config entry, and the state KEY (`myrg`) differs from the
+        // crate name. The recorded `locator` must drive the uninstall.
+        let mut cfg = Config::default();
+        cfg.settings.install_dir = "/home/u/.local/bin".into();
+        let mut state = State::default();
+        let mut rec = record("cargo", vec![]);
+        rec.locator = Some("ripgrep".into());
+        state.tools.insert("myrg".into(), rec);
+        let runner = MockRunner::new().expect(
+            "cargo uninstall --root /home/u/.local ripgrep",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        // force=false is fine because the tool IS tracked in state.
+        remove_tool(&mut cfg, &mut state, &runner, "myrg", false).unwrap();
+        assert!(state.tool("myrg").is_none());
+    }
+
+    #[test]
+    fn npm_uses_npm_rm() {
+        let mut cfg = cfg_with("pnpm", "npm:pnpm");
+        let mut state = State::default();
+        state.tools.insert("pnpm".into(), record("npm", vec![]));
+        let runner = MockRunner::new().expect(
+            "npm rm -g pnpm",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        remove_tool(&mut cfg, &mut state, &runner, "pnpm", false).unwrap();
+        assert!(state.tool("pnpm").is_none());
     }
 
     #[test]
@@ -149,14 +256,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bin = dir.path().join("eza");
         std::fs::write(&bin, b"preexisting").unwrap();
-
-        // install_dir points at our tempdir so the adopted path matches.
         let mut cfg = cfg_with("eza", "github:eza-community/eza");
         cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
         let mut state = State::default();
-
-        remove_tool(&mut cfg, &mut state, "eza", true).unwrap();
-        assert!(!bin.exists(), "adopted file should be deleted");
+        let runner = MockRunner::new();
+        remove_tool(&mut cfg, &mut state, &runner, "eza", true).unwrap();
+        assert!(!bin.exists());
         assert!(!cfg.tools.contains_key("eza"));
     }
 
@@ -164,7 +269,8 @@ mod tests {
     fn force_without_config_errors() {
         let mut cfg = Config::default();
         let mut state = State::default();
-        let err = remove_tool(&mut cfg, &mut state, "ghost", true).unwrap_err();
+        let runner = MockRunner::new();
+        let err = remove_tool(&mut cfg, &mut state, &runner, "ghost", true).unwrap_err();
         assert!(err.to_string().contains("nothing to adopt"), "{err}");
     }
 }

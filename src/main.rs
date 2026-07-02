@@ -1,12 +1,18 @@
 //! ubix — declarative binary/CLI tool installer & tracker.
 //!
-//! M1 scope: config/state model (schema_version + flock), spec parsing, github
-//! release install/upgrade/remove with atomic replace, list, minimal sync.
+//! Implements M1–M6 (see docs/PRD.md §11): config/state model (schema_version +
+//! flock), spec parsing, multi-source install/upgrade/remove (github, gitlab,
+//! pypi/uv, npm/fnm, cargo, go, url) with atomic replace, sync/prune, doctor,
+//! outdated, checksum discovery, and toolchain bootstrap.
 
+mod archive;
 mod bootstrap;
+mod checksum;
 mod cli;
 mod config;
 mod engine;
+mod http;
+mod outdated;
 mod paths;
 mod remove;
 mod runner;

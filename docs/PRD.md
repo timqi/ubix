@@ -321,7 +321,9 @@ state 有、config 无的工具：`sync` 默认**仅列出警告**；`sync --pru
 - **恢复契约**：若在更新 state 前任一步失败（网络中断、chmod 失败、磁盘满），state 不被写入，下次 `sync` 自动重试；已存在的可用旧二进制不被破坏。
 
 ### 8.8 校验和发现
-release 校验按优先级扫描同 release 资产：`<asset>.sha256` → `<asset>.sha256sum` → 合并文件 `checksums.txt` / `SHA256SUMS`（解析其中匹配 `<asset>` 的行）。找到则验证并写 `state.sha256`；找不到记 `checksum = "none"`（不阻断安装，`doctor` 可提示）。
+按优先级扫描同 release 资产：`<asset>.sha256` → `<asset>.sha256sum` → 合并文件 `checksums.txt` / `SHA256SUMS`（解析其中匹配 `<asset>` 的行）。找到则验证并写 `state.sha256`；找不到记 `checksum = "none"`（不阻断安装，`doctor` 可提示）。
+- **适用范围**：sidecar 发现算法用于 **url 源**（ubix 自行下载、可访问同目录/同 release 资产清单）。对 **github/gitlab release**，资产下载由 ubi 内部完成（不暴露资产清单），故不做 sidecar 扫描；此时 `state.sha256` 记录**已安装二进制的 sha256**（用于跨次安装的篡改/变更检测）。§8.8 的解析/校验逻辑已实现并驱动 url 路径。
+- **bootstrap go**：go.dev/dl JSON 每个文件带 `sha256`，解压前用本算法校验 tarball。
 
 ### 8.9 PATH 自检
 `doctor` 检查以下是否在 `$PATH`，缺失给出写入 shell rc 的建议：`~/.local/bin`、`~/.cargo/bin`、fnm alias bin（运行时探测）、`~/.local/share/go/bin`。

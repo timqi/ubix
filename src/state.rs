@@ -62,6 +62,13 @@ pub struct ToolRecord {
     pub source: String,
     pub installed_version: String,
 
+    /// The source locator/package name captured at install time (e.g. `ripgrep`
+    /// for `cargo:ripgrep`, `ruff` for `pypi:ruff`). Used so `sync --prune` can
+    /// uninstall an orphan even when its config key differs from the package
+    /// name. Additive optional field — schema_version stays 1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub locator: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_asset: Option<String>,
 
@@ -223,6 +230,7 @@ mod tests {
         ToolRecord {
             source: "github".into(),
             installed_version: "v0.18.21".into(),
+            locator: Some("eza-community/eza".into()),
             resolved_asset: Some("eza_x86_64-unknown-linux-musl.tar.gz".into()),
             module: None,
             install_paths: vec![PathBuf::from("/home/qiqi/.local/bin/eza")],
@@ -240,6 +248,17 @@ mod tests {
         let text = s.to_toml().unwrap();
         let back = State::from_toml(&text).unwrap();
         assert_eq!(s, back);
+        // The additive `locator` field is serialized and read back.
+        assert!(text.contains("locator"));
+        assert_eq!(back.tool("eza").unwrap().locator.as_deref(), Some("eza-community/eza"));
+    }
+
+    #[test]
+    fn locator_is_optional_and_defaults_none() {
+        // Old state files (schema_version=1) without `locator` still parse.
+        let text = "schema_version = 1\n[tools.eza]\nsource = \"github\"\ninstalled_version = \"v1\"\ninstall_paths = []\n";
+        let s = State::from_toml(text).unwrap();
+        assert_eq!(s.tool("eza").unwrap().locator, None);
     }
 
     #[test]

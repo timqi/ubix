@@ -4,7 +4,7 @@ use anyhow::{bail, Result};
 use ubi::ForgeType;
 
 use crate::config::ToolConfig;
-use crate::engine::{ReleaseEngine, ReleaseRequest, UbiEngine};
+use crate::engine::{ReleaseEngine, ReleaseRequest};
 use crate::runner::CommandRunner;
 use crate::sources::{parse_spec, InstallOutcome, Source, SourceKind};
 
@@ -19,16 +19,6 @@ pub struct GithubSource {
 }
 
 impl GithubSource {
-    /// Placeholder constructor used by `handler_for`; real installs go through
-    /// [`Self::for_tool`]. Kept so the `Source` object is constructible.
-    pub fn new() -> Self {
-        Self {
-            engine: Box::new(UbiEngine::new()),
-            tool_name: String::new(),
-            install_dir: std::path::PathBuf::new(),
-        }
-    }
-
     /// Construct a handler bound to a specific tool name + install_dir.
     pub fn for_tool(
         tool_name: impl Into<String>,
@@ -51,15 +41,11 @@ impl GithubSource {
             );
         }
 
-        // M1: single-exe only. `exes` (multi-entry) is wired in config but not
-        // handled here (§12).
-        if let Some(exes) = &tool.exes {
-            if !exes.is_empty() {
-                bail!(
-                    "multi-entry `exes` ({exes:?}) is not supported in M1 \
-                     (single-exe only; see PRD §5.1/§12). Use `exe` for a single binary."
-                );
-            }
+        // `exes` (multi-entry, → ubi extract_all) is incompatible with `rename`
+        // (→ ubi rename_exe_to); ubi's build() would error deep inside. Fail
+        // clearly at build-request time instead (§5.1).
+        if tool.exes.as_ref().is_some_and(|e| !e.is_empty()) && tool.rename.is_some() {
+            bail!("`exes` and `rename` cannot be combined (rename applies to a single exe only)");
         }
 
         let final_name = tool
@@ -74,6 +60,7 @@ impl GithubSource {
             tag: tool.tag.clone(),
             matching: tool.matching.clone(),
             exe: tool.exe.clone(),
+            exes: tool.exes.clone().unwrap_or_default(),
             rename: tool.rename.clone(),
             install_dir: self.install_dir.clone(),
             final_name,
@@ -84,17 +71,8 @@ impl GithubSource {
     }
 }
 
-impl Default for GithubSource {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Source for GithubSource {
     fn install(&self, tool: &ToolConfig, _runner: &dyn CommandRunner) -> Result<InstallOutcome> {
-        if self.tool_name.is_empty() {
-            bail!("GithubSource must be constructed with `for_tool` before install");
-        }
         let req = self.build_request(tool)?;
         let result = self.engine.install(&req)?;
         Ok(InstallOutcome {
@@ -102,7 +80,7 @@ impl Source for GithubSource {
                 .version
                 .unwrap_or_else(|| "latest".to_string()),
             resolved_asset: None,
-            install_paths: vec![result.install_path],
+            install_paths: result.install_paths,
             sha256: Some(result.sha256),
         })
     }
@@ -129,8 +107,13 @@ mod tests {
     impl ReleaseEngine for FakeEngine {
         fn install(&self, req: &ReleaseRequest) -> Result<EngineResult> {
             *self.last.lock().unwrap() = Some(req.clone());
+            let paths = if req.exes.is_empty() {
+                vec![req.install_dir.join(&req.final_name)]
+            } else {
+                req.exes.iter().map(|e| req.install_dir.join(e)).collect()
+            };
             Ok(EngineResult {
-                install_path: req.install_dir.join(&req.final_name),
+                install_paths: paths,
                 sha256: "deadbeef".into(),
                 version: req.tag.clone().or_else(|| Some("v1.0.0".into())),
             })
@@ -165,15 +148,32 @@ mod tests {
     }
 
     #[test]
-    fn exes_rejected_in_m1() {
+    fn exes_installs_multiple_entries() {
         let fake = Box::new(FakeEngine {
             last: Mutex::new(None),
         });
         let src = GithubSource::for_tool("uv", PathBuf::from("/tmp/bin"), fake);
         let mut tool = ToolConfig::from_spec("github:astral-sh/uv");
         tool.exes = Some(vec!["uv".into(), "uvx".into()]);
+        let out = src.install(&tool, &MockRunner::new()).unwrap();
+        assert_eq!(
+            out.install_paths,
+            vec![
+                PathBuf::from("/tmp/bin/uv"),
+                PathBuf::from("/tmp/bin/uvx"),
+            ]
+        );
+    }
+
+    #[test]
+    fn exes_plus_rename_rejected() {
+        let fake = Box::new(FakeEngine { last: Mutex::new(None) });
+        let src = GithubSource::for_tool("uv", PathBuf::from("/tmp/bin"), fake);
+        let mut tool = ToolConfig::from_spec("github:astral-sh/uv");
+        tool.exes = Some(vec!["uv".into(), "uvx".into()]);
+        tool.rename = Some("nope".into());
         let err = src.install(&tool, &MockRunner::new()).unwrap_err();
-        assert!(err.to_string().contains("not supported in M1"), "{err}");
+        assert!(err.to_string().contains("cannot be combined"), "{err}");
     }
 
     #[test]
