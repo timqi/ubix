@@ -14,7 +14,6 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
 clap = { version = "4", features = ["derive"] }
-directories = "5"
 fs2 = "0.4"
 # Faithful port of ubi's asset-picker regexes (aqua matching-pruning simulation).
 regex = "1"
@@ -33,10 +32,17 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 flate2 = "1"
 tar = "0.4"
 xz2 = "0.1"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "3", default-features = false, features = ["deflate"] }
 # Surface ubi's `log`-facade output; small, sync logger honoring RUST_LOG.
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
 serde_yml = "0.0.13"
 
 [dev-dependencies]
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
