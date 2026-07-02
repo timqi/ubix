@@ -82,6 +82,10 @@ pub enum Command {
     Bootstrap(BootstrapArgs),
     /// List supported spec prefixes and their install backends.
     Sources,
+    /// Search the aqua-registry and print (or add) a generated `github:` config.
+    Search(SearchArgs),
+    /// aqua-registry maintenance (root-index cache).
+    Aqua(AquaArgs),
 }
 
 #[derive(Debug, Args)]
@@ -172,6 +176,33 @@ pub struct BootstrapArgs {
     pub reinstall: bool,
 }
 
+#[derive(Debug, Args)]
+pub struct SearchArgs {
+    /// `owner/repo` (direct lookup) or a repo-name substring (root-index search).
+    pub query: String,
+    /// Write the generated config and install immediately (like `add`).
+    #[arg(long)]
+    pub add: bool,
+    /// Explicit tool name (defaults to the aqua command name / repo).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Block waiting for the state lock instead of failing fast (with --add).
+    #[arg(long)]
+    pub wait: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct AquaArgs {
+    #[command(subcommand)]
+    pub command: AquaCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AquaCommand {
+    /// Refresh the aqua-registry root-index cache used by `search`.
+    Update,
+}
+
 /// Shared context for command execution.
 pub struct App {
     pub paths: Paths,
@@ -204,11 +235,24 @@ impl App {
             Command::Doctor => self.cmd_doctor(),
             Command::Bootstrap(a) => self.cmd_bootstrap(a),
             Command::Sources => self.cmd_sources(),
+            Command::Search(a) => self.cmd_search(a),
+            Command::Aqua(a) => self.cmd_aqua(a),
         }
     }
 
     // ---- add ----
     fn cmd_add(&self, args: AddArgs) -> Result<()> {
+        // aqua: prefix is intercepted BEFORE parse_spec (§8): resolve the aqua
+        // package into a synthesized `github:` ToolConfig, then take the normal
+        // add flow. `aqua:` never reaches parse_spec/SourceKind.
+        if let Some(rest) = args.spec.strip_prefix("aqua:") {
+            let (owner, repo) = split_owner_repo(rest.trim())?;
+            step!("resolving aqua:{owner}/{repo}");
+            let (name, tool) =
+                crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+            return self.persist_and_install(name, tool, args.force, args.wait);
+        }
+
         let mut tool = ToolConfig::from_spec(args.spec.clone());
         tool.matching = args.matching.map(crate::config::PlatformString::One);
         tool.exe = args.exe;
@@ -224,17 +268,38 @@ impl App {
             tool.arch_replace = Some(parse_kv_pairs(&args.arch_replace)?);
         }
 
-        let cfg_path = self.paths.config_file();
-        let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
-        let mut cfg = Config::load_or_default(&cfg_path)?;
-
-        let default_source = cfg.settings.default_source_kind()?;
+        let default_source = Config::load_or_default(&self.paths.config_file())?
+            .settings
+            .default_source_kind()?;
         let parsed = parse_spec(&args.spec, default_source)
             .with_context(|| format!("invalid spec `{}`", args.spec))?;
         let name = args.name.clone().unwrap_or_else(|| derive_name(&parsed.locator));
 
+        self.persist_and_install(name, tool, args.force, args.wait)
+    }
+
+    /// Shared install-first-then-persist flow used by `add` and `search --add`:
+    /// take the lock, guard existence, install via the tool's source, then write
+    /// state + config. `tool.spec` decides the source (aqua synthesizes a
+    /// `github:` spec upstream, so this stays source-agnostic).
+    fn persist_and_install(
+        &self,
+        name: String,
+        tool: ToolConfig,
+        force: bool,
+        wait: bool,
+    ) -> Result<()> {
+        let cfg_path = self.paths.config_file();
+        let mut locked = LockedState::acquire(&self.paths.state_file(), wait)?;
+        let mut cfg = Config::load_or_default(&cfg_path)?;
+
+        // Resolve the source now (for the final message + validation).
+        let default_source = cfg.settings.default_source_kind()?;
+        let parsed = parse_spec(&tool.spec, default_source)
+            .with_context(|| format!("invalid spec `{}`", tool.spec))?;
+
         // Existence guard: refuse to clobber an existing declaration unless --force.
-        if cfg.tools.contains_key(&name) && !args.force {
+        if cfg.tools.contains_key(&name) && !force {
             bail!(
                 "tool `{name}` already exists in config; use `ubix upgrade {name}` to reinstall, \
                  or `ubix add --force` to overwrite its parameters"
@@ -791,6 +856,88 @@ impl App {
         Ok(())
     }
 
+    // ---- search (aqua generator) ----
+    fn cmd_search(&self, args: SearchArgs) -> Result<()> {
+        // `owner/repo` → direct per-pkg lookup; otherwise a root-index search.
+        let (owner, repo) = if args.query.contains('/') {
+            split_owner_repo(args.query.trim())?
+        } else {
+            let (o, r) = self.resolve_search_query(&args.query)?;
+            (o, r)
+        };
+
+        let (name, tool) =
+            crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+
+        if args.add {
+            return self.persist_and_install(name, tool, false, args.wait);
+        }
+
+        // Default: print the generated snippet + a one-line platform preview.
+        print!("{}", crate::aqua::generate_snippet(&name, &tool));
+        match crate::aqua::current_platform_matching(&tool) {
+            Some(m) => println!(
+                "# on {}-{}: matches asset containing `{m}`",
+                crate::platform::goos(),
+                crate::platform::goarch()
+            ),
+            None => println!(
+                "# note: {}-{} is not among the supported platforms for this package",
+                crate::platform::goos(),
+                crate::platform::goarch()
+            ),
+        }
+        Ok(())
+    }
+
+    /// Resolve a fuzzy `search <name>` query to a single `owner/repo` via the
+    /// root-index cache (auto-fetching it if missing). Multiple candidates →
+    /// list them and bail; none → bail.
+    fn resolve_search_query(&self, query: &str) -> Result<(String, String)> {
+        let cache = crate::aqua::registry::root_cache_path();
+        let text = match crate::aqua::registry::read_root_cache(&cache)? {
+            Some(t) => t,
+            None => {
+                step!("aqua root index not cached; fetching…");
+                let (_, n) = crate::aqua::registry::update(self.http.as_ref())?;
+                step!("cached aqua root index ({n} bytes)");
+                crate::aqua::registry::read_root_cache(&cache)?
+                    .context("root index cache missing after update")?
+            }
+        };
+        let mut hits = crate::aqua::search_index(&text, query);
+        match hits.len() {
+            0 => bail!("no aqua package matching `{query}`"),
+            1 => {
+                let c = hits.remove(0);
+                Ok((c.owner, c.repo))
+            }
+            _ => {
+                // Exact repo-name match disambiguates a strong single hit.
+                if let Some(exact) = hits.iter().find(|c| c.repo == query) {
+                    return Ok((exact.owner.clone(), exact.repo.clone()));
+                }
+                let mut msg = format!("multiple aqua packages match `{query}`:\n");
+                for c in &hits {
+                    msg.push_str(&format!("  {}/{}\n", c.owner, c.repo));
+                }
+                msg.push_str("re-run with the exact `owner/repo`");
+                bail!(msg);
+            }
+        }
+    }
+
+    // ---- aqua (root-index cache maintenance) ----
+    fn cmd_aqua(&self, args: AquaArgs) -> Result<()> {
+        match args.command {
+            AquaCommand::Update => {
+                let (path, n) = crate::aqua::registry::update(self.http.as_ref())?;
+                println!("refreshed aqua root index: {} ({n} bytes)", path.display());
+                Ok(())
+            }
+        }
+    }
+
     // ---- install / upgrade dispatch ----
 
     /// Upgrade a tool. pypi uses `uv tool upgrade`; other sources reinstall in
@@ -1267,6 +1414,19 @@ fn format_sources() -> Vec<String> {
             "", info.summary, info.location
         ));
     }
+    // aqua is NOT a source kind — it is a config GENERATOR. It resolves an
+    // aqua-registry package into a `github:` entry (spec + per-platform
+    // matching) via `ubix add aqua:owner/repo` or `ubix search`.
+    out.push(String::new());
+    out.push("generator (not a source kind):".to_string());
+    out.push(format!(
+        "{:<prefix_w$}  {}  {}",
+        "aqua:", "aqua-registry → github: config", "aqua:openai/codex"
+    ));
+    out.push(format!(
+        "{:prefix_w$}  resolves an aqua package to a `github:` entry · via `add`/`search`",
+        ""
+    ));
     out
 }
 
@@ -1283,6 +1443,15 @@ fn parse_kv_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String,
         map.insert(k.to_string(), v.to_string());
     }
     Ok(map)
+}
+
+/// Split an `owner/repo` string into its two non-empty segments.
+pub fn split_owner_repo(s: &str) -> Result<(String, String)> {
+    let segs: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
+    if s.split('/').count() != 2 || segs.len() != 2 {
+        bail!("expected `owner/repo`, got `{s}`");
+    }
+    Ok((segs[0].to_string(), segs[1].to_string()))
 }
 
 /// Derive a tool name from a locator: last path segment, stripped of `@version`.
@@ -1827,8 +1996,13 @@ mod tests {
     #[test]
     fn format_sources_has_header_and_every_source() {
         let lines = format_sources();
-        // Header + two lines (row + summary) per source.
-        assert_eq!(lines.len(), 1 + SourceKind::all().len() * 2);
+        // Header + two lines (row + summary) per source, plus the aqua generator
+        // note block (blank + heading + 2 lines).
+        assert_eq!(lines.len(), 1 + SourceKind::all().len() * 2 + 4);
+        // aqua is documented as a generator, NOT a SourceKind.
+        let joined_all = lines.join("\n");
+        assert!(joined_all.contains("generator (not a source kind)"));
+        assert!(joined_all.contains("aqua:openai/codex"));
         assert!(lines[0].contains("PREFIX"));
         assert!(lines[0].contains("BACKEND"));
         assert!(lines[0].contains("EXAMPLE"));
@@ -1855,6 +2029,35 @@ mod tests {
     fn cli_parses_sources_subcommand() {
         let cli = Cli::try_parse_from(["ubix", "sources"]).unwrap();
         assert!(matches!(cli.command, Command::Sources));
+    }
+
+    #[test]
+    fn cli_parses_search_flags() {
+        let cli = Cli::try_parse_from(["ubix", "search", "codex", "--add", "--name", "cx"]).unwrap();
+        match cli.command {
+            Command::Search(a) => {
+                assert_eq!(a.query, "codex");
+                assert!(a.add);
+                assert_eq!(a.name.as_deref(), Some("cx"));
+            }
+            _ => panic!("expected search"),
+        }
+    }
+
+    #[test]
+    fn cli_parses_aqua_update() {
+        let cli = Cli::try_parse_from(["ubix", "aqua", "update"]).unwrap();
+        match cli.command {
+            Command::Aqua(a) => assert!(matches!(a.command, AquaCommand::Update)),
+            _ => panic!("expected aqua"),
+        }
+    }
+
+    #[test]
+    fn split_owner_repo_ok_and_errors() {
+        assert_eq!(split_owner_repo("openai/codex").unwrap(), ("openai".into(), "codex".into()));
+        assert!(split_owner_repo("codex").is_err());
+        assert!(split_owner_repo("a/b/c").is_err());
     }
 
     // ---- bootstrap python/nodejs runtime command construction ----

@@ -35,5 +35,6 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # Surface ubi's `log`-facade output; small, sync logger honoring RUST_LOG.
 log = "0.4"
 env_logger = { version = "0.11", default-features = false, features = ["humantime"] }
+serde_yml = "0.0.13"
 
 [dev-dependencies]

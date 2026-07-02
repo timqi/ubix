@@ -8,6 +8,7 @@
 #[macro_use]
 mod progress;
 
+mod aqua;
 mod archive;
 mod bootstrap;
 mod checksum;
