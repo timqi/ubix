@@ -153,6 +153,8 @@ pub struct UpgradeArgs {
 
 #[derive(Debug, Args)]
 pub struct SyncArgs {
+    /// Only sync this tool; default: all declared tools.
+    pub name: Option<String>,
     #[arg(long)]
     pub dry_run: bool,
     /// Remove orphaned tools (state has it, config does not) (§8.3).
@@ -318,6 +320,13 @@ impl App {
         let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
         let cfg = Config::load_or_default(&self.paths.config_file())?;
 
+        // Decide the scope: full sync (no name) or a single tool. An unknown
+        // scoped name (in neither config nor state) is an error.
+        let cfg_keys: Vec<String> = cfg.tools.keys().cloned().collect();
+        let state_keys: Vec<String> = locked.state.tools.keys().cloned().collect();
+        let scoped = args.name.is_some();
+        let selection = sync_selection(&cfg_keys, &state_keys, args.name.as_deref())?;
+
         // 1) npm LTS-jump detection (§5.4): if the live fnm default differs from
         //    the recorded one, all npm tools must be reinstalled on the new node.
         let recorded_node = locked.state.runtime.node_default.clone();
@@ -331,15 +340,8 @@ impl App {
             );
         }
 
-        // 2) Orphans: in state but not config (§8.3).
-        let orphans: Vec<String> = locked
-            .state
-            .tools
-            .keys()
-            .filter(|n| !cfg.tools.contains_key(*n))
-            .cloned()
-            .collect();
-        for name in &orphans {
+        // 2) Orphans: in state but not config (§8.3), filtered to the scope.
+        for name in &selection.orphans {
             if args.prune {
                 if args.dry_run {
                     println!("would prune orphan `{name}`");
@@ -364,9 +366,10 @@ impl App {
             }
         }
 
-        // 3) Converge declared tools.
+        // 3) Converge declared tools (filtered to the scope).
         let mut changed = 0usize;
-        for (name, tool) in &cfg.tools {
+        for name in &selection.declared {
+            let tool = &cfg.tools[name];
             let parsed = cfg.parsed_spec(tool)?;
             let installed = locked.state.tool(name).cloned();
             let needs = needs_install(&parsed, tool, installed.as_ref(), lts_jumped);
@@ -391,12 +394,17 @@ impl App {
             println!("synced `{name}`");
         }
 
-        // 4) Record the (possibly new) node default after reinstalls.
-        if let Some(live) = live_node {
-            if locked.state.runtime.node_default.as_deref() != Some(live.as_str()) {
-                locked.state.runtime.node_default = Some(live);
-                if !args.dry_run {
-                    locked.save()?;
+        // 4) Record the (possibly new) node default — ONLY on a full sync. A
+        //    scoped sync reinstalls just one tool, not every npm tool, so leaving
+        //    `node_default` unchanged lets a later full `sync` still detect the
+        //    LTS jump and reinstall the rest.
+        if !scoped {
+            if let Some(live) = live_node {
+                if locked.state.runtime.node_default.as_deref() != Some(live.as_str()) {
+                    locked.state.runtime.node_default = Some(live);
+                    if !args.dry_run {
+                        locked.save()?;
+                    }
                 }
             }
         }
@@ -726,6 +734,53 @@ fn read_state_no_lock(path: &std::path::Path) -> Result<crate::state::State> {
     crate::state::State::from_toml(&text)
 }
 
+/// Which tools a `sync` invocation should act on.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SyncSelection {
+    /// Declared (config) tool names to converge, in config order.
+    pub declared: Vec<String>,
+    /// Orphan (state-only) tool names to report/prune, in state order.
+    pub orphans: Vec<String>,
+}
+
+/// Compute the sync scope from config keys, state keys, and an optional tool
+/// name. `config_keys`/`state_keys` should preserve iteration order.
+///
+/// * `name = None` → all declared tools + all orphans (state ∖ config).
+/// * `name = Some(n)`:
+///   * in config → converge just `n` (no orphans).
+///   * else in state (orphan) → prune/report just `n`.
+///   * in neither → error `no tool \`<n>\` in config or state`.
+pub fn sync_selection(
+    config_keys: &[String],
+    state_keys: &[String],
+    name: Option<&str>,
+) -> Result<SyncSelection> {
+    let is_orphan = |k: &String| !config_keys.iter().any(|c| c == k);
+    match name {
+        None => Ok(SyncSelection {
+            declared: config_keys.to_vec(),
+            orphans: state_keys.iter().filter(|k| is_orphan(k)).cloned().collect(),
+        }),
+        Some(n) => {
+            if config_keys.iter().any(|c| c == n) {
+                Ok(SyncSelection {
+                    declared: vec![n.to_string()],
+                    orphans: Vec::new(),
+                })
+            } else if state_keys.iter().any(|s| s == n) {
+                // Orphan: in state but not config.
+                Ok(SyncSelection {
+                    declared: Vec::new(),
+                    orphans: vec![n.to_string()],
+                })
+            } else {
+                bail!("no tool `{n}` in config or state");
+            }
+        }
+    }
+}
+
 /// Decide whether a declared tool needs (re)installing during sync (§8.2).
 ///
 /// * missing from state → install.
@@ -964,9 +1019,70 @@ mod tests {
         match cli.command {
             Command::Sync(a) => {
                 assert!(a.dry_run && a.prune);
+                assert_eq!(a.name, None);
             }
             _ => panic!("expected sync"),
         }
+    }
+
+    #[test]
+    fn cli_parses_sync_optional_name() {
+        // Bare `sync` → no name.
+        match Cli::try_parse_from(["ubix", "sync"]).unwrap().command {
+            Command::Sync(a) => assert_eq!(a.name, None),
+            _ => panic!("expected sync"),
+        }
+        // `sync foo` → name = foo.
+        match Cli::try_parse_from(["ubix", "sync", "foo"]).unwrap().command {
+            Command::Sync(a) => assert_eq!(a.name.as_deref(), Some("foo")),
+            _ => panic!("expected sync"),
+        }
+        // `sync foo --prune --dry-run` → name + flags.
+        match Cli::try_parse_from(["ubix", "sync", "foo", "--prune", "--dry-run"])
+            .unwrap()
+            .command
+        {
+            Command::Sync(a) => {
+                assert_eq!(a.name.as_deref(), Some("foo"));
+                assert!(a.prune && a.dry_run);
+            }
+            _ => panic!("expected sync"),
+        }
+    }
+
+    #[test]
+    fn sync_selection_no_name_is_all() {
+        let cfg = vec!["eza".to_string(), "ruff".to_string()];
+        let state = vec!["eza".to_string(), "orphan".to_string()];
+        let sel = sync_selection(&cfg, &state, None).unwrap();
+        assert_eq!(sel.declared, vec!["eza", "ruff"]);
+        assert_eq!(sel.orphans, vec!["orphan"]);
+    }
+
+    #[test]
+    fn sync_selection_known_config_name() {
+        let cfg = vec!["eza".to_string(), "ruff".to_string()];
+        let state = vec!["eza".to_string()];
+        let sel = sync_selection(&cfg, &state, Some("ruff")).unwrap();
+        assert_eq!(sel.declared, vec!["ruff"]);
+        assert!(sel.orphans.is_empty());
+    }
+
+    #[test]
+    fn sync_selection_orphan_name() {
+        let cfg = vec!["eza".to_string()];
+        let state = vec!["eza".to_string(), "gone".to_string()];
+        let sel = sync_selection(&cfg, &state, Some("gone")).unwrap();
+        assert!(sel.declared.is_empty());
+        assert_eq!(sel.orphans, vec!["gone"]);
+    }
+
+    #[test]
+    fn sync_selection_unknown_name_errors() {
+        let cfg = vec!["eza".to_string()];
+        let state = vec!["eza".to_string()];
+        let err = sync_selection(&cfg, &state, Some("nope")).unwrap_err();
+        assert!(err.to_string().contains("no tool `nope` in config or state"), "{err}");
     }
 
     use crate::sources::{ParsedSpec, SourceKind};

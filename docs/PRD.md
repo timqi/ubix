@@ -316,7 +316,7 @@ ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--ve
       # 同名工具已存在时默认报错（提示用 upgrade 或 --force）；--force 才覆盖参数并重装（§8.10）
 ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
 ubix upgrade [name | --all] [--force]   # 原地升级；pin tag 默认跳过（D11）
-ubix sync [--dry-run] [--prune] [--wait]  # 幂等对账；--prune 删孤儿（D10）
+ubix sync [name] [--dry-run] [--prune] [--wait]  # 幂等对账；给 name 只对账该工具，默认全部
 ubix list                       # 已声明工具：名称 / spec / 已装版本
 ubix outdated                   # 各来源最新版 vs 已装（查询见 §7.1）
 ubix info <name>                # 来源、asset/module、路径、参数
