@@ -54,11 +54,15 @@ impl GithubSource {
             .or_else(|| tool.exe.clone())
             .unwrap_or_else(|| self.tool_name.clone());
 
+        // Resolve platform-portable `matching` for the current OS/arch; `None`
+        // means "no filter" so ubi's heuristic decides (we won't call .matching()).
+        let matching = tool.resolved_matching(crate::platform::goos(), crate::platform::goarch())?;
+
         Ok(ReleaseRequest {
             project: parsed.locator,
             forge: ForgeType::GitHub,
             tag: tool.tag.clone(),
-            matching: tool.matching.clone(),
+            matching,
             exe: tool.exe.clone(),
             exes: tool.exes.clone().unwrap_or_default(),
             rename: tool.rename.clone(),
@@ -131,12 +135,43 @@ mod tests {
         });
         let src = GithubSource::for_tool("codex", PathBuf::from("/tmp/bin"), fake);
         let mut tool = ToolConfig::from_spec("github:openai/codex");
-        tool.matching = Some("linux".into());
+        tool.matching = Some(crate::config::PlatformString::One("linux".into()));
         tool.exe = Some("codex".into());
         let runner = MockRunner::new();
         let out = src.install(&tool, &runner).unwrap();
         assert_eq!(out.install_paths, vec![PathBuf::from("/tmp/bin/codex")]);
         assert_eq!(out.sha256.as_deref(), Some("deadbeef"));
+    }
+
+    #[test]
+    fn build_request_resolves_per_platform_matching() {
+        use crate::config::PlatformString;
+        use std::collections::BTreeMap;
+        let fake = FakeEngine { last: Mutex::new(None) };
+        // Per-platform map with the CURRENT platform's exact key plus a `*`
+        // fallback, so the test is host-agnostic and exercises resolution.
+        let goos = crate::platform::goos();
+        let goarch = crate::platform::goarch();
+        let mut map: BTreeMap<String, String> = BTreeMap::new();
+        map.insert(format!("{goos}-{goarch}"), "exact-platform-asset".into());
+        map.insert("*".into(), "fallback-asset".into());
+
+        // Build the request directly to capture the resolved matching.
+        let src = GithubSource::for_tool("codex", PathBuf::from("/tmp/bin"), Box::new(fake));
+        let mut tool = ToolConfig::from_spec("github:openai/codex");
+        tool.matching = Some(PlatformString::PerPlatform(map));
+        let req = src.build_request(&tool).unwrap();
+        assert_eq!(req.matching.as_deref(), Some("exact-platform-asset"));
+    }
+
+    #[test]
+    fn build_request_matching_none_lets_ubi_decide() {
+        let src = GithubSource::for_tool("eza", PathBuf::from("/tmp/bin"), Box::new(FakeEngine {
+            last: Mutex::new(None),
+        }));
+        let tool = ToolConfig::from_spec("github:eza-community/eza");
+        let req = src.build_request(&tool).unwrap();
+        assert_eq!(req.matching, None);
     }
 
     #[test]

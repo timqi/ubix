@@ -93,6 +93,8 @@ pub struct AddArgs {
     /// Explicit tool name (defaults to derived from the locator).
     #[arg(long)]
     pub name: Option<String>,
+    /// Asset disambiguation substring (single-platform). For a cross-platform
+    /// per-OS/arch table, edit `[tools.<name>.matching]` in config.toml.
     #[arg(long)]
     pub matching: Option<String>,
     #[arg(long)]
@@ -213,7 +215,7 @@ impl App {
     // ---- add ----
     fn cmd_add(&self, args: AddArgs) -> Result<()> {
         let mut tool = ToolConfig::from_spec(args.spec.clone());
-        tool.matching = args.matching;
+        tool.matching = args.matching.map(crate::config::PlatformString::One);
         tool.exe = args.exe;
         tool.exes = args.exes;
         tool.tag = args.tag;
@@ -491,8 +493,14 @@ impl App {
         println!("source:  {}", parsed.source);
         println!("locator: {}", parsed.locator);
         println!("spec:    {}", tool.spec);
-        if let Some(m) = &tool.matching {
-            println!("matching: {m}");
+        if tool.matching.is_some() {
+            // Show the value resolved for THIS platform (per-platform tables
+            // resolve to the current OS/arch entry).
+            match tool.resolved_matching(crate::platform::goos(), crate::platform::goarch()) {
+                Ok(Some(m)) => println!("matching: {m}"),
+                Ok(None) => println!("matching: (none for this platform)"),
+                Err(e) => println!("matching: (unresolved: {e})"),
+            }
         }
         if let Some(e) = &tool.exe {
             println!("exe:     {e}");
@@ -629,8 +637,12 @@ impl App {
         if let Some(t) = &tool.tag {
             extras.push(format!("tag={t}"));
         }
-        if let Some(m) = &tool.matching {
-            extras.push(format!("matching={m}"));
+        if tool.matching.is_some() {
+            if let Ok(Some(m)) =
+                tool.resolved_matching(crate::platform::goos(), crate::platform::goarch())
+            {
+                extras.push(format!("matching={m}"));
+            }
         }
         if let Some(v) = &tool.version {
             extras.push(format!("version={v}"));

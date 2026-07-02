@@ -47,11 +47,14 @@ pub fn build_request(
         .or_else(|| tool.exe.clone())
         .unwrap_or_else(|| tool_name.to_string());
 
+    // Resolve platform-portable `matching` for the current OS/arch.
+    let matching = tool.resolved_matching(crate::platform::goos(), crate::platform::goarch())?;
+
     Ok(ReleaseRequest {
         project: parsed.locator,
         forge: ForgeType::GitLab,
         tag: tool.tag.clone(),
-        matching: tool.matching.clone(),
+        matching,
         exe: tool.exe.clone(),
         exes: tool.exes.clone().unwrap_or_default(),
         rename: tool.rename.clone(),

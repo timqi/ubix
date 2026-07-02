@@ -167,7 +167,7 @@ spec = "go:example.com/cmd/gotool@latest"
 ### 4.4 可选字段（按来源）
 | 字段 | 适用来源 | 含义 / 映射 |
 |---|---|---|
-| `matching` | github/gitlab/url | 子串消歧（ubi `.matching()`，`contains`，大小写敏感） |
+| `matching` | github/gitlab/url | 子串消歧（ubi `.matching()`，`contains`，大小写敏感）。可为**单字符串**或**按平台键的表**（见 §4.7），并支持 `{os}`/`{arch}` 模板 + `arch_replace`/`os_replace` |
 | `exe` | github/gitlab/url | 单入口可执行名，默认 = key（ubi `.exe()`） |
 | `exes` | github/gitlab/url | 多入口（实现见 §5.1） |
 | `tag` | github/gitlab | 版本锁定，默认 `latest`（ubi `.tag()`） |
@@ -210,6 +210,23 @@ node_default      = "v22.14.0"
   - 相等 → 正常。
   - 文件版本更低 → 运行内置迁移器升级后写回（state），或提示 config 需手动升级（config 不自动改人手文件，仅提示）。
   - 文件版本更高（比程序新）→ **拒绝运行**并提示升级 ubix，避免误解析。
+
+### 4.7 跨平台 `matching`（dotfile 可移植）
+config 通过 dotfiles 在多台机器/平台共享，故 `matching` 必须能因平台而异。`matching` 可写成两种形式：
+- **单字符串**（向后兼容）：所有平台同一值。
+- **按平台键的表**：键用 `<goos>-<goarch>`（如 `linux-amd64`/`darwin-arm64`）、`<goos>`（如 `darwin`）、或 `*`/`default` 兜底。
+- **解析优先级**：`<os>-<arch>` > `<os>` > `*`/`default`。值为空串 `""` 表示「不加 matching，交给 ubi 启发式」→ 等价 None。命中不到且无 `*` → **报错**并提示补该平台键（显式表里缺平台通常是遗漏）。
+- 解析出的字符串还支持 `{os}`/`{arch}` 模板 + `arch_replace`/`os_replace`（同 §5.7），便于命名规整的工具用单模板。
+- 示例（codex，各平台**格式都不同**，单模板做不到，故用平台表）：
+```toml
+[tools.codex]
+spec = "github:openai/codex"
+[tools.codex.matching]
+linux-amd64  = "codex-x86_64-unknown-linux-musl.tar.gz"
+linux-arm64  = "codex-aarch64-unknown-linux-musl.tar.gz"
+darwin-amd64 = "codex-x86_64-apple-darwin.tar.gz"
+darwin-arm64 = "codex-aarch64-apple-darwin.zst"
+```
 
 ---
 

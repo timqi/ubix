@@ -47,10 +47,45 @@ pub fn render_template(template: &str, version: &str, os: &str, arch: &str) -> R
 
 /// Apply a runtime-token → url-token replacement map (e.g. `amd64` → `x64`).
 /// Returns the mapped token, or the input unchanged when absent.
-fn apply_replace(token: &str, map: Option<&std::collections::BTreeMap<String, String>>) -> String {
+pub fn apply_replace(
+    token: &str,
+    map: Option<&std::collections::BTreeMap<String, String>>,
+) -> String {
     map.and_then(|m| m.get(token))
         .cloned()
         .unwrap_or_else(|| token.to_string())
+}
+
+/// Render `{os}`/`{arch}` tokens (only) in `s`, applying the given replace maps
+/// first. Reused by the platform-portable `matching` resolution. Unknown token
+/// → error; a `{version}` here is unknown (matching has no version).
+pub fn render_os_arch(
+    s: &str,
+    goos: &str,
+    goarch: &str,
+    os_replace: Option<&std::collections::BTreeMap<String, String>>,
+    arch_replace: Option<&std::collections::BTreeMap<String, String>>,
+) -> Result<String> {
+    let os = apply_replace(goos, os_replace);
+    let arch = apply_replace(goarch, arch_replace);
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('{') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else {
+            bail!("unterminated `{{` in `{s}`");
+        };
+        let sub = match &after[..end] {
+            "os" => os.as_str(),
+            "arch" => arch.as_str(),
+            other => bail!("unknown template variable `{{{other}}}` in `{s}` (supported: os, arch)"),
+        };
+        out.push_str(sub);
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// Resolve the `{version}` value for an http tool (§ priority: pin > discovery).
