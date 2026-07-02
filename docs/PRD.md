@@ -103,7 +103,7 @@
 | `github:` | `owner/repo` | `github:eza-community/eza` |
 | `gitlab:` | `group[/subgroup…]/repo`（自建加 `host`） | `gitlab:group/repo` |
 | `url:` | 固定直链归档/二进制 URL（无版本发现） | `url:https://…/x-linux-x86_64.tar.gz` |
-| `http:` | URL **模板** + 版本发现（aqua 式），见 §5.7 | `http:https://…/{version}/{os}-{arch}/claude` |
+| `template:` | URL **模板** + 版本发现（aqua 式），见 §5.7；`http:` 为兼容别名 | `template:https://…/{version}/{os}-{arch}/claude` |
 | `pypi:` | 包名 | `pypi:ruff` |
 | `npm:` | 包名 | `npm:pnpm` |
 | `cargo:` | crate 名 | `cargo:somecli` |
@@ -173,12 +173,12 @@ spec = "go:example.com/cmd/gotool@latest"
 | `tag` | github/gitlab | 版本锁定，默认 `latest`（ubi `.tag()`） |
 | `host` | gitlab | 自建 GitLab base；ubix 追加 `/api/v4` 后传 ubi `.api_base_url()` |
 | `rename` | release 类 | 安装后重命名（ubi `.rename_exe_to()`） |
-| `version` | pypi/npm/cargo/http | 版本约束 / http 的版本 pin |
+| `version` | pypi/npm/cargo/template | 版本约束 / http 的版本 pin |
 | `extras`/`with` | pypi | uv tool extras / `--with` 额外包 |
 | `features`/`locked` | cargo | cargo 特性 / `--locked` |
-| `url_musl` | http | Linux musl 上的替代 URL 模板（§5.7） |
-| `version_source` | http | 版本发现来源，如 `github:owner/repo`（§5.7） |
-| `arch_replace`/`os_replace` | http | 运行时 arch/os token → URL token 映射（如 `amd64→x64`） |
+| `url_musl` | template | Linux musl 上的替代 URL 模板（§5.7） |
+| `version_source` | template | 版本发现来源，如 `github:owner/repo`（§5.7） |
+| `arch_replace`/`os_replace` | template | 运行时 arch/os token → URL token 映射（如 `amd64→x64`） |
 
 ### 4.5 state.toml 草案（机器写入）
 ```toml
@@ -274,9 +274,9 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - 安装/升级：`GOBIN=~/.local/bin go install <module>@<version>` → 落 `~/.local/bin`。
 - go **无账本、无 `go uninstall`**：ubix 用 `state.toml` 的 `install_paths` 记账，卸载即删对应文件；`go version -m <bin>` 可反查校验。
 
-### 5.7 http（aqua 式模板 URL + 版本发现）
+### 5.7 template（aqua 式模板 URL + 版本发现；旧名 `http`，仍作别名）
 面向「不在 GitHub Release、而是托管在固定 CDN/GCS，按版本模板下载」的工具（典型：claude-code）。区别于 `url:`（固定链接、无 latest）。
-- **spec** = `http:<URL模板>`；模板变量 `{version}` / `{os}`（GOOS：linux/darwin/…）/ `{arch}`（GOARCH：amd64/arm64/…）。替换前套用 `arch_replace`/`os_replace`（映射运行时 token → URL token，如 `amd64→x64`）。
+- **spec** = `template:<URL模板>`（`http:` 兼容别名）；模板变量 `{version}` / `{os}`（GOOS：linux/darwin/…）/ `{arch}`（GOARCH：amd64/arm64/…）。替换前套用 `arch_replace`/`os_replace`（映射运行时 token → URL token，如 `amd64→x64`）。
 - **版本发现**：优先级 `tag`/`version`（pin） > `version_source`。`version_source = "github:owner/repo"` → 查该仓库最新 release/tag（复用 §7.1 github 查询），去掉前导 `v` 作 `{version}`。两者皆无 → 报错。
 - **libc 变体**：Linux musl 上若设了 `url_musl` 用之，否则用 `url`（复用平台 libc 探测）。
 - **格式**：按渲染后 URL 扩展名走 §5.2 的解压/提取；无扩展（如 `/claude`）→ 裸二进制。支持 `exe`/`exes`/`rename`。
@@ -286,7 +286,7 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - 配置示例（claude-code）：
 ```toml
 [tools.claude]
-spec           = "http:https://storage.googleapis.com/claude-code-dist-<id>/claude-code-releases/{version}/{os}-{arch}/claude"
+spec           = "template:https://storage.googleapis.com/claude-code-dist-<id>/claude-code-releases/{version}/{os}-{arch}/claude"
 url_musl       = "https://storage.googleapis.com/claude-code-dist-<id>/claude-code-releases/{version}/{os}-{arch}-musl/claude"
 version_source = "github:anthropics/claude-code"
 exe            = "claude"
@@ -336,7 +336,7 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 | cargo | `https://crates.io/api/v1/crates/<name>` 的 `crate.max_stable_version` |
 | go | `https://proxy.golang.org/<module>/@latest` 的 `Version` |
 | url | 无 latest 概念 → 标记 `n/a` |
-| http | 若设 `version_source`（github）→ 查其最新；否则 `n/a` |
+| template | 若设 `version_source`（github）→ 查其最新；否则 `n/a` |
 
 ---
 

@@ -183,7 +183,7 @@ pub struct ToolConfig {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub locked: Option<bool>,
 
-    // ---- http (templated URL + version discovery) ----
+    // ---- template (templated URL + version discovery; legacy prefix `http:`) ----
     /// Alternate URL template used on Linux+musl (glibc uses the primary `url`).
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub url_musl: Option<String>,
@@ -217,7 +217,7 @@ impl ToolConfig {
         let Some(raw) = pm.resolve(goos, goarch)? else {
             return Ok(None);
         };
-        let rendered = crate::sources::http::render_os_arch(
+        let rendered = crate::sources::template::render_os_arch(
             &raw,
             goos,
             goarch,
@@ -485,10 +485,10 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
     }
 
     #[test]
-    fn roundtrip_http_fields() {
+    fn roundtrip_template_fields() {
         let mut cfg = Config::default();
         let mut claude = ToolConfig::from_spec(
-            "http:https://h/claude-code-releases/{version}/{os}-{arch}/claude",
+            "template:https://h/claude-code-releases/{version}/{os}-{arch}/claude",
         );
         claude.url_musl = Some("https://h/{version}/{os}-{arch}-musl/claude".into());
         claude.version_source = Some("github:anthropics/claude-code".into());

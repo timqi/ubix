@@ -73,9 +73,9 @@ pub fn latest_version(
             Ok(Latest::Version(parse_go(&body)?))
         }
         SourceKind::Url => Ok(Latest::NotApplicable),
-        // http latest depends on the tool's `version_source` config, not the
-        // spec alone; the CLI routes http tools to `sources::http::latest`.
-        SourceKind::Http => Ok(Latest::NotApplicable),
+        // template latest depends on the tool's `version_source` config, not the
+        // spec alone; the CLI routes template tools to `sources::template::latest`.
+        SourceKind::Template => Ok(Latest::NotApplicable),
     }
 }
 

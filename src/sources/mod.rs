@@ -4,8 +4,8 @@ pub mod cargo;
 pub mod github;
 pub mod gitlab;
 pub mod go;
-pub mod http;
 pub mod npm;
+pub mod template;
 pub mod url;
 pub mod uv;
 
@@ -24,7 +24,9 @@ pub enum SourceKind {
     Github,
     Gitlab,
     Url,
-    Http,
+    /// Templated URL + version discovery. Canonical prefix `template:`; the
+    /// legacy `http:` prefix is a kept-for-compat alias (see `FromStr`).
+    Template,
     Pypi,
     Npm,
     Cargo,
@@ -55,7 +57,7 @@ impl SourceKind {
             SourceKind::Github,
             SourceKind::Gitlab,
             SourceKind::Url,
-            SourceKind::Http,
+            SourceKind::Template,
             SourceKind::Pypi,
             SourceKind::Npm,
             SourceKind::Cargo,
@@ -69,7 +71,7 @@ impl SourceKind {
             SourceKind::Github => "github",
             SourceKind::Gitlab => "gitlab",
             SourceKind::Url => "url",
-            SourceKind::Http => "http",
+            SourceKind::Template => "template",
             SourceKind::Pypi => "pypi",
             SourceKind::Npm => "npm",
             SourceKind::Cargo => "cargo",
@@ -99,10 +101,10 @@ impl SourceKind {
                 "url:https://example.com/x-linux-x86_64.tar.gz",
                 "~/.local/bin",
             ),
-            SourceKind::Http => (
+            SourceKind::Template => (
                 "built-in download + version discovery (templated URL)",
                 "templated URL with {version}/{os}/{arch}; version from version_source",
-                "http:https://host/{version}/{os}-{arch}/bin",
+                "template:https://host/{version}/{os}-{arch}/bin",
                 "~/.local/bin",
             ),
             SourceKind::Pypi => (
@@ -148,12 +150,15 @@ impl FromStr for SourceKind {
             "github" => SourceKind::Github,
             "gitlab" => SourceKind::Gitlab,
             "url" => SourceKind::Url,
-            "http" => SourceKind::Http,
+            "template" => SourceKind::Template,
+            // `http:` is a kept-for-compat alias for the templated-URL source
+            // (existing configs may still use it). Canonical output is `template`.
+            "http" => SourceKind::Template,
             "pypi" => SourceKind::Pypi,
             "npm" => SourceKind::Npm,
             "cargo" => SourceKind::Cargo,
             "go" => SourceKind::Go,
-            other => bail!("unknown source prefix `{other}:` (expected one of github/gitlab/url/http/pypi/npm/cargo/go)"),
+            other => bail!("unknown source prefix `{other}:` (expected one of github/gitlab/url/template/pypi/npm/cargo/go)"),
         })
     }
 }
@@ -243,10 +248,10 @@ fn validate_locator(kind: SourceKind, locator: &str) -> Result<()> {
                 bail!("url locator `{locator}` must be an http(s) URL");
             }
         }
-        SourceKind::Http => {
+        SourceKind::Template => {
             // locator is a URL TEMPLATE (may contain {version}/{os}/{arch}).
             if !(locator.starts_with("http://") || locator.starts_with("https://")) {
-                bail!("http locator `{locator}` must be an http(s) URL template");
+                bail!("template locator `{locator}` must be an http(s) URL template");
             }
         }
         SourceKind::Pypi | SourceKind::Npm | SourceKind::Cargo => {
@@ -312,7 +317,7 @@ mod tests {
             p("url:https://example.com/x-linux-x86_64.tar.gz").source,
             SourceKind::Url
         );
-        assert_eq!(p("http:https://h/{version}/bin").source, SourceKind::Http);
+        assert_eq!(p("template:https://h/{version}/bin").source, SourceKind::Template);
         assert_eq!(p("pypi:ruff").source, SourceKind::Pypi);
         assert_eq!(p("npm:pnpm").source, SourceKind::Npm);
         assert_eq!(p("cargo:somecli").source, SourceKind::Cargo);
@@ -327,15 +332,26 @@ mod tests {
     }
 
     #[test]
-    fn http_prefix_holds_url_template() {
-        let parsed = p("http:https://h/{version}/{os}-{arch}/claude");
-        assert_eq!(parsed.source, SourceKind::Http);
+    fn template_prefix_holds_url_template() {
+        let parsed = p("template:https://h/{version}/{os}-{arch}/claude");
+        assert_eq!(parsed.source, SourceKind::Template);
         assert_eq!(parsed.locator, "https://h/{version}/{os}-{arch}/claude");
     }
 
     #[test]
-    fn http_locator_requires_scheme() {
-        assert!(parse_spec("http:h/{version}/claude", SourceKind::Github).is_err());
+    fn http_prefix_is_backcompat_alias_for_template() {
+        // Legacy `http:` still parses to Template (kept-for-compat alias), but
+        // the canonical string is `template`.
+        let parsed = p("http:https://h/{version}/{os}-{arch}/claude");
+        assert_eq!(parsed.source, SourceKind::Template);
+        assert_eq!(parsed.locator, "https://h/{version}/{os}-{arch}/claude");
+        assert_eq!(SourceKind::Template.as_str(), "template");
+        assert_eq!(SourceKind::Template.to_string(), "template");
+    }
+
+    #[test]
+    fn template_locator_requires_scheme() {
+        assert!(parse_spec("template:h/{version}/claude", SourceKind::Github).is_err());
     }
 
     #[test]
@@ -390,7 +406,7 @@ mod tests {
             SourceKind::Github,
             SourceKind::Gitlab,
             SourceKind::Url,
-            SourceKind::Http,
+            SourceKind::Template,
             SourceKind::Pypi,
             SourceKind::Npm,
             SourceKind::Cargo,
@@ -409,7 +425,7 @@ mod tests {
                 SourceKind::Github
                 | SourceKind::Gitlab
                 | SourceKind::Url
-                | SourceKind::Http
+                | SourceKind::Template
                 | SourceKind::Pypi
                 | SourceKind::Npm
                 | SourceKind::Cargo

@@ -12,7 +12,7 @@ use crate::paths::Paths;
 use crate::remove;
 use crate::runner::{CommandRunner, SystemRunner};
 use crate::sources::github::GithubSource;
-use crate::sources::http as http_source;
+use crate::sources::template as template_source;
 use crate::sources::{cargo, gitlab, go, npm, parse_spec, url, uv, Source, SourceKind};
 use crate::state::{LockedState, ToolRecord};
 
@@ -111,13 +111,13 @@ pub struct AddArgs {
     /// Rename the installed executable.
     #[arg(long)]
     pub rename: Option<String>,
-    /// (http source) alternate URL template used on Linux+musl.
+    /// (template source) alternate URL template used on Linux+musl.
     #[arg(long)]
     pub url_musl: Option<String>,
-    /// (http source) where to discover the version, e.g. github:owner/repo.
+    /// (template source) where to discover the version, e.g. github:owner/repo.
     #[arg(long)]
     pub version_source: Option<String>,
-    /// (http source) runtime-arch → url-token override, repeatable, e.g. --arch-replace amd64=x64.
+    /// (template source) runtime-arch → url-token override, repeatable, e.g. --arch-replace amd64=x64.
     #[arg(long, value_name = "K=V")]
     pub arch_replace: Vec<String>,
     /// Overwrite an existing tool of the same name (reinstall + replace config entry).
@@ -467,10 +467,10 @@ impl App {
                 .get(name)
                 .map(|r| r.installed_version.clone())
                 .unwrap_or_else(|| "(none)".into());
-            // http latest depends on the tool's `version_source` config, so it
-            // is routed to the http source; everything else uses the spec-only path.
-            let latest_res = if parsed.source == SourceKind::Http {
-                http_source::latest(tool, self.http.as_ref())
+            // template latest depends on the tool's `version_source` config, so
+            // it is routed to the template source; others use the spec-only path.
+            let latest_res = if parsed.source == SourceKind::Template {
+                template_source::latest(tool, self.http.as_ref())
             } else {
                 outdated::latest_version(self.http.as_ref(), &parsed, tool.host.as_deref())
             };
@@ -748,7 +748,7 @@ impl App {
             SourceKind::Cargo => cargo::install(tool, self.runner.as_ref(), &install_dir)?,
             SourceKind::Go => go::install(tool, self.runner.as_ref(), &install_dir)?,
             SourceKind::Url => url::install(tool, self.http.as_ref(), &install_dir, name)?,
-            SourceKind::Http => http_source::install(
+            SourceKind::Template => template_source::install(
                 tool,
                 self.http.as_ref(),
                 self.runner.as_ref(),
@@ -1106,11 +1106,11 @@ mod tests {
     }
 
     #[test]
-    fn cli_parses_http_add_flags() {
+    fn cli_parses_template_add_flags() {
         let cli = Cli::try_parse_from([
             "ubix",
             "add",
-            "http:https://h/{version}/{os}-{arch}/claude",
+            "template:https://h/{version}/{os}-{arch}/claude",
             "--version-source",
             "github:anthropics/claude-code",
             "--url-musl",
@@ -1409,7 +1409,7 @@ mod tests {
 
     #[test]
     fn format_list_truncates_long_spec() {
-        let long = format!("http:https://example.com/{}/bin", "x".repeat(200));
+        let long = format!("template:https://example.com/{}/bin", "x".repeat(200));
         let rows = vec![("claude".to_string(), long, "(not installed)".to_string())];
         let lines = format_list(&rows);
         // Spec is capped at LIST_SPEC_MAX chars and ends with the ellipsis.

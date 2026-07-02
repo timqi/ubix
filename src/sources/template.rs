@@ -1,4 +1,5 @@
-//! Templated-HTTP source (aqua-style `type: http` + `version_source`).
+//! Templated-URL source (`template:`, aqua-style templated URL + version
+//! discovery). The legacy prefix `http:` is a kept-for-compat alias.
 //!
 //! Distinct from the fixed-URL `url` source: the locator is a URL *template*
 //! with `{version}`, `{os}`, `{arch}` variables rendered at install time, and
@@ -101,7 +102,7 @@ pub fn resolve_version(
         return Ok(strip_leading_v(pin).to_string());
     }
     let Some(vs) = tool.version_source.as_deref() else {
-        bail!("http source requires `version` or `version_source`");
+        bail!("template source requires `version` or `version_source`");
     };
     crate::step!("resolving version via {vs}");
     let latest = query_version_source(vs, http)?;
@@ -172,9 +173,9 @@ pub fn install(
     install_dir: &Path,
     default_name: &str,
 ) -> Result<InstallOutcome> {
-    let parsed = parse_spec(&tool.spec, SourceKind::Http)?;
-    if parsed.source != SourceKind::Http {
-        bail!("http source received non-http spec `{}`", tool.spec);
+    let parsed = parse_spec(&tool.spec, SourceKind::Template)?;
+    if parsed.source != SourceKind::Template {
+        bail!("template source received non-template spec `{}`", tool.spec);
     }
 
     let version = resolve_version(tool, http)?;
@@ -259,7 +260,7 @@ mod tests {
 
     #[test]
     fn arch_replace_amd64_to_x64() {
-        let mut tool = ToolConfig::from_spec(format!("http:{CLAUDE_TEMPLATE}"));
+        let mut tool = ToolConfig::from_spec(format!("template:{CLAUDE_TEMPLATE}"));
         tool.arch_replace = Some(arch_map());
         let url = render_url(&tool, CLAUDE_TEMPLATE, "1.0.88", "linux", "amd64", false).unwrap();
         assert!(url.ends_with("/1.0.88/linux-x64/claude"), "{url}");
@@ -267,7 +268,7 @@ mod tests {
 
     #[test]
     fn claude_glibc_and_musl_urls() {
-        let mut tool = ToolConfig::from_spec(format!("http:{CLAUDE_TEMPLATE}"));
+        let mut tool = ToolConfig::from_spec(format!("template:{CLAUDE_TEMPLATE}"));
         tool.url_musl = Some(CLAUDE_MUSL.into());
         tool.arch_replace = Some(arch_map());
         // glibc → primary template, x64.
@@ -294,7 +295,7 @@ mod tests {
 
     #[test]
     fn version_pin_takes_priority() {
-        let mut tool = ToolConfig::from_spec("http:https://h/{version}/bin");
+        let mut tool = ToolConfig::from_spec("template:https://h/{version}/bin");
         tool.version = Some("2.0.0".into());
         tool.version_source = Some("github:owner/repo".into());
         // No HTTP call needed since pin wins.
@@ -304,7 +305,7 @@ mod tests {
 
     #[test]
     fn tag_pin_strips_leading_v() {
-        let mut tool = ToolConfig::from_spec("http:https://h/{version}/bin");
+        let mut tool = ToolConfig::from_spec("template:https://h/{version}/bin");
         tool.tag = Some("v1.5.0".into());
         let http = MockHttp::new();
         assert_eq!(resolve_version(&tool, &http).unwrap(), "1.5.0");
@@ -312,7 +313,7 @@ mod tests {
 
     #[test]
     fn version_source_github_latest_with_v_strip() {
-        let mut tool = ToolConfig::from_spec("http:https://h/{version}/bin");
+        let mut tool = ToolConfig::from_spec("template:https://h/{version}/bin");
         tool.version_source = Some("github:anthropics/claude-code".into());
         let http = MockHttp::new().with_text(
             "https://api.github.com/repos/anthropics/claude-code/releases/latest",
@@ -323,17 +324,31 @@ mod tests {
 
     #[test]
     fn error_when_neither_version_nor_source() {
-        let tool = ToolConfig::from_spec("http:https://h/{version}/bin");
+        let tool = ToolConfig::from_spec("template:https://h/{version}/bin");
         let http = MockHttp::new();
         let err = resolve_version(&tool, &http).unwrap_err();
         assert!(err.to_string().contains("requires `version` or `version_source`"), "{err}");
     }
 
     #[test]
+    fn install_accepts_legacy_http_prefix_alias() {
+        // A legacy `http:` spec still installs via the template source.
+        let mut tool = ToolConfig::from_spec("http:https://example.com/{version}/tool");
+        tool.version = Some("1.0.0".into());
+        let url = "https://example.com/1.0.0/tool";
+        let http = MockHttp::new().with_bytes(url, b"bin".to_vec());
+        let runner = MockRunner::new();
+        let dir = tempfile::tempdir().unwrap();
+        let out = install(&tool, &http, &runner, dir.path(), "tool").unwrap();
+        assert_eq!(out.installed_version, "1.0.0");
+        assert_eq!(out.install_paths, vec![dir.path().join("tool")]);
+    }
+
+    #[test]
     fn install_raw_binary_end_to_end() {
         // version_source discovers 1.0.88; template renders to the glibc URL;
         // the raw binary at that URL is installed as `claude`.
-        let mut tool = ToolConfig::from_spec(format!("http:{CLAUDE_TEMPLATE}"));
+        let mut tool = ToolConfig::from_spec(format!("template:{CLAUDE_TEMPLATE}"));
         tool.url_musl = Some(CLAUDE_MUSL.into());
         tool.version_source = Some("github:anthropics/claude-code".into());
         tool.arch_replace = Some(arch_map());
@@ -373,7 +388,7 @@ mod tests {
 
     #[test]
     fn latest_uses_version_source_or_na() {
-        let mut tool = ToolConfig::from_spec("http:https://h/{version}/bin");
+        let mut tool = ToolConfig::from_spec("template:https://h/{version}/bin");
         // No version_source → n/a.
         let http = MockHttp::new();
         assert_eq!(latest(&tool, &http).unwrap(), Latest::NotApplicable);
