@@ -347,6 +347,8 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 
 ### 8.2 幂等
 `sync` 可反复执行；已是目标版本则跳过；npm LTS 跃迁触发重装（§5.4）。
+- **版本回填**：早期安装的记录可能是 `installed_version = "latest"` 哨兵。`sync` 会对处于该哨兵、且 `install_paths` 非空的工具运行已装二进制的 `--version`（依次尝试 `--version`/`-V`/`version`，从 stdout+stderr 里扫首个 `v?MAJOR.MINOR.PATCH[后缀]`，保留前导 `v`）回填真实版本——**不重装、不联网**；扫不到则保持 `latest`。本次已（重）装的工具由安装流程记真实版本，回填跳过。`--dry-run` 只提示不写。全量 `sync` 与限定 `sync <name>` 都适用。
+- `outdated` 的过期判定**忽略一个前导 `v`**（`same_version`），使回填出的裸 `14.1.1` 不会被误判为落后于 tag `v14.1.1`。
 
 ### 8.3 孤儿处理（D10）
 state 有、config 无的工具：`sync` 默认**仅列出警告**；`sync --prune` 才按来源卸载并从 state 移除。

@@ -368,6 +368,7 @@ impl App {
 
         // 3) Converge declared tools (filtered to the scope).
         let mut changed = 0usize;
+        let mut reinstalled: Vec<String> = Vec::new();
         for name in &selection.declared {
             let tool = &cfg.tools[name];
             let parsed = cfg.parsed_spec(tool)?;
@@ -391,7 +392,41 @@ impl App {
             locked.state.tools.insert(name.clone(), record);
             locked.save()?;
             changed += 1;
+            reinstalled.push(name.clone());
             println!("synced `{name}`");
+        }
+
+        // 3b) Backfill the real version for records stuck on the `latest`
+        //     sentinel, by running the installed binary's `--version` (no
+        //     reinstall, no network). Tools (re)installed above already recorded
+        //     the real version, so skip them here.
+        for name in &selection.declared {
+            if reinstalled.contains(name) {
+                continue;
+            }
+            let Some(rec) = locked.state.tool(name) else {
+                continue;
+            };
+            if rec.installed_version != "latest" || rec.install_paths.is_empty() {
+                continue;
+            }
+            let bin = rec.install_paths[0].clone();
+            let Some(ver) = probe_binary_version(self.runner.as_ref(), &bin) else {
+                continue;
+            };
+            if ver == "latest" {
+                continue;
+            }
+            if args.dry_run {
+                println!("would backfill `{name}` version: {ver}");
+                continue;
+            }
+            if let Some(rec) = locked.state.tools.get_mut(name) {
+                rec.installed_version = ver.clone();
+                rec.updated_at = Some(crate::now_iso8601());
+            }
+            locked.save()?;
+            step!("backfilled `{name}` version: {ver}");
         }
 
         // 4) Record the (possibly new) node default — ONLY on a full sync. A
@@ -479,7 +514,12 @@ impl App {
                 Ok(Latest::NotApplicable) => "n/a".to_string(),
                 Err(e) => format!("query-failed ({e})"),
             };
-            let marker = if latest != "n/a" && latest != installed && installed != "(none)" {
+            // Compare ignoring a leading `v` so a backfilled bare `14.1.1` isn't
+            // falsely flagged against a tag `v14.1.1`.
+            let marker = if latest != "n/a"
+                && installed != "(none)"
+                && !same_version(&latest, &installed)
+            {
                 " *"
             } else {
                 ""
@@ -906,6 +946,98 @@ fn run_nodejs_runtime(
         bail!("fnm default failed: {}", out.stderr.trim());
     }
     Ok(default_arg)
+}
+
+/// Probe an installed binary's real version by running it, for backfilling
+/// records stored as the `latest` sentinel. Tries `--version`, `-V`, `version`
+/// in order; on each, runs `<bin> <flag>` via the runner, scans combined
+/// stdout+stderr for the first semver (`v?MAJOR.MINOR.PATCH[-/+/.suffix]`), and
+/// returns it (preserving a leading `v`). No network, no reinstall.
+pub fn probe_binary_version(
+    runner: &dyn CommandRunner,
+    bin_path: &std::path::Path,
+) -> Option<String> {
+    let bin = bin_path.to_string_lossy();
+    for flag in ["--version", "-V", "version"] {
+        let Ok(out) = runner.run(&bin, &[flag], &[]) else {
+            continue;
+        };
+        // Run the tool even on non-zero exit — some print version to stderr and
+        // exit non-zero; scan whatever we got.
+        let combined = format!("{}\n{}", out.stdout, out.stderr);
+        if let Some(v) = scan_semver(&combined) {
+            return Some(v);
+        }
+    }
+    None
+}
+
+/// Find the first `v?MAJOR.MINOR.PATCH[suffix]` substring in `text`. Preserves a
+/// leading `v`. Hand-rolled (no regex dep).
+fn scan_semver(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let n = bytes.len();
+    let mut i = 0;
+    while i < n {
+        // Optional leading `v` (only when followed by a digit).
+        let has_v = bytes[i] == b'v' && i + 1 < n && bytes[i + 1].is_ascii_digit();
+        let start = i;
+        let mut j = if has_v { i + 1 } else { i };
+        if j < n && bytes[j].is_ascii_digit() {
+            // MAJOR.MINOR.PATCH — require three dot-separated digit runs.
+            if let Some(end) = match_core_semver(bytes, j) {
+                j = end;
+                // Optional pre-release / build suffix: [-+.][0-9A-Za-z.-]+
+                if j < n && matches!(bytes[j], b'-' | b'+' | b'.') {
+                    let mut k = j + 1;
+                    while k < n && is_suffix_byte(bytes[k]) {
+                        k += 1;
+                    }
+                    if k > j + 1 {
+                        j = k;
+                    }
+                }
+                return Some(text[start..j].to_string());
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Match `DIGITS.DIGITS.DIGITS` starting at `start`; return the end index or None.
+fn match_core_semver(bytes: &[u8], start: usize) -> Option<usize> {
+    let n = bytes.len();
+    let mut i = start;
+    for part in 0..3 {
+        let run_start = i;
+        while i < n && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == run_start {
+            return None; // empty numeric run
+        }
+        if part < 2 {
+            if i >= n || bytes[i] != b'.' {
+                return None; // need a dot between the first three parts
+            }
+            i += 1;
+        }
+    }
+    Some(i)
+}
+
+fn is_suffix_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'.' || b == b'-'
+}
+
+/// Compare two version strings ignoring ONE leading `v`/`V` on each, so a
+/// backfilled bare `14.1.1` matches a tag `v14.1.1`.
+pub fn same_version(a: &str, b: &str) -> bool {
+    fn strip_v(s: &str) -> &str {
+        s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s)
+    }
+    strip_v(a) == strip_v(b)
 }
 
 /// Which tools a `sync` invocation should act on.
@@ -1515,5 +1647,66 @@ mod tests {
         let calls = runner.calls.borrow();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[1].args, vec!["python", "install"]);
+    }
+
+    // ---- version backfill helpers ----
+
+    #[test]
+    fn probe_version_from_version_flag() {
+        let runner = MockRunner::new()
+            .expect("/bin/rg --version", ok_out("ripgrep 14.1.1\nfeatures:+pcre2\n"));
+        assert_eq!(
+            probe_binary_version(&runner, Path::new("/bin/rg")).as_deref(),
+            Some("14.1.1")
+        );
+    }
+
+    #[test]
+    fn probe_version_falls_through_to_dash_capital_v() {
+        // `--version` yields no semver; `-V` does.
+        let runner = MockRunner::new()
+            .expect("/bin/tool --version", ok_out("no version info here\n"))
+            .expect("/bin/tool -V", ok_out("tool version 2.0.5\n"));
+        assert_eq!(
+            probe_binary_version(&runner, Path::new("/bin/tool")).as_deref(),
+            Some("2.0.5")
+        );
+    }
+
+    #[test]
+    fn probe_version_prerelease_and_leading_v() {
+        let rc = MockRunner::new().expect("/b/x --version", ok_out("x 1.2.3-rc.1\n"));
+        assert_eq!(probe_binary_version(&rc, Path::new("/b/x")).as_deref(), Some("1.2.3-rc.1"));
+        // Preserves a leading `v`.
+        let v = MockRunner::new().expect("/b/eza --version", ok_out("eza v0.23.4\n"));
+        assert_eq!(probe_binary_version(&v, Path::new("/b/eza")).as_deref(), Some("v0.23.4"));
+    }
+
+    #[test]
+    fn probe_version_none_when_no_semver() {
+        let runner = MockRunner::new()
+            .expect("/b/x --version", ok_out("unknown"))
+            .expect("/b/x -V", ok_out("still nothing"))
+            .expect("/b/x version", ok_out("nope 1.2 only two parts"));
+        assert_eq!(probe_binary_version(&runner, Path::new("/b/x")), None);
+    }
+
+    #[test]
+    fn probe_version_reads_stderr_too() {
+        // Some tools print version to stderr (and may exit non-zero).
+        let runner = MockRunner::new().expect(
+            "/b/x --version",
+            CommandOutput { status: 1, stdout: String::new(), stderr: "x 3.4.5\n".into() },
+        );
+        assert_eq!(probe_binary_version(&runner, Path::new("/b/x")).as_deref(), Some("3.4.5"));
+    }
+
+    #[test]
+    fn same_version_ignores_leading_v() {
+        assert!(same_version("v1.2.3", "1.2.3"));
+        assert!(same_version("1.2.3", "v1.2.3"));
+        assert!(same_version("v1.2.3", "v1.2.3"));
+        assert!(!same_version("1.2.3", "1.2.4"));
+        assert!(!same_version("v1.2.3", "1.2.4"));
     }
 }
