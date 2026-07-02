@@ -688,11 +688,22 @@ impl App {
             )?,
         };
 
-        // Key step: where it landed. Verbose adds the resolved version/asset/sha.
+        // Key step: where it landed.
         for p in &outcome.install_paths {
             step!("installing → {}", p.display());
         }
-        detail!("resolved version = {}", outcome.installed_version);
+
+        // Record the real version. For unpinned github/gitlab, ubi doesn't expose
+        // the resolved tag (outcome is "latest"), so query the releases API once
+        // to record an accurate string; falls back to the ubi value on failure.
+        let installed_version = resolve_record_version(
+            self.http.as_ref(),
+            &parsed,
+            tool.tag.as_deref(),
+            tool.host.as_deref(),
+            &outcome.installed_version,
+        );
+        detail!("resolved version = {installed_version}");
         if let Some(asset) = &outcome.resolved_asset {
             detail!("resolved asset = {asset}");
         }
@@ -709,7 +720,7 @@ impl App {
         let now = crate::now_iso8601();
         Ok(ToolRecord {
             source: parsed.source.to_string(),
-            installed_version: outcome.installed_version,
+            installed_version,
             locator: Some(parsed.locator.clone()),
             resolved_asset: outcome.resolved_asset,
             module,
@@ -732,6 +743,39 @@ fn read_state_no_lock(path: &std::path::Path) -> Result<crate::state::State> {
         return Ok(crate::state::State::default());
     }
     crate::state::State::from_toml(&text)
+}
+
+/// Determine the version string to record after a successful install.
+///
+/// * `tag` pinned → the tag (no query).
+/// * unpinned github/gitlab → query the releases API for the latest tag (ubi
+///   0.9 exposes no resolved-tag getter). `Ok(Version(v))` → `v`; error or
+///   `NotApplicable` → `fallback` (the install already succeeded via ubi).
+/// * other sources → `fallback` unchanged (they record their own real version).
+pub fn resolve_record_version(
+    http: &dyn HttpClient,
+    parsed: &crate::sources::ParsedSpec,
+    tag: Option<&str>,
+    host: Option<&str>,
+    fallback: &str,
+) -> String {
+    if let Some(t) = tag {
+        return t.to_string();
+    }
+    if !matches!(parsed.source, SourceKind::Github | SourceKind::Gitlab) {
+        return fallback.to_string();
+    }
+    match outdated::latest_version(http, parsed, host) {
+        Ok(Latest::Version(v)) => v,
+        Ok(Latest::NotApplicable) => {
+            detail!("version query returned n/a; recording `{fallback}`");
+            fallback.to_string()
+        }
+        Err(e) => {
+            detail!("version query failed ({e}); recording `{fallback}`");
+            fallback.to_string()
+        }
+    }
 }
 
 /// Which tools a `sync` invocation should act on.
@@ -1086,6 +1130,77 @@ mod tests {
     }
 
     use crate::sources::{ParsedSpec, SourceKind};
+
+    #[test]
+    fn resolve_record_version_tag_pin_no_query() {
+        use crate::http::MockHttp;
+        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
+        // MockHttp has no canned responses; a query would error. Tag pin must not
+        // query, so this returns the tag.
+        let http = MockHttp::new();
+        assert_eq!(
+            resolve_record_version(&http, &parsed, Some("v1.2.3"), None, "latest"),
+            "v1.2.3"
+        );
+    }
+
+    #[test]
+    fn resolve_record_version_github_unpinned_queries_latest() {
+        use crate::http::MockHttp;
+        let parsed = ParsedSpec {
+            source: SourceKind::Github,
+            locator: "eza-community/eza".into(),
+        };
+        let http = MockHttp::new().with_text(
+            "https://api.github.com/repos/eza-community/eza/releases/latest",
+            r#"{"tag_name":"v0.23.4"}"#,
+        );
+        assert_eq!(
+            resolve_record_version(&http, &parsed, None, None, "latest"),
+            "v0.23.4"
+        );
+    }
+
+    #[test]
+    fn resolve_record_version_github_query_error_falls_back() {
+        use crate::http::MockHttp;
+        let parsed = ParsedSpec { source: SourceKind::Github, locator: "o/r".into() };
+        // No canned response → query errors → fallback preserved.
+        let http = MockHttp::new();
+        assert_eq!(
+            resolve_record_version(&http, &parsed, None, None, "latest"),
+            "latest"
+        );
+    }
+
+    #[test]
+    fn resolve_record_version_non_release_source_unchanged() {
+        use crate::http::MockHttp;
+        let parsed = ParsedSpec { source: SourceKind::Pypi, locator: "ruff".into() };
+        // pypi never queries here; returns fallback unchanged (uv reports the real one).
+        let http = MockHttp::new();
+        assert_eq!(
+            resolve_record_version(&http, &parsed, None, None, "0.6.9"),
+            "0.6.9"
+        );
+    }
+
+    #[test]
+    fn resolve_record_version_gitlab_unpinned_queries_with_host() {
+        use crate::http::MockHttp;
+        let parsed = ParsedSpec {
+            source: SourceKind::Gitlab,
+            locator: "group/sub/repo".into(),
+        };
+        let http = MockHttp::new().with_text(
+            "https://gitlab.fish/api/v4/projects/group%2Fsub%2Frepo/releases",
+            r#"[{"tag_name":"v3.1.0"}]"#,
+        );
+        assert_eq!(
+            resolve_record_version(&http, &parsed, None, Some("https://gitlab.fish"), "latest"),
+            "v3.1.0"
+        );
+    }
 
     fn rec(version: &str) -> ToolRecord {
         ToolRecord {

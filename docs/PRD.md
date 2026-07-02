@@ -243,6 +243,7 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - **多入口 `exes`**（如 uv/uvx）：实现策略 = **`extract_all()` 解出全部到临时目录，再按 `exes` 白名单挑选、原子移动进 `install_dir`，其余丢弃**（避免多次网络下载）。若归档结构不支持，则回退为对每个 exe 各调一次 ubi。`state.toml` 的 `install_paths` 记录全部入口。
 - **自建 GitLab**：`host="https://gitlab.fish"` → ubix 拼 `https://gitlab.fish/api/v4` 传 `UbiBuilder::api_base_url()` 并 `forge(GitLab)`。
 - Token：`UBIX_GITHUB_TOKEN` / `UBIX_GITLAB_TOKEN` → ubi `.github_token()/.gitlab_token()`（匿名 GitHub API 仅 60 req/h）。
+- **版本记账**：`tag` 已 pin → 记 pin 值。未 pin 时，由于 ubi 0.9 不暴露它解析到的实际 tag，unpinned github/gitlab 会在安装时**额外发一次 releases-API 查询**取真实最新 tag 记入 `installed_version`（复用 `outdated::latest_version`，honors `UBIX_GITHUB_TOKEN`/`UBIX_GITLAB_TOKEN`）；仅当该查询失败时才回退记 `latest`。这样 `list`/`outdated` 能显示真实版本、且 `installed==latest` 时正确判为未过期。
 
 ### 5.2 url 直链
 - 无 release API 时的兜底：下载给定 URL，按扩展名走 §5.1 格式处理与提取（`extract_all` + `exe`/`exes` 挑选）。
