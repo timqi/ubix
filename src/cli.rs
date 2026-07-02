@@ -82,6 +82,8 @@ pub enum Command {
     Doctor,
     /// Bootstrap a language toolchain (rust|go).
     Bootstrap(BootstrapArgs),
+    /// List supported spec prefixes and their install backends.
+    Sources,
 }
 
 #[derive(Debug, Args)]
@@ -204,6 +206,7 @@ impl App {
             Command::Edit => self.cmd_edit(),
             Command::Doctor => self.cmd_doctor(),
             Command::Bootstrap(a) => self.cmd_bootstrap(a),
+            Command::Sources => self.cmd_sources(),
         }
     }
 
@@ -583,6 +586,14 @@ impl App {
         bootstrap::bootstrap(target, args.reinstall, &ctx)
     }
 
+    // ---- sources ----
+    fn cmd_sources(&self) -> Result<()> {
+        for line in format_sources() {
+            println!("{line}");
+        }
+        Ok(())
+    }
+
     // ---- install / upgrade dispatch ----
 
     /// Upgrade a tool. pypi uses `uv tool upgrade`; other sources reinstall in
@@ -744,6 +755,41 @@ fn format_list(rows: &[(String, String, String)]) -> Vec<String> {
     rows.iter()
         .map(|(name, spec, ver)| format!("{name:<name_w$}  {spec:<spec_w$}  {ver}"))
         .collect()
+}
+
+/// Format the `ubix sources` table from every [`SourceKind`]. A header plus one
+/// `PREFIX | BACKEND | EXAMPLE` row per source (aligned), with the summary on an
+/// indented second line. Data-driven from `SourceKind::all()`.
+fn format_sources() -> Vec<String> {
+    let infos: Vec<_> = SourceKind::all().iter().map(|k| k.describe()).collect();
+    // `prefix:` including the trailing colon for the PREFIX column.
+    let prefix_col: Vec<String> = infos.iter().map(|i| format!("{}:", i.prefix)).collect();
+    let prefix_w = prefix_col
+        .iter()
+        .map(String::len)
+        .chain(std::iter::once("PREFIX".len()))
+        .max()
+        .unwrap_or(0);
+    let backend_w = infos
+        .iter()
+        .map(|i| i.backend.len())
+        .chain(std::iter::once("BACKEND".len()))
+        .max()
+        .unwrap_or(0);
+
+    let mut out = Vec::new();
+    out.push(format!(
+        "{:<prefix_w$}  {:<backend_w$}  {}",
+        "PREFIX", "BACKEND", "EXAMPLE"
+    ));
+    for (i, info) in infos.iter().enumerate() {
+        out.push(format!(
+            "{:<prefix_w$}  {:<backend_w$}  {}",
+            prefix_col[i], info.backend, info.example
+        ));
+        out.push(format!("{:prefix_w$}  {}", "", info.summary));
+    }
+    out
 }
 
 /// Parse repeatable `k=v` CLI values into a map (used for `--arch-replace`).
@@ -960,5 +1006,32 @@ mod tests {
     #[test]
     fn format_list_empty() {
         assert!(format_list(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_sources_has_header_and_every_source() {
+        let lines = format_sources();
+        // Header + two lines (row + summary) per source.
+        assert_eq!(lines.len(), 1 + SourceKind::all().len() * 2);
+        assert!(lines[0].contains("PREFIX"));
+        assert!(lines[0].contains("BACKEND"));
+        assert!(lines[0].contains("EXAMPLE"));
+        let joined = lines.join("\n");
+        // Every prefix and its example appear.
+        for &k in SourceKind::all() {
+            let info = k.describe();
+            assert!(joined.contains(&format!("{}:", info.prefix)), "missing prefix {}", info.prefix);
+            assert!(joined.contains(info.example), "missing example {}", info.example);
+            assert!(joined.contains(info.backend), "missing backend {}", info.backend);
+        }
+        // Spot-check a couple of the required backend strings.
+        assert!(joined.contains("ubi (GitHub Releases)"));
+        assert!(joined.contains("cargo install --root ~/.local"));
+    }
+
+    #[test]
+    fn cli_parses_sources_subcommand() {
+        let cli = Cli::try_parse_from(["ubix", "sources"]).unwrap();
+        assert!(matches!(cli.command, Command::Sources));
     }
 }

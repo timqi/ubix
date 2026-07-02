@@ -31,7 +31,35 @@ pub enum SourceKind {
     Go,
 }
 
+/// Human-facing description of a source kind, shown by `ubix sources`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SourceInfo {
+    /// The spec prefix (without the trailing colon), e.g. `github`.
+    pub prefix: &'static str,
+    /// The backend/tooling used to install this source.
+    pub backend: &'static str,
+    /// A one-line summary of the source's behavior.
+    pub summary: &'static str,
+    /// A representative `prefix:locator` spec example.
+    pub example: &'static str,
+}
+
 impl SourceKind {
+    /// Every source kind, in display order. Iterating this makes `ubix sources`
+    /// (and other exhaustive consumers) pick up new kinds automatically.
+    pub fn all() -> &'static [SourceKind] {
+        &[
+            SourceKind::Github,
+            SourceKind::Gitlab,
+            SourceKind::Url,
+            SourceKind::Http,
+            SourceKind::Pypi,
+            SourceKind::Npm,
+            SourceKind::Cargo,
+            SourceKind::Go,
+        ]
+    }
+
     /// The canonical prefix string as stored in `state.source`.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -46,6 +74,58 @@ impl SourceKind {
         }
     }
 
+    /// Human-facing metadata for `ubix sources`. `prefix` is derived from
+    /// [`as_str`] so it never drifts from the parser.
+    pub fn describe(self) -> SourceInfo {
+        let (backend, summary, example) = match self {
+            SourceKind::Github => (
+                "ubi (GitHub Releases)",
+                "prebuilt binaries from GitHub releases (asset heuristics via ubi)",
+                "github:eza-community/eza",
+            ),
+            SourceKind::Gitlab => (
+                "ubi (GitLab Releases; +host for self-hosted)",
+                "prebuilt binaries from GitLab releases; set `host` for self-hosted",
+                "gitlab:group/repo",
+            ),
+            SourceKind::Url => (
+                "built-in download (fixed link)",
+                "download a fixed archive/binary URL; no version discovery",
+                "url:https://example.com/x-linux-x86_64.tar.gz",
+            ),
+            SourceKind::Http => (
+                "built-in download + version discovery (templated URL)",
+                "templated URL with {version}/{os}/{arch}; version from version_source",
+                "http:https://host/{version}/{os}-{arch}/bin",
+            ),
+            SourceKind::Pypi => (
+                "uv tool",
+                "install Python CLI tools via `uv tool install`",
+                "pypi:ruff",
+            ),
+            SourceKind::Npm => (
+                "fnm default LTS node (npm -g)",
+                "global npm package on the fnm default LTS node",
+                "npm:pnpm",
+            ),
+            SourceKind::Cargo => (
+                "cargo install --root ~/.local",
+                "compile a Rust crate into ~/.local/bin via cargo",
+                "cargo:ripgrep",
+            ),
+            SourceKind::Go => (
+                "GOBIN=~/.local/bin go install",
+                "compile a Go module into ~/.local/bin via go install",
+                "go:example.com/cmd/tool@latest",
+            ),
+        };
+        SourceInfo {
+            prefix: self.as_str(),
+            backend,
+            summary,
+            example,
+        }
+    }
 }
 
 impl FromStr for SourceKind {
@@ -305,6 +385,49 @@ mod tests {
             SourceKind::Go,
         ] {
             assert_eq!(k.as_str().parse::<SourceKind>().unwrap(), k);
+        }
+    }
+
+    #[test]
+    fn all_covers_every_variant() {
+        // Exhaustive-match guard: if a variant is added, this match fails to
+        // compile until it's also listed here (and thus in `all()`).
+        for k in SourceKind::all() {
+            match k {
+                SourceKind::Github
+                | SourceKind::Gitlab
+                | SourceKind::Url
+                | SourceKind::Http
+                | SourceKind::Pypi
+                | SourceKind::Npm
+                | SourceKind::Cargo
+                | SourceKind::Go => {}
+            }
+        }
+        // `all()` has no duplicates and matches the known count.
+        assert_eq!(SourceKind::all().len(), 8);
+    }
+
+    #[test]
+    fn describe_fields_nonempty_and_prefix_matches_parser() {
+        for &k in SourceKind::all() {
+            let info = k.describe();
+            assert!(!info.prefix.is_empty(), "{k} prefix empty");
+            assert!(!info.backend.is_empty(), "{k} backend empty");
+            assert!(!info.summary.is_empty(), "{k} summary empty");
+            assert!(!info.example.is_empty(), "{k} example empty");
+            // prefix is derived from as_str().
+            assert_eq!(info.prefix, k.as_str());
+            // The example spec parses to this same kind.
+            let parsed = parse_spec(info.example, SourceKind::Github).unwrap();
+            assert_eq!(parsed.source, k, "example `{}` parsed to {}", info.example, parsed.source);
+            // The example starts with `<prefix>:`.
+            assert!(
+                info.example.starts_with(&format!("{}:", info.prefix)),
+                "example `{}` should start with `{}:`",
+                info.example,
+                info.prefix
+            );
         }
     }
 }
