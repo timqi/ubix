@@ -2138,6 +2138,7 @@ dependencies = [
  "flate2",
  "fs2",
  "log",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

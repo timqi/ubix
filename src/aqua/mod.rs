@@ -6,6 +6,8 @@
 //! `github:` [`ToolConfig`] (spec + per-platform `matching` + exe/rename). The
 //! CLI's `add`/`search` commands call this; the install path never sees aqua.
 
+pub mod hint;
+pub mod prune;
 pub mod registry;
 pub mod resolve;
 pub mod schema;
@@ -38,9 +40,13 @@ pub fn resolve_package(
 ) -> Result<(String, ToolConfig)> {
     let pkg = registry::fetch_package(http, owner, repo)?;
 
-    // Only github_release is supported at the top level (plan §2/§9).
+    // Only github_release is supported at the top level (plan §2/§9). `type:
+    // http` packages (templated URL, e.g. claude-code) can't be synthesized as
+    // `github:`, but ubix's `template:` source covers them — emit a ready-to-use
+    // `ubix add 'template:…'` command instead of a dead-end error.
     match pkg.type_.as_deref() {
         Some("github_release") | None => {}
+        Some("http") => bail!(hint::http_hint(&pkg, owner, repo)),
         Some(other) => bail!(
             "unsupported aqua construct: package type `{other}` for {owner}/{repo}; \
              see {} and add a `github:` entry manually",
@@ -61,7 +67,39 @@ pub fn resolve_package(
     };
 
     let branch = resolve::select_branch(&pkg, &tag, owner, repo)?;
-    synth::synth(&branch, &tag, owner, repo, name_override)
+    let (name, mut tool) = synth::synth(&branch, &tag, owner, repo, name_override)?;
+
+    // Drop per-platform `matching` where ubi would already pick a viable asset
+    // on its own (best-effort: needs the real asset list; keep matching if the
+    // fetch fails). This trims the common case where matching is pure noise.
+    prune_synthesized_matching(http, &mut tool, &spec.locator);
+
+    Ok((name, tool))
+}
+
+/// Prune redundant per-platform `matching` from a synthesized tool using the
+/// release asset list + a simulation of ubi's picker. No-op on any error (keeps
+/// the safe, fully-specified matching) or when matching isn't a per-platform map.
+fn prune_synthesized_matching(http: &dyn HttpClient, tool: &mut ToolConfig, locator: &str) {
+    let Some(PlatformString::PerPlatform(map)) = &tool.matching else {
+        return;
+    };
+    let assets = match outdated::github_release_asset_names(http, locator) {
+        Ok(a) if !a.is_empty() => a,
+        _ => return, // fetch failed / no assets → keep matching (safe default)
+    };
+    let pruned = prune::prune_matching(map, &assets);
+    let dropped = map.len() - pruned.len();
+    if dropped == 0 {
+        return;
+    }
+    if pruned.is_empty() {
+        crate::step!("matching not needed (ubi selects assets on its own); omitting");
+        tool.matching = None;
+    } else {
+        crate::step!("pruned {dropped} redundant matching entr(y/ies)");
+        tool.matching = Some(PlatformString::PerPlatform(pruned));
+    }
 }
 
 /// Render a pretty TOML block for a synthesized tool (for `ubix search` output).
@@ -173,16 +211,36 @@ mod tests {
 
     #[test]
     fn unsupported_type_degrades() {
+        // A non-http unsupported type still degrades with the generic message.
         let yaml = r#"
 packages:
-  - type: http
+  - type: go_install
     repo_owner: x
     repo_name: y
-    url: https://example.com/{{.Version}}
 "#;
         let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
         let err = resolve_package(&http, "x", "y", None).unwrap_err();
         assert!(err.to_string().contains("unsupported aqua construct"), "{err}");
         assert!(err.to_string().contains("registry.yaml"), "{err}");
+    }
+
+    #[test]
+    fn http_type_emits_template_hint() {
+        let yaml = r#"
+packages:
+  - type: http
+    repo_owner: x
+    repo_name: y
+    url: https://example.com/{{.Version}}/{{.OS}}-{{.Arch}}/y
+    files:
+      - name: y
+    version_source: github_tag
+"#;
+        let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
+        let err = resolve_package(&http, "x", "y", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("template:"), "{msg}");
+        assert!(msg.contains("ubix add 'template:https://example.com/{version}/{os}-{arch}/y'"), "{msg}");
+        assert!(msg.contains("--version-source github:x/y"), "{msg}");
     }
 }

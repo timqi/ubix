@@ -67,7 +67,8 @@ pub enum Command {
     /// Uninstall a tool and remove it from config (only removes state-tracked files).
     Remove(RemoveArgs),
     #[command(
-        about = "Install missing, upgrade to latest, and converge pinned tools.\n\nActs on the named tools, or every declared tool with --all (one of the two is required). A tool already at its target version is skipped; --force reinstalls it. Pinned `tag`/`version` tools converge to the pin. --dry-run reports installed vs latest and the chosen action without touching anything. --prune removes orphans (in state but not config)."
+        about = "Install missing, upgrade to latest, and converge pinned tools.",
+        long_about = "Install missing, upgrade to latest, and converge pinned tools.\n\nActs on the named tools, or every declared tool with --all (one of the two is required). A tool already at its target version is skipped; --force reinstalls it. Pinned `tag`/`version` tools converge to the pin. --dry-run reports installed vs latest and the chosen action without touching anything. --prune removes orphans (in state but not config)."
     )]
     Upgrade(UpgradeArgs),
     /// List declared and installed tools.
@@ -84,8 +85,6 @@ pub enum Command {
     Sources,
     /// Search the aqua-registry and print (or add) a generated `github:` config.
     Search(SearchArgs),
-    /// aqua-registry maintenance (root-index cache).
-    Aqua(AquaArgs),
 }
 
 #[derive(Debug, Args)]
@@ -191,18 +190,6 @@ pub struct SearchArgs {
     pub wait: bool,
 }
 
-#[derive(Debug, Args)]
-pub struct AquaArgs {
-    #[command(subcommand)]
-    pub command: AquaCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum AquaCommand {
-    /// Refresh the aqua-registry root-index cache used by `search`.
-    Update,
-}
-
 /// Shared context for command execution.
 pub struct App {
     pub paths: Paths,
@@ -236,7 +223,6 @@ impl App {
             Command::Bootstrap(a) => self.cmd_bootstrap(a),
             Command::Sources => self.cmd_sources(),
             Command::Search(a) => self.cmd_search(a),
-            Command::Aqua(a) => self.cmd_aqua(a),
         }
     }
 
@@ -875,35 +861,41 @@ impl App {
 
         // Default: print the generated snippet + a one-line platform preview.
         print!("{}", crate::aqua::generate_snippet(&name, &tool));
-        match crate::aqua::current_platform_matching(&tool) {
-            Some(m) => println!(
-                "# on {}-{}: matches asset containing `{m}`",
-                crate::platform::goos(),
-                crate::platform::goarch()
-            ),
-            None => println!(
-                "# note: {}-{} is not among the supported platforms for this package",
-                crate::platform::goos(),
-                crate::platform::goarch()
-            ),
+        let (goos, goarch) = (crate::platform::goos(), crate::platform::goarch());
+        if tool.matching.is_none() {
+            // matching was pruned (or never needed): ubi auto-selects the asset.
+            println!("# no matching needed: ubi selects the asset for {goos}-{goarch} automatically");
+        } else {
+            match crate::aqua::current_platform_matching(&tool) {
+                Some(m) => println!("# on {goos}-{goarch}: matches asset containing `{m}`"),
+                None => println!(
+                    "# note: {goos}-{goarch} is not among the supported platforms for this package"
+                ),
+            }
         }
         Ok(())
     }
 
     /// Resolve a fuzzy `search <name>` query to a single `owner/repo` via the
-    /// root-index cache (auto-fetching it if missing). Multiple candidates →
-    /// list them and bail; none → bail.
+    /// root-index cache. Refreshes the cache from upstream first (best-effort);
+    /// on a failed refresh, falls back to the existing cache, and only errors if
+    /// there is no cache to fall back to. Multiple candidates → list them and
+    /// bail; none → bail.
     fn resolve_search_query(&self, query: &str) -> Result<(String, String)> {
         let cache = crate::aqua::registry::root_cache_path();
-        let text = match crate::aqua::registry::read_root_cache(&cache)? {
-            Some(t) => t,
-            None => {
-                step!("aqua root index not cached; fetching…");
-                let (_, n) = crate::aqua::registry::update(self.http.as_ref())?;
-                step!("cached aqua root index ({n} bytes)");
+        let text = match crate::aqua::registry::update(self.http.as_ref()) {
+            Ok((_, n)) => {
+                step!("refreshed aqua root index ({n} bytes)");
                 crate::aqua::registry::read_root_cache(&cache)?
                     .context("root index cache missing after update")?
             }
+            Err(e) => match crate::aqua::registry::read_root_cache(&cache)? {
+                Some(t) => {
+                    step!("aqua root index refresh failed ({e}); using cached index");
+                    t
+                }
+                None => bail!("aqua root index unavailable (refresh failed: {e}, no cache)"),
+            },
         };
         let mut hits = crate::aqua::search_index(&text, query);
         match hits.len() {
@@ -923,17 +915,6 @@ impl App {
                 }
                 msg.push_str("re-run with the exact `owner/repo`");
                 bail!(msg);
-            }
-        }
-    }
-
-    // ---- aqua (root-index cache maintenance) ----
-    fn cmd_aqua(&self, args: AquaArgs) -> Result<()> {
-        match args.command {
-            AquaCommand::Update => {
-                let (path, n) = crate::aqua::registry::update(self.http.as_ref())?;
-                println!("refreshed aqua root index: {} ({n} bytes)", path.display());
-                Ok(())
             }
         }
     }
@@ -2041,15 +2022,6 @@ mod tests {
                 assert_eq!(a.name.as_deref(), Some("cx"));
             }
             _ => panic!("expected search"),
-        }
-    }
-
-    #[test]
-    fn cli_parses_aqua_update() {
-        let cli = Cli::try_parse_from(["ubix", "aqua", "update"]).unwrap();
-        match cli.command {
-            Command::Aqua(a) => assert!(matches!(a.command, AquaCommand::Update)),
-            _ => panic!("expected aqua"),
         }
     }
 

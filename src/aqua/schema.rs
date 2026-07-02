@@ -37,6 +37,10 @@ pub struct Package {
     // ---- fields that flow through the base ⊕ branch ⊕ override merge ----
     #[serde(default)]
     pub asset: Option<String>,
+    /// `type: http` templated download URL (aqua Go-template). Consulted only by
+    /// the `template:` hint for http packages; the github_release path ignores it.
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
@@ -47,6 +51,10 @@ pub struct Package {
     pub supported_envs: Option<Vec<String>>,
     #[serde(default)]
     pub version_prefix: Option<String>,
+    /// Where aqua discovers the version (e.g. `github_tag`, `github_release`).
+    /// Used by the http `template:` hint to fill `--version-source`.
+    #[serde(default)]
+    pub version_source: Option<String>,
 
     /// Top-level branch selector; usually `"false"` when version_overrides carry
     /// the real branches, but may be a real constraint on simple packages.
@@ -76,6 +84,8 @@ pub struct VersionOverride {
     #[serde(default)]
     pub asset: Option<String>,
     #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]
     pub files: Option<Vec<FileEntry>>,
@@ -102,6 +112,8 @@ pub struct PlatformOverride {
     pub goarch: Option<String>,
     #[serde(default)]
     pub asset: Option<String>,
+    #[serde(default)]
+    pub url: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
     #[serde(default)]

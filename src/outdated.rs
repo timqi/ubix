@@ -107,6 +107,31 @@ pub fn parse_github(body: &str) -> Result<String> {
 }
 
 #[derive(Deserialize)]
+struct GithubReleaseAssets {
+    #[serde(default)]
+    assets: Vec<GithubAsset>,
+}
+#[derive(Deserialize)]
+struct GithubAsset {
+    name: String,
+}
+
+/// Parse the `assets[].name` list from a GitHub `releases/latest` payload.
+pub fn parse_github_asset_names(body: &str) -> Result<Vec<String>> {
+    let rel: GithubReleaseAssets =
+        serde_json::from_str(body).context("parsing GitHub release assets JSON")?;
+    Ok(rel.assets.into_iter().map(|a| a.name).collect())
+}
+
+/// Fetch the asset names of a GitHub repo's latest release (best-effort input to
+/// the aqua matching-pruning simulation). `locator` is `owner/repo`.
+pub fn github_release_asset_names(http: &dyn HttpClient, locator: &str) -> Result<Vec<String>> {
+    let url = format!("https://api.github.com/repos/{locator}/releases/latest");
+    let body = http.get_text(&url)?;
+    parse_github_asset_names(&body)
+}
+
+#[derive(Deserialize)]
 struct GitlabRelease {
     tag_name: String,
 }

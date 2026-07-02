@@ -16,6 +16,8 @@ chrono = { version = "0.4", features = ["serde", "clock"], default-features = fa
 clap = { version = "4", features = ["derive"] }
 directories = "5"
 fs2 = "0.4"
+# Faithful port of ubi's asset-picker regexes (aqua matching-pruning simulation).
+regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
