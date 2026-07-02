@@ -110,7 +110,7 @@
 
 **解析规则**：
 - `default_source`（默认 `github`）仅在 locator **无前缀**时套用；此时 locator 必须是 `owner/repo`（两段）。**禁止无前缀单词 locator**（如裸 `ruff`），否则报错要求显式前缀。
-- `matching` 语义 = ubi 的子串包含（`str::contains`，大小写不敏感），非 glob / regex；文档中明确标注。
+- `matching` 语义 = ubi 的子串包含（`str::contains`，**大小写敏感**，与 ubi v0.9 一致），非 glob / regex；写 `matching` 时须与 GitHub/GitLab 资产名大小写一致。
 
 ### 4.3 config.toml 完整示例
 ```toml
@@ -127,7 +127,7 @@ spec = "github:eza-community/eza"
 
 [tools.codex]
 spec     = "github:openai/codex"
-matching = "codex-x86_64-unknown-linux"  # 子串消歧（大小写不敏感）
+matching = "codex-x86_64-unknown-linux"  # 子串消歧（大小写敏感）
 exe      = "codex"                        # 归档内可执行名，默认 = key
 
 [tools.uv]
@@ -166,7 +166,7 @@ spec = "go:example.com/cmd/gotool@latest"
 ### 4.4 可选字段（按来源）
 | 字段 | 适用来源 | 含义 / 映射 |
 |---|---|---|
-| `matching` | github/gitlab/url | 子串消歧（ubi `.matching()`，`contains`，大小写不敏感） |
+| `matching` | github/gitlab/url | 子串消歧（ubi `.matching()`，`contains`，大小写敏感） |
 | `exe` | github/gitlab/url | 单入口可执行名，默认 = key（ubi `.exe()`） |
 | `exes` | github/gitlab/url | 多入口（实现见 §5.1） |
 | `tag` | github/gitlab | 版本锁定，默认 `latest`（ubi `.tag()`） |
@@ -197,7 +197,7 @@ install_paths     = ["/home/qiqi/.local/bin/gotool"]   # go 无账本 → 卸载
 installed_at      = "2026-07-02T08:45:00Z"
 updated_at        = "2026-07-02T08:45:00Z"
 
-[tools._runtime]                                        # 记录 fnm default node 版本等运行时事实
+[_runtime]                                              # 顶层：记录 fnm default node 版本等运行时事实
 node_default      = "v22.14.0"
 ```
 
