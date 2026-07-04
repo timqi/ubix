@@ -3,9 +3,10 @@
 //! * `rust` (M5): fetch rustup-init from static.rust-lang.org and run `-y`.
 //! * `go`   (M5): fetch the latest stable tarball from go.dev/dl and extract to GOROOT.
 //!
-//! Underlying single-binary tools (uv, fnm) are ordinary github release tools —
-//! install them via `ubix add` (the source handlers print the exact spec when
-//! the tool is missing), not via a special bootstrap.
+//! Underlying single-binary tools (uv, fnm) are ordinary github release tools,
+//! installed as a side effect of the language bootstraps (`python`/`nodejs`),
+//! which also provision a default runtime. The package sources that need them
+//! (pypi/npm) point the user at those bootstraps when the toolchain is missing.
 //!
 //! Both targets are idempotent: if the target is already present they skip
 //! unless `--reinstall`. External calls go through the `CommandRunner`/
@@ -45,14 +46,14 @@ impl std::str::FromStr for BootstrapTarget {
             // uv/fnm are plain github releases, not toolchain bootstraps. Use the
             // language targets (python/nodejs) to install them + a runtime.
             "uv" => bail!(
-                "`uv` is not a bootstrap target; install it with:\n    \
-                 ubix add github:astral-sh/uv --name uv --exes uv,uvx\n\
-                 (or `ubix bootstrap python` to also install a default Python)"
+                "`uv` is not a bootstrap target; run:\n    \
+                 ubix bootstrap python\n\
+                 (installs uv + a default Python)"
             ),
             "fnm" => bail!(
-                "`fnm` is not a bootstrap target; install it with:\n    \
-                 ubix add github:Schniz/fnm --name fnm\n\
-                 (or `ubix bootstrap nodejs` to also install a default LTS node)"
+                "`fnm` is not a bootstrap target; run:\n    \
+                 ubix bootstrap nodejs\n\
+                 (installs fnm + a default LTS node)"
             ),
             other => {
                 bail!("unknown bootstrap target `{other}` (expected rust|go|python|nodejs|pixi)")
@@ -303,17 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn uv_target_points_to_add_spec() {
-        // uv/fnm are no longer bootstrap targets; parsing them yields a clear
-        // error pointing at the `ubix add` spec.
+    fn uv_target_points_to_language_bootstrap() {
+        // uv/fnm are not standalone bootstrap targets; parsing them yields a clear
+        // error pointing at the language bootstrap that installs them + a runtime.
         let err = "uv".parse::<BootstrapTarget>().unwrap_err().to_string();
-        assert!(err.contains("ubix add github:astral-sh/uv --name uv --exes uv,uvx"), "{err}");
+        assert!(err.contains("ubix bootstrap python"), "{err}");
     }
 
     #[test]
-    fn fnm_target_points_to_add_spec() {
+    fn fnm_target_points_to_language_bootstrap() {
         let err = "fnm".parse::<BootstrapTarget>().unwrap_err().to_string();
-        assert!(err.contains("ubix add github:Schniz/fnm --name fnm"), "{err}");
+        assert!(err.contains("ubix bootstrap nodejs"), "{err}");
     }
 
     #[test]

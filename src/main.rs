@@ -43,7 +43,7 @@ fn main() -> Result<()> {
     progress::set_verbosity(verbosity);
     init_logger(verbosity);
 
-    let app = cli::App::new(verbosity)?;
+    let app = cli::App::new(verbosity, cli.yes)?;
     if let Err(e) = app.run(cli) {
         // Print the full error chain with context.
         eprintln!("error: {e:#}");

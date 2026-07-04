@@ -180,8 +180,8 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
     }
     if !runner.which("fnm") {
         bail!(
-            "`fnm` not found; install it with:\n    \
-             ubix add github:Schniz/fnm --name fnm"
+            "npm tools need a Node runtime (fnm + a default node); run:\n    \
+             ubix bootstrap nodejs"
         );
     }
     // Require a fnm DEFAULT node (not just fnm) so `npm` runs on the right node.
@@ -319,11 +319,11 @@ mod tests {
 
     #[test]
     fn install_requires_fnm() {
-        // fnm itself missing → point at the add spec.
+        // fnm itself missing → point at the nodejs bootstrap.
         let runner = MockRunner::new();
         let t = ToolConfig::from_spec("npm:pnpm");
         let err = install(&t, &runner).unwrap_err();
-        assert!(err.to_string().contains("ubix add github:Schniz/fnm"), "{err}");
+        assert!(err.to_string().contains("ubix bootstrap nodejs"), "{err}");
     }
 
     #[test]

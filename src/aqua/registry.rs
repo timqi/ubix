@@ -2,6 +2,7 @@
 //! (plan §4). All network goes through the [`HttpClient`] seam.
 
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
 
@@ -11,6 +12,11 @@ use crate::paths;
 use super::schema::{Package, Registry};
 
 const RAW_BASE: &str = "https://raw.githubusercontent.com/aquaproj/aqua-registry/main";
+
+/// Max age before the cached root index is re-fetched. Search reuses a cache
+/// younger than this so repeated `ubix search` calls don't hammer (and get
+/// rate-limited by) raw.githubusercontent.com.
+const ROOT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The raw URL for a single package's registry.yaml.
 pub fn pkg_url(owner: &str, repo: &str) -> String {
@@ -58,20 +64,72 @@ pub fn fetch_package(http: &dyn HttpClient, owner: &str, repo: &str) -> Result<P
     Ok(chosen)
 }
 
-/// Refresh the root-index cache from upstream. Returns the cache path and byte
-/// size written.
-pub fn update(http: &dyn HttpClient) -> Result<(PathBuf, usize)> {
+/// Refresh the root-index cache from upstream into `path`. Returns the bytes
+/// written. `path` is threaded through (rather than re-deriving it) so it always
+/// matches the location the caller reads back.
+pub fn update(http: &dyn HttpClient, path: &Path) -> Result<usize> {
     let body = http
         .get_text(&root_url())
         .context("fetching aqua root registry index")?;
-    let path = root_cache_path();
-    paths::ensure_parent_dir(&path)?;
+    paths::ensure_parent_dir(path)?;
     // Write to a temp sibling then rename, so a partial/failed write never
     // truncates the existing cache (which serves as the offline fallback).
     let tmp = path.with_extension("yaml.tmp");
     std::fs::write(&tmp, &body).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("renaming into {}", path.display()))?;
-    Ok((path, body.len()))
+    std::fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))?;
+    Ok(body.len())
+}
+
+/// Whether a cache file's age is within `ttl` (fresh → reuse without fetching).
+/// Missing file or an unreadable mtime → not fresh.
+fn cache_fresh(path: &Path, ttl: Duration) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return false;
+    };
+    let Ok(mtime) = meta.modified() else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(mtime)
+        .map(|age| age < ttl)
+        .unwrap_or(false)
+}
+
+/// Return the aqua root-index text for searching. Reuses a cache younger than
+/// [`ROOT_CACHE_TTL`] (skipping the network entirely) unless `force`. Otherwise
+/// fetches upstream, falling back to any stale cache on failure; errors only
+/// when there is no usable text at all.
+pub fn root_index(http: &dyn HttpClient, force: bool) -> Result<String> {
+    root_index_from(http, &root_cache_path(), ROOT_CACHE_TTL, force)
+}
+
+/// [`root_index`] with an explicit cache path + TTL (so tests can avoid the
+/// env-derived cache path and time-sensitive network).
+fn root_index_from(
+    http: &dyn HttpClient,
+    cache: &Path,
+    ttl: Duration,
+    force: bool,
+) -> Result<String> {
+    if !force && cache_fresh(cache, ttl) {
+        if let Some(text) = read_root_cache(cache)? {
+            crate::step!("using cached aqua root index (< 24h old)");
+            return Ok(text);
+        }
+    }
+    match update(http, cache) {
+        Ok(n) => {
+            crate::step!("refreshed aqua root index ({n} bytes)");
+            read_root_cache(cache)?.context("root index cache missing after update")
+        }
+        Err(e) => match read_root_cache(cache)? {
+            Some(text) => {
+                crate::step!("aqua root index refresh failed ({e}); using cached index");
+                Ok(text)
+            }
+            None => bail!("aqua root index unavailable (refresh failed: {e}, no cache)"),
+        },
+    }
 }
 
 /// Read the cached root index text, if present.
@@ -133,9 +191,85 @@ fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::http::MockHttp;
+    use crate::http::{HttpClient, MockHttp};
 
     const CODEX: &str = include_str!("../../tests/fixtures/aqua/openai_codex.yaml");
+
+    /// An HttpClient that fails the test if any network method is called — proves
+    /// the TTL path served from cache without touching the network.
+    struct NoNet;
+    impl HttpClient for NoNet {
+        fn get_text(&self, url: &str) -> Result<String> {
+            panic!("unexpected network fetch: {url}")
+        }
+        fn get_bytes(&self, _: &str) -> Result<Vec<u8>> {
+            panic!("unexpected network fetch")
+        }
+        fn post_json(&self, _: &str, _: &str) -> Result<String> {
+            panic!("unexpected network fetch")
+        }
+    }
+
+    fn tmp_cache(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("ubix-registry-test-{name}.yaml"));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    #[test]
+    fn cache_fresh_true_for_new_false_for_zero_ttl() {
+        let path = tmp_cache("fresh");
+        std::fs::write(&path, "packages: []\n").unwrap();
+        assert!(cache_fresh(&path, Duration::from_secs(3600)), "just-written cache is fresh");
+        assert!(!cache_fresh(&path, Duration::ZERO), "zero TTL is never fresh");
+        assert!(!cache_fresh(Path::new("/no/such/file"), Duration::from_secs(3600)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn root_index_reuses_fresh_cache_without_fetch() {
+        let path = tmp_cache("reuse");
+        std::fs::write(&path, "packages:\n  - repo_owner: a\n    repo_name: b\n").unwrap();
+        // Fresh cache + NoNet → must return the cached text, never fetch.
+        let text = root_index_from(&NoNet, &path, Duration::from_secs(3600), false).unwrap();
+        assert!(text.contains("repo_name: b"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn root_index_force_and_stale_fall_back_to_cache_on_fetch_error() {
+        let path = tmp_cache("stale");
+        std::fs::write(&path, "packages:\n  - repo_owner: a\n    repo_name: b\n").unwrap();
+        // force=true bypasses the fresh cache → tries update (MockHttp has no
+        // canned root_url → errors) → falls back to the existing cache text.
+        let text = root_index_from(&MockHttp::new(), &path, Duration::from_secs(3600), true).unwrap();
+        assert!(text.contains("repo_name: b"));
+        // Zero TTL (stale) takes the same fetch→fallback path.
+        let text = root_index_from(&MockHttp::new(), &path, Duration::ZERO, false).unwrap();
+        assert!(text.contains("repo_name: b"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn root_index_fetches_and_writes_cache_when_stale() {
+        let path = tmp_cache("fetch");
+        // No existing cache + a canned root_url → update writes to `path`, then
+        // root_index_from reads it back from the SAME path (regression: update
+        // used to hardcode root_cache_path()).
+        let http = MockHttp::new()
+            .with_text(&root_url(), "packages:\n  - repo_owner: x\n    repo_name: y\n");
+        let text = root_index_from(&http, &path, Duration::ZERO, true).unwrap();
+        assert!(text.contains("repo_name: y"));
+        assert!(path.exists(), "cache written to the passed path");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn root_index_errors_when_no_cache_and_fetch_fails() {
+        let path = tmp_cache("missing"); // removed by tmp_cache
+        let err = root_index_from(&MockHttp::new(), &path, Duration::ZERO, false).unwrap_err();
+        assert!(err.to_string().contains("unavailable"), "{err}");
+    }
 
     #[test]
     fn urls_are_raw_github() {

@@ -40,6 +40,11 @@ pub struct Cli {
     /// Show more detail, including dependency logs (ubi asset selection, etc.).
     #[arg(short, long, global = true)]
     pub verbose: bool,
+
+    /// Assume "yes" for interactive prompts (e.g. auto-run a missing toolchain's
+    /// `ubix bootstrap`). Required to bootstrap in non-interactive contexts.
+    #[arg(short = 'y', long, global = true)]
+    pub yes: bool,
 }
 
 impl Cli {
@@ -202,6 +207,10 @@ pub struct SearchArgs {
     /// Block waiting for the state lock instead of failing fast (with --add).
     #[arg(long)]
     pub wait: bool,
+    /// Force a fresh download of the aqua root index, ignoring the local cache
+    /// TTL (default: reuse a cache younger than 24h to avoid rate limits).
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 /// Shared context for command execution.
@@ -211,10 +220,12 @@ pub struct App {
     pub http: Box<dyn HttpClient>,
     /// Effective verbosity (also mirrored into the global used by `step!`).
     pub verbosity: crate::progress::Verbosity,
+    /// Skip interactive confirmation (from `--yes`); auto-runs bootstrap prompts.
+    pub assume_yes: bool,
 }
 
 impl App {
-    pub fn new(verbosity: crate::progress::Verbosity) -> Result<Self> {
+    pub fn new(verbosity: crate::progress::Verbosity, assume_yes: bool) -> Result<Self> {
         // Keep the global (consulted by the step!/detail! macros) in sync.
         crate::progress::set_verbosity(verbosity);
         Ok(Self {
@@ -222,6 +233,7 @@ impl App {
             runner: Box::new(SystemRunner::new()),
             http: Box::new(ReqwestClient::new()),
             verbosity,
+            assume_yes,
         })
     }
 
@@ -318,13 +330,21 @@ impl App {
         wait: bool,
     ) -> Result<()> {
         let cfg_path = self.paths.config_file();
-        let mut locked = LockedState::acquire(&self.paths.state_file(), wait)?;
-        let mut cfg = Config::load_or_default(&cfg_path)?;
 
-        // Resolve the source now (for the final message + validation).
-        let default_source = cfg.settings.default_source_kind()?;
+        // Resolve the source (for validation + the final message) and ensure the
+        // language toolchain it rides on exists BEFORE taking the state lock —
+        // bootstrap takes its own lock, and it may also mutate config (adds
+        // fnm/uv/pixi), so we (re)load config fresh afterwards.
+        let default_source = {
+            let cfg = Config::load_or_default(&cfg_path)?;
+            cfg.settings.default_source_kind()?
+        };
         let parsed = parse_spec(&tool.spec, default_source)
             .with_context(|| format!("invalid spec `{}`", tool.spec))?;
+        self.ensure_toolchain(parsed.source)?;
+
+        let mut locked = LockedState::acquire(&self.paths.state_file(), wait)?;
+        let mut cfg = Config::load_or_default(&cfg_path)?;
 
         // Existence guard: refuse to clobber an existing declaration unless --force.
         if cfg.tools.contains_key(&name) && !force {
@@ -990,13 +1010,24 @@ impl App {
 
     // ---- bootstrap ----
     fn cmd_bootstrap(&self, args: BootstrapArgs) -> Result<()> {
+        let target: bootstrap::BootstrapTarget = args.target.parse()?;
+        self.run_bootstrap_target(target, args.reinstall)
+    }
+
+    /// Run a bootstrap target. Shared by `ubix bootstrap` and the on-demand
+    /// toolchain provisioning in [`ensure_toolchain`]. Acquires its own state
+    /// lock (via `ensure_added`), so callers MUST NOT hold the lock.
+    fn run_bootstrap_target(
+        &self,
+        target: bootstrap::BootstrapTarget,
+        reinstall: bool,
+    ) -> Result<()> {
         use bootstrap::BootstrapTarget;
-        let target: BootstrapTarget = args.target.parse()?;
         match target {
             // python/nodejs/pixi need the add/config/state machinery → handled here.
-            BootstrapTarget::Python => self.cmd_bootstrap_python(args.reinstall),
-            BootstrapTarget::Nodejs => self.cmd_bootstrap_nodejs(args.reinstall),
-            BootstrapTarget::Pixi => self.cmd_bootstrap_pixi(args.reinstall),
+            BootstrapTarget::Python => self.cmd_bootstrap_python(reinstall),
+            BootstrapTarget::Nodejs => self.cmd_bootstrap_nodejs(reinstall),
+            BootstrapTarget::Pixi => self.cmd_bootstrap_pixi(reinstall),
             // rust/go are pure toolchain fetches → the ctx-only bootstrap.
             BootstrapTarget::Rust | BootstrapTarget::Go => {
                 let cfg = Config::load_or_default(&self.paths.config_file())?;
@@ -1005,9 +1036,73 @@ impl App {
                     http: self.http.as_ref(),
                     go_root: crate::paths::expand(&cfg.settings.go_root),
                 };
-                bootstrap::bootstrap(target, args.reinstall, &ctx)
+                bootstrap::bootstrap(target, reinstall, &ctx)
             }
         }
+    }
+
+    /// Pre-flight for package sources that ride a language toolchain (npm→fnm,
+    /// pypi→uv, cargo→rust, go→go, pixi→pixi). If the toolchain is missing, offer
+    /// to run the matching `ubix bootstrap` (interactive prompt, or auto with
+    /// `--yes`); otherwise bail with the exact command. A single `ubix add fnm`
+    /// is NOT enough for npm — a default node must also be set — so we always
+    /// route through bootstrap, never a bare `ubix add`.
+    ///
+    /// MUST be called BEFORE the state lock is taken: bootstrap acquires its own
+    /// lock, so calling this while holding one would deadlock.
+    fn ensure_toolchain(&self, source: SourceKind) -> Result<()> {
+        use bootstrap::BootstrapTarget::{Go, Nodejs, Pixi, Python, Rust};
+        // (what's missing, bootstrap target, the exact command to suggest)
+        let missing: Option<(&str, bootstrap::BootstrapTarget, &str)> = match source {
+            SourceKind::Npm => {
+                if !self.runner.which("fnm") {
+                    Some(("npm tools need a Node runtime (fnm + a default node)", Nodejs, "ubix bootstrap nodejs"))
+                } else if !npm::has_default_node(self.runner.as_ref()) {
+                    Some(("npm tools need a default fnm node", Nodejs, "ubix bootstrap nodejs"))
+                } else {
+                    None
+                }
+            }
+            SourceKind::Pypi => (!self.runner.which("uv"))
+                .then_some(("pypi tools need `uv`", Python, "ubix bootstrap python")),
+            SourceKind::Cargo => (!self.runner.which("cargo"))
+                .then_some(("cargo tools need the Rust toolchain", Rust, "ubix bootstrap rust")),
+            SourceKind::Go => (!self.runner.which("go"))
+                .then_some(("go tools need the Go toolchain", Go, "ubix bootstrap go")),
+            SourceKind::Pixi => (!self.runner.which("pixi"))
+                .then_some(("pixi tools need `pixi`", Pixi, "ubix bootstrap pixi")),
+            _ => None,
+        };
+        let Some((need, target, cmd)) = missing else {
+            return Ok(());
+        };
+        if self.confirm_bootstrap(need, cmd) {
+            step!("{need}; bootstrapping via `{cmd}`");
+            self.run_bootstrap_target(target, false)?;
+        } else {
+            bail!("{need}; run `{cmd}` first (or re-run with `--yes` to auto-install)");
+        }
+        Ok(())
+    }
+
+    /// Decide whether to auto-run a bootstrap: `--yes` always consents; otherwise
+    /// prompt on a TTY (default No). Non-interactive without `--yes` → false, so
+    /// the caller bails with a copy-pasteable command.
+    fn confirm_bootstrap(&self, need: &str, cmd: &str) -> bool {
+        use std::io::{IsTerminal, Write};
+        if self.assume_yes {
+            return true;
+        }
+        if !std::io::stdin().is_terminal() {
+            return false;
+        }
+        eprint!("{need}. Run `{cmd}` now? [y/N] ");
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
 
     /// Ensure `name` is installed via the `ubix add` path for `spec` (with the
@@ -1115,8 +1210,9 @@ impl App {
         // (Send+Sync) crosses the thread boundary — not `self`.
         let http = self.http.as_ref();
         let channel = args.channel.as_deref();
+        let refresh = args.refresh;
         let (aqua_res, pixi_res) = std::thread::scope(|s| {
-            let a = want_aqua.then(|| s.spawn(|| aqua_candidates(http, &query)));
+            let a = want_aqua.then(|| s.spawn(|| aqua_candidates(http, &query, refresh)));
             let p = want_pixi.then(|| s.spawn(|| crate::prefix_dev::search(http, &query, channel, 25)));
             // A panicked finder becomes a graceful Err (release builds are
             // panic=abort, so re-panicking here would kill the whole process).
@@ -1397,27 +1493,14 @@ fn pixi_locator(h: &crate::prefix_dev::Hit) -> String {
 }
 
 /// Fetch aqua-registry candidates for a fuzzy `query` (repo-name substring).
-/// Refreshes the root index (best-effort); falls back to a cached index, and
-/// only errors when there is no cache at all. Returns all hits (may be empty).
+/// Uses a TTL-cached root index (see [`registry::root_index`]) so repeated
+/// searches don't re-download it; `force` bypasses the cache. Returns all hits.
 fn aqua_candidates(
     http: &dyn HttpClient,
     query: &str,
+    force: bool,
 ) -> Result<Vec<crate::aqua::registry::Candidate>> {
-    let cache = crate::aqua::registry::root_cache_path();
-    let text = match crate::aqua::registry::update(http) {
-        Ok((_, n)) => {
-            step!("refreshed aqua root index ({n} bytes)");
-            crate::aqua::registry::read_root_cache(&cache)?
-                .context("root index cache missing after update")?
-        }
-        Err(e) => match crate::aqua::registry::read_root_cache(&cache)? {
-            Some(t) => {
-                step!("aqua root index refresh failed ({e}); using cached index");
-                t
-            }
-            None => bail!("aqua root index unavailable (refresh failed: {e}, no cache)"),
-        },
-    };
+    let text = crate::aqua::registry::root_index(http, force)?;
     Ok(crate::aqua::search_index(&text, query))
 }
 
@@ -2182,6 +2265,7 @@ mod tests {
             runner: Box::new(MockRunner::new()),
             http: Box::new(http),
             verbosity: crate::progress::Verbosity::Quiet,
+            assume_yes: false,
         }
     }
 
@@ -2518,6 +2602,65 @@ mod tests {
         assert_eq!(calls[0].args, vec!["install", "--lts"]);
         assert_eq!(calls[1].program, "/home/u/.local/bin/fnm");
         assert_eq!(calls[1].args, vec!["default", "v22.14.0"]);
+    }
+
+    /// Build a test `App` around a specific runner (paths point at a throwaway
+    /// dir; `ensure_toolchain`'s bail path never touches the FS).
+    fn app_with_runner(runner: MockRunner) -> App {
+        App {
+            paths: Paths { config_dir: "/tmp/ubix-test".into(), data_dir: "/tmp/ubix-test".into() },
+            runner: Box::new(runner),
+            http: Box::new(MockHttp::new()),
+            verbosity: crate::progress::Verbosity::Quiet,
+            assume_yes: false,
+        }
+    }
+
+    #[test]
+    fn ensure_toolchain_ok_when_present() {
+        // cargo on PATH → no prompt, no bail.
+        let app = app_with_runner(MockRunner::new().with_present("cargo"));
+        assert!(app.ensure_toolchain(SourceKind::Cargo).is_ok());
+    }
+
+    #[test]
+    fn ensure_toolchain_bails_with_bootstrap_hint_non_interactive() {
+        // Missing toolchain + non-interactive (test stdin is not a TTY) + no
+        // --yes → bail pointing at the exact `ubix bootstrap` command.
+        let cases = [
+            (SourceKind::Cargo, "ubix bootstrap rust"),
+            (SourceKind::Go, "ubix bootstrap go"),
+            (SourceKind::Pypi, "ubix bootstrap python"),
+            (SourceKind::Pixi, "ubix bootstrap pixi"),
+            (SourceKind::Npm, "ubix bootstrap nodejs"),
+        ];
+        for (source, hint) in cases {
+            let app = app_with_runner(MockRunner::new());
+            let err = app.ensure_toolchain(source).unwrap_err().to_string();
+            assert!(err.contains(hint), "source {source:?}: {err}");
+            assert!(err.contains("--yes"), "source {source:?} should mention --yes: {err}");
+        }
+    }
+
+    #[test]
+    fn ensure_toolchain_npm_needs_default_node_even_with_fnm() {
+        // fnm present but no default node → still routes to bootstrap nodejs
+        // (a bare `ubix add fnm` would not be enough).
+        let runner = MockRunner::new().with_present("fnm").expect(
+            "fnm exec --using=default -- node --version",
+            CommandOutput { status: 1, stdout: String::new(), stderr: "no default".into() },
+        );
+        let app = app_with_runner(runner);
+        let err = app.ensure_toolchain(SourceKind::Npm).unwrap_err().to_string();
+        assert!(err.contains("ubix bootstrap nodejs"), "{err}");
+    }
+
+    #[test]
+    fn ensure_toolchain_noop_for_non_toolchain_sources() {
+        // github/gitlab/url don't ride a language toolchain → always Ok.
+        let app = app_with_runner(MockRunner::new());
+        assert!(app.ensure_toolchain(SourceKind::Github).is_ok());
+        assert!(app.ensure_toolchain(SourceKind::Url).is_ok());
     }
 
     #[test]
