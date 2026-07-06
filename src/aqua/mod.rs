@@ -42,11 +42,16 @@ pub fn resolve_package(
 
     // Only github_release is supported at the top level (plan §2/§9). `type:
     // http` packages (templated URL, e.g. claude-code) can't be synthesized as
-    // `github:`, but ubix's `url:` source covers them — emit a ready-to-use
-    // `ubix add 'url:…'` command instead of a dead-end error.
+    // `github:`, but ubix's `url:` source covers exactly that shape — synthesize
+    // a `url:` ToolConfig so `add`/`search --add` install it directly, just like
+    // github. When the shape is too ambiguous to synth safely, fall back to the
+    // ready-to-paste `ubix add 'url:…'` hint.
     match pkg.type_.as_deref() {
         Some("github_release") | None => {}
-        Some("http") => bail!(hint::http_hint(&pkg, owner, repo)),
+        Some("http") => {
+            return hint::synth_url_config(&pkg, owner, repo, name_override)
+                .ok_or_else(|| anyhow::anyhow!(hint::http_hint(&pkg, owner, repo)));
+        }
         Some(other) => bail!(
             "unsupported aqua construct: package type `{other}` for {owner}/{repo}; \
              see {} and add a `github:` entry manually",
@@ -123,6 +128,14 @@ pub fn generate_snippet(name: &str, tool: &ToolConfig) -> String {
     if let Some(rename) = &tool.rename {
         out.push_str(&format!("rename = \"{rename}\"\n"));
     }
+    // url-source scalars — MUST precede any `[tools.name.X]` table header below,
+    // else TOML would nest them under that subtable.
+    if let Some(vs) = &tool.version_source {
+        out.push_str(&format!("version_source = \"{vs}\"\n"));
+    }
+    if let Some(m) = &tool.url_musl {
+        out.push_str(&format!("url_musl = \"{m}\"\n"));
+    }
     if let Some(PlatformString::PerPlatform(map)) = &tool.matching {
         out.push_str(&format!("[tools.{name}.matching]\n"));
         for (k, v) in map {
@@ -130,6 +143,18 @@ pub fn generate_snippet(name: &str, tool: &ToolConfig) -> String {
         }
     } else if let Some(PlatformString::One(s)) = &tool.matching {
         out.push_str(&format!("matching = \"{s}\"\n"));
+    }
+    if let Some(map) = &tool.arch_replace {
+        out.push_str(&format!("[tools.{name}.arch_replace]\n"));
+        for (k, v) in map {
+            out.push_str(&format!("{k} = \"{v}\"\n"));
+        }
+    }
+    if let Some(map) = &tool.os_replace {
+        out.push_str(&format!("[tools.{name}.os_replace]\n"));
+        for (k, v) in map {
+            out.push_str(&format!("{k} = \"{v}\"\n"));
+        }
     }
     out
 }
@@ -226,7 +251,9 @@ packages:
     }
 
     #[test]
-    fn http_type_emits_url_hint() {
+    fn http_type_synthesizes_url_config() {
+        // A `type: http` package now synthesizes a `url:` ToolConfig (like
+        // github), so `add`/`search --add` install it directly — no more bail.
         let yaml = r#"
 packages:
   - type: http
@@ -237,11 +264,57 @@ packages:
       - name: y
     version_source: github_tag
 "#;
+        // No latest-version fetch is canned: the http arm must NOT hit the github
+        // release API (it returns before version discovery).
+        let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
+        let (name, tool) = resolve_package(&http, "x", "y", None).unwrap();
+        assert_eq!(name, "y");
+        assert_eq!(tool.spec, "url:https://example.com/{version}/{os}-{arch}/y");
+        assert_eq!(tool.exe.as_deref(), Some("y"));
+        assert_eq!(tool.version_source.as_deref(), Some("github:x/y"));
+    }
+
+    #[test]
+    fn http_type_ambiguous_url_falls_back_to_hint() {
+        // A URL only in a version-gated branch (no `"true"` catch-all) can't be
+        // synthesized safely — degrade to the manual `ubix add 'url:…'` hint.
+        let yaml = r#"
+packages:
+  - type: http
+    repo_owner: x
+    repo_name: y
+    files:
+      - name: y
+    version_source: github_tag
+    version_overrides:
+      - version_constraint: 'semver("< 2.0.0")'
+        url: https://example.com/{{.Version}}/{{.OS}}-{{.Arch}}/y
+"#;
         let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
         let err = resolve_package(&http, "x", "y", None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("url:"), "{msg}");
-        assert!(msg.contains("ubix add 'url:https://example.com/{version}/{os}-{arch}/y'"), "{msg}");
+        // Degrades to the manual `ubix add 'url:…'` hint (not an auto-install).
+        assert!(msg.contains("ubix add 'url:"), "{msg}");
         assert!(msg.contains("--version-source github:x/y"), "{msg}");
+    }
+
+    #[test]
+    fn generate_snippet_renders_url_fields() {
+        let mut tool = ToolConfig::from_spec("url:https://h/{version}/{os}-{arch}/claude");
+        tool.exe = Some("claude".into());
+        tool.version_source = Some("github:anthropics/claude-code".into());
+        tool.url_musl = Some("https://h/{version}/{os}-{arch}-musl/claude".into());
+        tool.arch_replace = Some([("amd64".to_string(), "x64".to_string())].into_iter().collect());
+        let snippet = generate_snippet("claude", &tool);
+        // Scalars appear before the `[tools.claude.arch_replace]` table header so
+        // TOML doesn't nest them under it.
+        let vs_at = snippet.find("version_source =").unwrap();
+        let musl_at = snippet.find("url_musl =").unwrap();
+        let table_at = snippet.find("[tools.claude.arch_replace]").unwrap();
+        assert!(vs_at < table_at && musl_at < table_at, "{snippet}");
+        assert!(snippet.contains("amd64 = \"x64\""), "{snippet}");
+        // Round-trips as valid TOML under a config document.
+        let cfg: crate::config::Config = toml::from_str(&snippet).unwrap();
+        assert_eq!(cfg.tools["claude"].version_source.as_deref(), Some("github:anthropics/claude-code"));
     }
 }

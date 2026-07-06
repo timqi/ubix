@@ -1535,6 +1535,14 @@ fn print_search_results(query: &str, cands: &[SearchHit]) {
 fn print_aqua_snippet(name: &str, tool: &ToolConfig) {
     print!("{}", crate::aqua::generate_snippet(name, tool));
     let (goos, goarch) = (crate::platform::goos(), crate::platform::goarch());
+    // A synthesized `url:` tool has no ubi asset-picker; it renders a templated
+    // URL and discovers {version} via version_source.
+    if matches!(parse_spec(&tool.spec, SourceKind::Github).map(|p| p.source), Ok(SourceKind::Url)) {
+        println!(
+            "# url source: discovers {{version}} via version_source, renders {{os}}/{{arch}} for {goos}-{goarch}"
+        );
+        return;
+    }
     if tool.matching.is_none() {
         println!("# no matching needed: ubi selects the asset for {goos}-{goarch} automatically");
         return;
