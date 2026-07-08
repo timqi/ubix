@@ -355,7 +355,11 @@ impl App {
         }
 
         // Install first, then persist state + config so we never record a failed install.
-        let record = self.install_tool(&cfg, &name, &tool)?;
+        // `--force` overwrites an existing declaration and must force a real
+        // reinstall (e.g. `uv tool install --reinstall`), otherwise a tool whose
+        // manager already has it (uv/cargo/npm) reports "already installed" and
+        // never relinks its entry points into our bin dir.
+        let record = self.install_tool(&cfg, &name, &tool, force)?;
         let version = record.installed_version.clone();
         locked.state.tools.insert(name.clone(), record);
         locked.save()?;
@@ -580,7 +584,7 @@ impl App {
                     // not an upgrade — routing it through upgrade_tool would run
                     // `uv tool upgrade` on a not-yet-installed package and fail.
                     let record = if is_install {
-                        self.install_tool(&cfg, name, tool)?
+                        self.install_tool(&cfg, name, tool, false)?
                     } else {
                         self.upgrade_tool(&cfg, name, tool)?
                     };
@@ -1132,7 +1136,7 @@ impl App {
         if !exes.is_empty() {
             tool.exes = Some(exes.iter().map(|s| s.to_string()).collect());
         }
-        let record = self.install_tool(&cfg, name, &tool)?;
+        let record = self.install_tool(&cfg, name, &tool, reinstall)?;
         let version = record.installed_version.clone();
         locked.state.tools.insert(name.to_string(), record);
         locked.save()?;
@@ -1299,7 +1303,7 @@ impl App {
         // A pinned pixi tool must CONVERGE to its pin: `pixi global update` ignores
         // the pin and jumps to latest, so reinstall via `pixi global install pkg=version`.
         if parsed.source == SourceKind::Pixi && tool.version.is_some() {
-            return self.install_tool(cfg, name, tool);
+            return self.install_tool(cfg, name, tool, true);
         }
         if matches!(parsed.source, SourceKind::Pypi | SourceKind::Pixi) {
             let install_dir = cfg.settings.install_dir_path();
@@ -1330,11 +1334,18 @@ impl App {
                 updated_at: Some(now),
             });
         }
-        self.install_tool(cfg, name, tool)
+        // github/gitlab/url/go/cargo/npm "upgrade" is a reinstall in place.
+        self.install_tool(cfg, name, tool, true)
     }
 
     /// Install a tool via its source handler and return a fresh state record.
-    fn install_tool(&self, cfg: &Config, name: &str, tool: &ToolConfig) -> Result<ToolRecord> {
+    fn install_tool(
+        &self,
+        cfg: &Config,
+        name: &str,
+        tool: &ToolConfig,
+        reinstall: bool,
+    ) -> Result<ToolRecord> {
         let parsed = cfg.parsed_spec(tool)?;
         let install_dir = cfg.settings.install_dir_path();
 
@@ -1372,7 +1383,7 @@ impl App {
             SourceKind::Gitlab => {
                 gitlab::install(tool, name, install_dir, &UbiEngine::new())?
             }
-            SourceKind::Pypi => uv::install(tool, self.runner.as_ref(), &install_dir, false)?,
+            SourceKind::Pypi => uv::install(tool, self.runner.as_ref(), &install_dir, reinstall)?,
             SourceKind::Pixi => pixi::install(tool, self.runner.as_ref())?,
             SourceKind::Npm => npm::install(tool, self.runner.as_ref())?,
             SourceKind::Cargo => cargo::install(tool, self.runner.as_ref(), &install_dir)?,
