@@ -49,9 +49,32 @@ struct HttpFields {
 /// `format: raw` case) never renames.
 fn file_needs_rename(f: &FileEntry) -> bool {
     match (&f.name, &f.src) {
-        (Some(name), Some(src)) => src.rsplit('/').next().unwrap_or(src) != name,
+        (Some(name), Some(src)) => super::synth::needs_rename(name, src),
         _ => false,
     }
+}
+
+/// Drop aqua ALIAS entries — several names pointing at the same member (e.g.
+/// claude-squad's `cs` → `claude-squad`): extra links, not real files in the
+/// asset. Delegates to `synth::dedup_aliases` on (name, effective src) pairs,
+/// where an entry's effective src defaults to its own `name` (no `src` set).
+fn drop_aliases(entries: Vec<FileEntry>) -> Vec<FileEntry> {
+    let pairs: Vec<(String, String)> = entries
+        .iter()
+        .filter_map(|f| {
+            let name = f.name.clone()?;
+            let src = f.src.clone().unwrap_or_else(|| name.clone());
+            Some((name, src))
+        })
+        .collect();
+    let (kept, _dropped) = super::synth::dedup_aliases(pairs);
+    entries
+        .into_iter()
+        .filter(|f| match &f.name {
+            Some(n) => kept.iter().any(|(k, _)| k == n),
+            None => true, // nameless entries are ignored downstream anyway
+        })
+        .collect()
 }
 
 /// Find a musl download URL among platform overrides (an override whose `url`
@@ -107,7 +130,10 @@ fn extract(pkg: &Package) -> HttpFields {
         }
     }
 
-    let file_entries = files.unwrap_or_default();
+    // Drop alias entries first so they aren't misread as renames (which would
+    // needlessly degrade `synth_url_config` to the manual hint) and don't end
+    // up in `--exes` (where install would fail to find them in the asset).
+    let file_entries = drop_aliases(files.unwrap_or_default());
     let needs_rename = file_entries.iter().any(file_needs_rename);
 
     HttpFields {
@@ -399,6 +425,55 @@ packages:
         assert_eq!(name, "r");
         assert_eq!(tool.spec, "url:https://example.com/download/r");
         assert!(tool.version_source.is_none(), "{:?}", tool.version_source);
+    }
+
+    #[test]
+    fn alias_entry_is_dropped_not_misread_as_rename() {
+        // An alias (`src` naming a sibling entry) is an extra link, not a
+        // rename: synth must still succeed with the real member as the exe.
+        let pkg = parse(
+            r#"
+packages:
+  - type: http
+    repo_owner: o
+    repo_name: r
+    url: https://h/{{.Version}}/{{.OS}}-{{.Arch}}.tar.gz
+    files:
+      - name: tool
+      - name: t
+        src: tool
+    version_source: github_tag
+"#,
+        );
+        let (name, tool) = synth_url_config(&pkg, "o", "r", None).unwrap();
+        assert_eq!(name, "tool");
+        assert_eq!(tool.exe.as_deref(), Some("tool"));
+        assert_eq!(tool.exes, None);
+    }
+
+    #[test]
+    fn alias_of_pathed_member_is_dropped_by_effective_src() {
+        // The alias points at the SAME member as a sibling whose own `src` is a
+        // path: matching by effective src (not sibling names) collapses it, and
+        // the surviving pathed entry (basename == name) is not a rename.
+        let pkg = parse(
+            r#"
+packages:
+  - type: http
+    repo_owner: o
+    repo_name: r
+    url: https://h/{{.Version}}/{{.OS}}-{{.Arch}}.tar.gz
+    files:
+      - name: tool
+        src: dist/tool
+      - name: t
+        src: dist/tool
+    version_source: github_tag
+"#,
+        );
+        let (name, tool) = synth_url_config(&pkg, "o", "r", None).unwrap();
+        assert_eq!(name, "tool");
+        assert_eq!(tool.exe.as_deref(), Some("tool"));
     }
 
     #[test]

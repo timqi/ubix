@@ -33,6 +33,15 @@ case works today; each note records the edge and why it was left.
   member name differs AND varies per platform need per-platform `exe` support, or
   a "bail when not representable" guard — validate against real ubi behavior first.
   (`src/aqua/synth.rs`)
+- **aqua alias files are dropped, not installed.** ~15 of 2244 registry packages
+  declare extra names for the SAME archive member (`files[].src` pointing at a
+  sibling entry, e.g. claude-squad's `cs`, flyctl's `fly`, and 9 `kubectl-*`
+  plugin names). aqua materializes these as links; ubix's `github:` source can't,
+  so `synth` dedups them (with a step note) and installs only the real member.
+  Mostly cosmetic, but two cases lose function: flyctl's PRIMARY command is the
+  `fly` alias, and `kubectl <plugin>` dispatch requires the `kubectl-*` name.
+  Supporting them needs an `aliases` config field + post-install symlinks tracked
+  in state (removal is already unlink-by-tracked-file). (`src/aqua/synth.rs`)
 
 ## `outdated` / version discovery
 - **Go latest-version query uses the install package path, not the module root.**

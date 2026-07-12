@@ -7,11 +7,11 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 
 use crate::config::{PlatformString, ToolConfig};
 
-use super::resolve::{effective_for, registry_url, version_for_template, Branch};
+use super::resolve::{effective_for, unsupported, version_for_template, Branch};
 use super::template::{self, asset_without_ext, Ctx};
 
 /// The four target platforms we synthesize for (plan §6).
@@ -27,7 +27,7 @@ pub const PLATFORMS: &[(&str, &str)] = &[
 struct Rendered {
     /// The version-independent `matching` substring for this platform.
     matching: String,
-    /// files[].name → basename(rendered src) (for `rename` derivation).
+    /// files[].name → rendered src path (for alias dedup + `rename` derivation).
     files: Vec<(String, String)>,
 }
 
@@ -46,11 +46,7 @@ pub fn synth(
     // Reject non-github_release types surfaced by the winning branch.
     if let Some(t) = &branch.type_ {
         if t != "github_release" {
-            bail!(
-                "unsupported aqua construct: type `{t}` for {owner}/{repo}; \
-                 see {} and add a `github:` entry manually",
-                registry_url(owner, repo)
-            );
+            return Err(unsupported(owner, repo, format!("type `{t}` for {owner}/{repo}")));
         }
     }
 
@@ -71,14 +67,14 @@ pub fn synth(
     }
 
     if matching_map.is_empty() {
-        bail!(
-            "unsupported aqua construct: no supported linux/darwin platform for {owner}/{repo}; \
-             see {} and add a `github:` entry manually",
-            registry_url(owner, repo)
-        );
+        return Err(unsupported(
+            owner,
+            repo,
+            format!("no supported linux/darwin platform for {owner}/{repo}"),
+        ));
     }
 
-    let files = file_names.unwrap_or_default();
+    let (files, dropped_aliases) = dedup_aliases(file_names.unwrap_or_default());
     let name = name_override
         .map(str::to_string)
         .or_else(|| files.first().map(|(n, _)| n.clone()))
@@ -90,20 +86,78 @@ pub fn synth(
     match files.len() {
         0 => {}
         1 => {
-            let (fname, src_base) = &files[0];
+            let (fname, src) = &files[0];
             tool.exe = Some(fname.clone());
             // rename when the in-archive basename differs from the wanted name.
-            if src_base != fname {
+            if needs_rename(fname, src) {
                 tool.rename = Some(fname.clone());
             }
         }
         _ => {
-            // Multi-file → exes (mutually exclusive with rename, per github source).
+            // Multi-file → exes (mutually exclusive with rename, per github
+            // source): `plan_exe_installs` looks each entry up by exact file
+            // basename, so a name that differs from its archive member can't
+            // be expressed here — degrade instead of emitting a config that
+            // fails at install time.
+            if let Some((fname, src)) = files.iter().find(|(n, s)| needs_rename(n, s)) {
+                return Err(unsupported(
+                    owner,
+                    repo,
+                    format!(
+                        "multi-file package {owner}/{repo} wants `{fname}` renamed from \
+                         archive member `{src}` (`exes` can't rename)"
+                    ),
+                ));
+            }
             tool.exes = Some(files.iter().map(|(n, _)| n.clone()).collect());
         }
     }
 
+    if !dropped_aliases.is_empty() {
+        crate::step!(
+            "omitting aqua alias exe(s) {} (extra link(s) to the same archive member)",
+            dropped_aliases
+                .iter()
+                .map(|d| format!("`{d}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     Ok((name, tool))
+}
+
+/// Whether producing command `name` from archive member `src` requires a
+/// rename (the member's basename differs from the wanted name).
+pub(super) fn needs_rename(name: &str, src: &str) -> bool {
+    basename(src) != name
+}
+
+/// Collapse aqua alias entries: several `files[]` names may point at the SAME
+/// in-archive member (e.g. claude-squad ships `cs` with `src: claude-squad`).
+/// aqua materializes aliases as extra links at install time, but the archive
+/// holds ONE real file — emitting every name as an `exes` entry fails at
+/// install ("`cs` not found in extracted archive"). Keeps one entry per
+/// rendered src (preferring the name that equals the member basename); the
+/// second element returns the dropped alias names for reporting.
+/// Also reused by `hint::extract` on unrendered (name, effective src) pairs.
+pub(super) fn dedup_aliases(files: Vec<(String, String)>) -> (Vec<(String, String)>, Vec<String>) {
+    let mut out: Vec<(String, String)> = Vec::new();
+    let mut dropped: Vec<String> = Vec::new();
+    for (name, src) in files {
+        match out.iter_mut().find(|(_, s)| *s == src) {
+            None => out.push((name, src)),
+            Some(kept) => {
+                // Prefer keeping the name that matches the archive member.
+                if name == basename(&src) {
+                    dropped.push(std::mem::replace(&mut kept.0, name));
+                } else {
+                    dropped.push(name);
+                }
+            }
+        }
+    }
+    (out, dropped)
 }
 
 /// Render asset + files for one platform, and derive the matching substring.
@@ -143,8 +197,7 @@ fn render_platform(
             Some(s) => template::render(s, &ctx, "files.src")?,
             None => name.clone(),
         };
-        let base = basename(&src).to_string();
-        files.push((name.clone(), base));
+        files.push((name.clone(), src));
     }
 
     let matching = matching_substring(&eff.asset, &rendered_asset, version, owner, repo)?;
@@ -187,12 +240,14 @@ fn matching_substring(
         return Ok(prefix);
     }
 
-    bail!(
-        "unsupported aqua construct: cannot derive a unique version-independent asset \
-         fragment for {owner}/{repo} (rendered `{rendered_asset}`); \
-         see {} and add a `github:` entry manually",
-        registry_url(owner, repo)
-    );
+    Err(unsupported(
+        owner,
+        repo,
+        format!(
+            "cannot derive a unique version-independent asset fragment for {owner}/{repo} \
+             (rendered `{rendered_asset}`)"
+        ),
+    ))
 }
 
 /// A fragment is usable if it has at least one alphanumeric character (i.e. it
@@ -317,6 +372,83 @@ mod tests {
         let err = matching_substring("{{trimV .Version}}-", "2.65.0-", "2.65.0", "o", "r")
             .unwrap_err();
         assert!(err.to_string().contains("cannot derive"), "{err}");
+    }
+
+    // smtg-ai/claude-squad shape: `cs` is an aqua ALIAS (`src: claude-squad`)
+    // pointing at the one real archive member — not a second file.
+    const SQUAD: &str = r#"
+packages:
+  - type: github_release
+    repo_owner: smtg-ai
+    repo_name: claude-squad
+    asset: claude-squad_{{trimV .Version}}_{{.OS}}_{{.Arch}}.{{.Format}}
+    format: tar.gz
+    files:
+      - name: claude-squad
+      - name: cs
+        src: claude-squad
+"#;
+
+    #[test]
+    fn synth_collapses_alias_files_to_single_exe() {
+        // Regression: previously synthesized exes = ["claude-squad", "cs"], and
+        // install failed with "`cs` not found in extracted archive".
+        let p = pkg(SQUAD);
+        let branch = select_branch(&p, "1.0.5", "smtg-ai", "claude-squad").unwrap();
+        let (name, tool) = synth(&branch, "v1.0.5", "smtg-ai", "claude-squad", None).unwrap();
+        assert_eq!(name, "claude-squad");
+        assert_eq!(tool.exe.as_deref(), Some("claude-squad"));
+        assert_eq!(tool.exes, None);
+        assert_eq!(tool.rename, None);
+    }
+
+    #[test]
+    fn dedup_prefers_real_member_name_even_when_alias_listed_first() {
+        let files = vec![
+            ("cs".to_string(), "claude-squad".to_string()),
+            ("claude-squad".to_string(), "claude-squad".to_string()),
+        ];
+        assert_eq!(
+            dedup_aliases(files),
+            (
+                vec![("claude-squad".to_string(), "claude-squad".to_string())],
+                vec!["cs".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn dedup_keeps_genuinely_distinct_files() {
+        let files = vec![
+            ("uv".to_string(), "uv-dist/uv".to_string()),
+            ("uvx".to_string(), "uv-dist/uvx".to_string()),
+        ];
+        assert_eq!(dedup_aliases(files.clone()), (files, vec![]));
+    }
+
+    #[test]
+    fn synth_bails_on_multi_file_rename() {
+        // Two REAL files where one wants a name differing from its archive
+        // member: `exes` can't rename, so degrade to the manual hint.
+        let p = pkg(
+            r#"
+packages:
+  - type: github_release
+    repo_owner: o
+    repo_name: r
+    asset: r_{{.OS}}_{{.Arch}}.tar.gz
+    files:
+      - name: a
+      - name: b
+        src: dist/b-real
+"#,
+        );
+        let branch = select_branch(&p, "1.0.0", "o", "r").unwrap();
+        let err = synth(&branch, "v1.0.0", "o", "r", None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unsupported aqua construct"), "{msg}");
+        assert!(msg.contains("`exes` can't rename"), "{msg}");
+        assert!(msg.contains("registry.yaml"), "{msg}");
     }
 
     #[test]

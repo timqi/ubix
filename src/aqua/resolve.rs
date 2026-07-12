@@ -15,6 +15,15 @@ pub fn registry_url(owner: &str, repo: &str) -> String {
     format!("https://github.com/aquaproj/aqua-registry/blob/main/pkgs/{owner}/{repo}/registry.yaml")
 }
 
+/// The standard degrade error: an aqua construct ubix can't synthesize, with a
+/// pointer at the package's registry.yaml and the manual fallback.
+pub fn unsupported(owner: &str, repo: &str, reason: impl std::fmt::Display) -> anyhow::Error {
+    anyhow::anyhow!(
+        "unsupported aqua construct: {reason}; see {} and add a `github:` entry manually",
+        registry_url(owner, repo)
+    )
+}
+
 /// Fully-merged, still-templated fields for one branch (pre-platform-override).
 #[derive(Debug, Clone, Default)]
 pub struct Branch {

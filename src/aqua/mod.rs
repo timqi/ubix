@@ -22,7 +22,6 @@ use crate::outdated::{self, Latest};
 use crate::sources::{ParsedSpec, SourceKind};
 
 pub use registry::search_index;
-pub use resolve::registry_url;
 
 /// Resolve an aqua package into a synthesized `github:` [`ToolConfig`].
 ///
@@ -52,11 +51,13 @@ pub fn resolve_package(
             return hint::synth_url_config(&pkg, owner, repo, name_override)
                 .ok_or_else(|| anyhow::anyhow!(hint::http_hint(&pkg, owner, repo)));
         }
-        Some(other) => bail!(
-            "unsupported aqua construct: package type `{other}` for {owner}/{repo}; \
-             see {} and add a `github:` entry manually",
-            registry_url(owner, repo)
-        ),
+        Some(other) => {
+            return Err(resolve::unsupported(
+                owner,
+                repo,
+                format!("package type `{other}` for {owner}/{repo}"),
+            ))
+        }
     }
 
     // Discover latest version (honors UBIX_GITHUB_TOKEN via outdated → github).
