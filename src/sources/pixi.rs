@@ -111,8 +111,65 @@ pub fn uninstall_args(locator: &str) -> Vec<String> {
 const PIXI_MISSING: &str =
     "`pixi` not found; install it with:\n    ubix bootstrap pixi\n    (or: ubix add prefix-dev/pixi)";
 
-/// Install a pixi tool via `pixi global install`. The tracked install path is the
-/// trampoline pixi drops into `$PIXI_HOME/bin` (named after the package).
+/// `pixi global list --json` — reports each global environment's exposed
+/// trampoline names.
+pub fn list_args() -> Vec<String> {
+    vec!["global".into(), "list".into(), "--json".into()]
+}
+
+/// Extract the trampoline names pixi exposed for the global environment `env`,
+/// from the JSON of `pixi global list --json`.
+///
+/// A conda package's executables are NOT necessarily its package name:
+/// `bubblewrap` exposes `bwrap`, `vim` exposes `ex`/`view`/`vim`/`xxd`. The
+/// environment is keyed by name (which pixi derives from the package), and the
+/// `exposed[].exposed_name` entries are the actual files in `$PIXI_HOME/bin`.
+/// Returns empty when the env is absent, so callers can fall back.
+pub fn exposed_names(json: &str, env: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(envs) = v.as_array() else { return Vec::new() };
+    let Some(entry) = envs
+        .iter()
+        .find(|e| e.get("name").and_then(|n| n.as_str()) == Some(env))
+    else {
+        return Vec::new();
+    };
+    entry
+        .get("exposed")
+        .and_then(|e| e.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.get("exposed_name").and_then(|n| n.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Resolve the trampoline paths pixi dropped for `locator`. Best-effort: any
+/// failure falls back to the package name (the old, often-wrong assumption).
+fn tracked_paths(runner: &dyn CommandRunner, locator: &str) -> Vec<PathBuf> {
+    let env = bare_name(locator);
+    let args = list_args();
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let discovered = match runner.run("pixi", &refs, &[]) {
+        Ok(out) if out.success() => exposed_names(&out.stdout, &env),
+        _ => Vec::new(),
+    };
+    let names = if discovered.is_empty() {
+        vec![env.clone()]
+    } else {
+        crate::sources::order_exes(discovered, &env)
+    };
+    let dir = pixi_bin_dir();
+    names.iter().map(|n| dir.join(n)).collect()
+}
+
+/// Install a pixi tool via `pixi global install`. The tracked install paths are
+/// the trampolines pixi drops into `$PIXI_HOME/bin`, whose names come from the
+/// package's exposed entry points — not from the package name.
 pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallOutcome> {
     let parsed = parse_spec(&tool.spec, SourceKind::Pixi)?;
     if parsed.source != SourceKind::Pixi {
@@ -133,7 +190,7 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
     Ok(InstallOutcome {
         installed_version: tool.version.clone().unwrap_or_else(|| "latest".into()),
         resolved_asset: None,
-        install_paths: vec![pixi_bin_dir().join(bare_name(&parsed.locator))],
+        install_paths: tracked_paths(runner, &parsed.locator),
         sha256: None,
     })
 }
@@ -156,7 +213,7 @@ pub fn upgrade(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
     Ok(InstallOutcome {
         installed_version: tool.version.clone().unwrap_or_else(|| "latest".into()),
         resolved_asset: None,
-        install_paths: vec![pixi_bin_dir().join(bare_name(&parsed.locator))],
+        install_paths: tracked_paths(runner, &parsed.locator),
         sha256: None,
     })
 }
@@ -235,20 +292,117 @@ mod tests {
     #[test]
     fn install_runs_pixi_and_tracks_bin() {
         use crate::runner::{CommandOutput, MockRunner};
-        let runner = MockRunner::new().with_present("pixi").expect(
-            "pixi global install samtools --channel https://prefix.dev/bioconda",
-            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
-        );
+        let runner = MockRunner::new()
+            .with_present("pixi")
+            .expect(
+                "pixi global install samtools --channel https://prefix.dev/bioconda",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "pixi global list --json",
+                CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"name":"samtools","exposed":[{"exposed_name":"samtools","executable":"samtools"}]}]"#
+                        .into(),
+                    stderr: String::new(),
+                },
+            );
         let t = ToolConfig::from_spec("pixi:bioconda::samtools");
         let out = install(&t, &runner).unwrap();
-        // Tracked binary is the bare name (channel stripped) in the pixi bin dir.
+        // Tracked binary is the exposed name (channel stripped) in the pixi bin dir.
         assert_eq!(out.install_paths.len(), 1);
         assert!(out.install_paths[0].ends_with("samtools"), "{:?}", out.install_paths);
-        let call = runner.last_call().unwrap();
-        assert_eq!(
-            call.args,
-            vec!["global", "install", "samtools", "--channel", "https://prefix.dev/bioconda"]
+        let calls = runner.calls.borrow();
+        assert!(calls.iter().any(|c| c.program == "pixi"
+            && c.args
+                == ["global", "install", "samtools", "--channel", "https://prefix.dev/bioconda"]));
+    }
+
+    #[test]
+    fn exposed_names_reads_trampoline_names() {
+        // A conda package's executables need not match its name: `bubblewrap`
+        // exposes `bwrap`.
+        let json = r#"[{"name":"vim","exposed":[{"exposed_name":"vim","executable":"vim"}]},
+                       {"name":"bubblewrap","exposed":[{"exposed_name":"bwrap","executable":"bwrap"}]}]"#;
+        assert_eq!(exposed_names(json, "bubblewrap"), vec!["bwrap"]);
+        assert_eq!(exposed_names(json, "vim"), vec!["vim"]);
+        // Absent env / junk / missing `exposed` → empty, so callers fall back.
+        assert!(exposed_names(json, "nope").is_empty());
+        assert!(exposed_names("not json", "vim").is_empty());
+        assert!(exposed_names(r#"[{"name":"x"}]"#, "x").is_empty());
+    }
+
+    #[test]
+    fn install_tracks_renamed_trampoline() {
+        // Regression: `pixi:bubblewrap` used to record `~/.pixi/bin/bubblewrap`,
+        // which does not exist — pixi exposes `bwrap`. `remove` therefore
+        // unlinked nothing and install-path checks saw a missing file.
+        use crate::runner::{CommandOutput, MockRunner};
+        let runner = MockRunner::new()
+            .with_present("pixi")
+            .expect(
+                "pixi global install bubblewrap",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "pixi global list --json",
+                CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"name":"bubblewrap","exposed":[{"exposed_name":"bwrap","executable":"bwrap"}]}]"#
+                        .into(),
+                    stderr: String::new(),
+                },
+            );
+        let t = ToolConfig::from_spec("pixi:bubblewrap");
+        let out = install(&t, &runner).unwrap();
+        assert_eq!(out.install_paths.len(), 1);
+        assert!(out.install_paths[0].ends_with("bwrap"), "{:?}", out.install_paths);
+    }
+
+    #[test]
+    fn install_tracks_all_exposed_with_primary_first() {
+        // Multi-binary conda package: every trampoline is tracked so `remove`
+        // is complete, and the package-named one leads so version backfill
+        // (which probes install_paths[0]) can succeed.
+        use crate::runner::{CommandOutput, MockRunner};
+        let runner = MockRunner::new()
+            .with_present("pixi")
+            .expect(
+                "pixi global install vim",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "pixi global list --json",
+                CommandOutput {
+                    status: 0,
+                    stdout: r#"[{"name":"vim","exposed":[
+                        {"exposed_name":"xxd","executable":"xxd"},
+                        {"exposed_name":"ex","executable":"ex"},
+                        {"exposed_name":"vim","executable":"vim"}]}]"#
+                        .into(),
+                    stderr: String::new(),
+                },
+            );
+        let t = ToolConfig::from_spec("pixi:vim");
+        let out = install(&t, &runner).unwrap();
+        assert_eq!(out.install_paths.len(), 3);
+        assert!(out.install_paths[0].ends_with("vim"), "{:?}", out.install_paths);
+        assert!(out.install_paths[1].ends_with("ex"));
+        assert!(out.install_paths[2].ends_with("xxd"));
+    }
+
+    #[test]
+    fn install_falls_back_to_package_name_when_list_fails() {
+        // `pixi global list` unavailable → still record a plausible path.
+        use crate::runner::{CommandOutput, MockRunner};
+        let runner = MockRunner::new().with_present("pixi").expect(
+            "pixi global install ripgrep",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
         );
+        let t = ToolConfig::from_spec("pixi:ripgrep");
+        let out = install(&t, &runner).unwrap();
+        assert_eq!(out.install_paths.len(), 1);
+        assert!(out.install_paths[0].ends_with("ripgrep"), "{:?}", out.install_paths);
     }
 
     #[test]

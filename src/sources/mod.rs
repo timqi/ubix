@@ -285,6 +285,25 @@ fn validate_locator(kind: SourceKind, locator: &str) -> Result<()> {
     Ok(())
 }
 
+/// Order discovered executable names: `primary` first, then the rest sorted.
+///
+/// The head of `install_paths` is load-bearing — version backfill probes ONLY
+/// `install_paths[0]` (`cli.rs`), and an auxiliary alias need not answer
+/// `--version` at all. npm's `wrangler` ships `cf-wrangler`/`wrangler`/
+/// `wrangler2` and `cf-wrangler` rejects every probe flag; conda's `vim` exposes
+/// `ex` ahead of `vim` alphabetically. Electing either would leave the record at
+/// the `latest` sentinel and make `decide_action` reinstall on every upgrade.
+///
+/// Sorting the remainder keeps state diffs stable, since neither npm's `bin` map
+/// nor pixi's `exposed` list guarantees an order across versions.
+pub(crate) fn order_exes(mut exes: Vec<String>, primary: &str) -> Vec<String> {
+    exes.sort();
+    if let Some(pos) = exes.iter().position(|e| e == primary) {
+        exes[..=pos].rotate_right(1);
+    }
+    exes
+}
+
 /// Outcome of an install/upgrade operation, used to update state.
 #[derive(Debug, Clone)]
 pub struct InstallOutcome {
@@ -323,6 +342,36 @@ mod tests {
 
     fn p(spec: &str) -> ParsedSpec {
         parse_spec(spec, SourceKind::Github).unwrap()
+    }
+
+    #[test]
+    fn order_exes_puts_primary_first() {
+        // npm: `wrangler` ships cf-wrangler/wrangler/wrangler2. Plain sorting
+        // elects `cf-wrangler`, which answers none of the probe flags, so version
+        // backfill (which reads install_paths[0]) would silently fail and the tool
+        // would be reinstalled on every upgrade.
+        assert_eq!(
+            order_exes(
+                vec!["wrangler2".into(), "cf-wrangler".into(), "wrangler".into()],
+                "wrangler"
+            ),
+            vec!["wrangler", "cf-wrangler", "wrangler2"]
+        );
+        // conda: `vim` exposes `ex`/`view`/`vim`/`xxd`; `ex` sorts first.
+        assert_eq!(
+            order_exes(
+                vec!["xxd".into(), "ex".into(), "vim".into(), "view".into()],
+                "vim"
+            ),
+            vec!["vim", "ex", "view", "xxd"]
+        );
+        // No exe matches the package name (conda `bubblewrap` exposes only
+        // `bwrap`) → sorted, nothing promoted.
+        assert_eq!(
+            order_exes(vec!["bwrap".into()], "bubblewrap"),
+            vec!["bwrap"]
+        );
+        assert_eq!(order_exes(vec!["b".into(), "a".into()], "pkg"), vec!["a", "b"]);
     }
 
     #[test]
