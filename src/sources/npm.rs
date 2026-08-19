@@ -160,6 +160,23 @@ fn query_installed_bins(runner: &dyn CommandRunner, pkg: &str) -> Vec<String> {
     }
 }
 
+/// Order discovered bin names: `primary` first, then the rest sorted.
+///
+/// The head of `install_paths` is load-bearing — version backfill probes ONLY
+/// `install_paths[0]` (`cli.rs`), and an auxiliary alias need not answer
+/// `--version` at all. `wrangler` ships `cf-wrangler`, `wrangler`, `wrangler2`;
+/// sorting alone would elect `cf-wrangler`, which rejects every probe flag, so
+/// the record would stay at the `latest` sentinel and `decide_action` would
+/// reinstall the package on every upgrade. The rest is sorted because `npm ls`
+/// map order is not stable across npm versions and state files get diffed.
+fn order_bins(mut bins: Vec<String>, primary: &str) -> Vec<String> {
+    bins.sort();
+    if let Some(pos) = bins.iter().position(|b| b == primary) {
+        bins[..=pos].rotate_right(1);
+    }
+    bins
+}
+
 /// Decide which entry-point paths to record. Ground truth is what npm reported it
 /// linked (`discovered`); otherwise fall back to explicitly declared `exes`, and
 /// only as a last resort to the unscoped package name.
@@ -169,16 +186,14 @@ fn tracked_paths(
     locator: &str,
     bin_dir: &std::path::Path,
 ) -> Vec<PathBuf> {
-    let mut exes = if !discovered.is_empty() {
-        discovered
+    let exes = if !discovered.is_empty() {
+        order_bins(discovered, unscoped_name(locator))
     } else if let Some(declared) = tool.exes.as_ref().filter(|e| !e.is_empty()) {
+        // An explicit `exes` order is the user's choice — don't reorder it.
         declared.clone()
     } else {
         vec![unscoped_name(locator).to_string()]
     };
-    // Stable ordering: the state file is diffed by humans, and `npm ls` map order
-    // is not guaranteed across npm versions.
-    exes.sort();
     exes.iter().map(|e| bin_dir.join(e)).collect()
 }
 
@@ -494,6 +509,54 @@ mod tests {
         assert!(installed_bins(r#"{"dependencies":{}}"#, "pnpm").is_empty());
         // Present but no `bin` field (a library, not a CLI).
         assert!(installed_bins(r#"{"dependencies":{"lodash":{}}}"#, "lodash").is_empty());
+    }
+
+    #[test]
+    fn order_bins_puts_primary_first() {
+        // Regression: `wrangler` ships cf-wrangler/wrangler/wrangler2. Plain
+        // sorting elects `cf-wrangler`, which answers none of the probe flags, so
+        // version backfill (which reads install_paths[0]) would silently fail and
+        // the tool would be reinstalled on every upgrade.
+        assert_eq!(
+            order_bins(
+                vec!["wrangler2".into(), "cf-wrangler".into(), "wrangler".into()],
+                "wrangler"
+            ),
+            vec!["wrangler", "cf-wrangler", "wrangler2"]
+        );
+        // No bin matches the package name → sorted, nothing promoted.
+        assert_eq!(
+            order_bins(vec!["b".into(), "a".into()], "pkg"),
+            vec!["a", "b"]
+        );
+        // Single bin is unaffected.
+        assert_eq!(order_bins(vec!["dsh".into()], "dsh"), vec!["dsh"]);
+    }
+
+    #[test]
+    fn tracked_paths_head_is_probe_target_for_multi_bin() {
+        // The whole point of the ordering: install_paths[0] must be the bin that
+        // can report a version.
+        let t = ToolConfig::from_spec("npm:wrangler");
+        let got = tracked_paths(
+            vec!["cf-wrangler".into(), "wrangler".into(), "wrangler2".into()],
+            &t,
+            "wrangler",
+            std::path::Path::new("/b"),
+        );
+        assert_eq!(got[0], PathBuf::from("/b/wrangler"));
+        assert_eq!(got.len(), 3);
+    }
+
+    #[test]
+    fn tracked_paths_preserves_declared_exes_order() {
+        // An explicit `exes` list is the user's stated order — never reordered.
+        let mut t = ToolConfig::from_spec("npm:thing");
+        t.exes = Some(vec!["zzz".into(), "aaa".into()]);
+        assert_eq!(
+            tracked_paths(Vec::new(), &t, "thing", std::path::Path::new("/b")),
+            vec![PathBuf::from("/b/zzz"), PathBuf::from("/b/aaa")]
+        );
     }
 
     #[test]
