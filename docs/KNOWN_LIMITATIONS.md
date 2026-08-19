@@ -61,6 +61,13 @@ case works today; each note records the edge and why it was left.
   entry it just rejected; ubix bails with an error instead of synthesizing from a
   version the registry says the entry does not describe.
   (`src/aqua/resolve.rs::select_branch`)
+- **An override's `variants:` are not evaluated.** aqua gates a platform override
+  on runtime variant keys (today only `libc`, glibc vs musl) and skips an override
+  whose variants don't match. ubix doesn't detect libc, so it treats a
+  variants-bearing override as matching — which lands on the glibc entry that
+  registries list first (`anthropics/claude-code`, `just`, 3 others; 28 lines
+  registry-wide). On musl that picks the glibc asset. Detecting libc is a
+  `platform.rs` change plus a runtime probe. (`src/aqua/resolve.rs::pick_override`)
 
 ## bare-name discovery (`add <name>` / `which`)
 - **Branch selection is approximated, not evaluated.** The scanner can't run
@@ -76,17 +83,24 @@ case works today; each note records the edge and why it was left.
   last-listed one made `dineshba/tf-summarize` claim `terraform-plan-summarize`, a
   command it no longer ships. (`src/aqua/registry.rs`, `src/aqua/resolve.rs`)
 - **Command evidence is scoped to the running host.** A platform `overrides[]`
-  entry counts only when its `goos`/`goarch` match this machine, mirroring
-  `resolve::effective_for`. So the same registry gives different answers on
-  different hosts (`ImageMagick/ImageMagick` installs `magick` on linux and eight
-  commands on windows), and a package that names its commands only for platforms
-  you are not on falls back to the package-level `files[]` — or, failing that, to
-  the repo name. A YAML alias (`files: *anchor`) is likewise not resolved by a
-  line scan; the scope inherits instead. Neither case is currently reachable from
-  a `"true"` branch or a base entry. An `envs:`-scoped override (7 lines in the
-  whole registry, one of which declares `files:`) is read as unscoped, so it would
-  apply everywhere — currently unreachable, since that package's `"true"` branch
-  is `no_asset`. (`src/aqua/registry.rs`)
+  entry counts only when its `goos`/`goarch`/`envs:` match this machine, and only
+  the FIRST matching entry is applied — mirroring `resolve::effective_for`. So the
+  same registry gives different answers on different hosts
+  (`ImageMagick/ImageMagick` installs `magick` on linux and eight commands on
+  windows), and a package that names its commands only for platforms you are not
+  on falls back to the package-level `files[]` — or, failing that, to the repo
+  name. A YAML alias (`files: *anchor`) is not resolved by a line scan; the scope
+  inherits instead — currently unreachable from a `"true"` branch or a base entry.
+  `variants:` are not evaluated here either (see above). (`src/aqua/registry.rs`)
+- **A package with no build for this host is reported, not hidden.** When
+  `supported_envs` exclude the host or the entry ubix would install from is
+  `no_asset`, the candidate is marked unavailable: it still appears in
+  `ubix which` (so a linux `ubix which xcodes` explains itself rather than saying
+  "not found"), ranks below anything installable, and never auto-picks — `add`
+  fails with `no linux/amd64 build`. 37 of 2277 packages are in that state on
+  linux/amd64. What it can NOT see is a package that is unavailable only because
+  no asset template resolves for the host; that needs the full synthesis path.
+  (`src/aqua/registry.rs`, `src/discover.rs`)
 - **A mirror that declares the same command ties with upstream.** Matching now
   follows the commands a package is known to INSTALL, so `ubix which rg` lists
   `BurntSushi/ripgrep` first — but `microsoft/ripgrep-prebuilt` declares `rg` too,

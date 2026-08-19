@@ -1373,6 +1373,15 @@ impl App {
             return installable_spec(query, hit);
         }
 
+        // Nothing here installs on this host, so there is no choice to prompt for.
+        if hits.iter().all(|h| h.candidate.unavailable) {
+            print_discovery(query, &hits, DISCOVERY_LIMIT);
+            bail!(
+                "no `{query}` candidate has a {}/{} build in the aqua registry",
+                crate::platform::goos(),
+                crate::platform::goarch()
+            );
+        }
         print_discovery(query, &hits, DISCOVERY_LIMIT);
         // `--yes` means "don't ask me", so it must not stop at a prompt either —
         // it goes straight to the explanatory error.
@@ -1438,6 +1447,13 @@ impl App {
                 "# `ubix add {query}` installs {} (matched on {})",
                 h.spec.as_deref().unwrap_or("-"),
                 h.why.label()
+            ),
+            // A lone hit the registry rules out on this host is not a CHOICE the
+            // user can make differently; say so instead of offering `--pick`.
+            None if hits.iter().all(|h| h.candidate.unavailable) => println!(
+                "# `ubix add {query}` has no {}/{} build in the aqua registry",
+                crate::platform::goos(),
+                crate::platform::goarch()
             ),
             None => println!(
                 "# ambiguous: `ubix add {query}` stops and asks — choose with `--pick N` \
@@ -1731,6 +1747,14 @@ fn installable_spec(query: &str, hit: &crate::discover::Hit) -> Result<(String, 
             hit.candidate.kind
         )
     })?;
+    if hit.candidate.unavailable {
+        bail!(
+            "{} has no {}/{} build in the aqua registry",
+            hit.candidate.pkg_path(),
+            crate::platform::goos(),
+            crate::platform::goarch()
+        );
+    }
     Ok((spec, commands_note(query, &hit.candidate)))
 }
 
@@ -1740,6 +1764,13 @@ fn installable_spec(query: &str, hit: &crate::discover::Hit) -> Result<(String, 
 /// Naming the real binary is the fastest way to tell a genuine hit from a
 /// same-named lookalike.
 fn commands_note(query: &str, c: &crate::aqua::registry::Candidate) -> String {
+    if c.unavailable {
+        return format!(
+            "no {}/{} build",
+            crate::platform::goos(),
+            crate::platform::goarch()
+        );
+    }
     let cmds = c.command_names();
     // Nothing to say when the package installs exactly what was asked for —
     // including when only an override declares it (`sharkdp/bat` → `bat`).

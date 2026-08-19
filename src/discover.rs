@@ -146,7 +146,13 @@ pub fn rank(cands: &[Candidate], query: &str) -> Vec<Hit> {
             })
         })
         .collect();
-    hits.sort_by(|a, b| b.score.cmp(&a.score));
+    // Score first; among equals, one that installs something on THIS host beats
+    // one the registry rules out here (`aqua:ahkohd/oyo` is darwin-only).
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then(a.candidate.unavailable.cmp(&b.candidate.unavailable))
+    });
     // Collapse rows that would install the exact same thing, keeping the
     // best-scoring one. Without this, a repo listed twice in the registry reads
     // as a tie and [`pick`] would refuse a choice that has only one outcome.
@@ -164,7 +170,9 @@ pub fn rank(cands: &[Candidate], query: &str) -> Vec<Hit> {
 /// `rootlesskit`/`vpnkit`, so it does NOT provide `rootless` even though its
 /// package name ends that way.
 fn provides(c: &Candidate, q: &str) -> bool {
-    c.commands().1.iter().any(|n| n.to_ascii_lowercase() == *q)
+    // A package the registry says installs nothing here provides nothing here,
+    // whatever its `files[]` advertise for other platforms.
+    !c.unavailable && c.commands().1.iter().any(|n| n.to_ascii_lowercase() == *q)
 }
 
 /// The strongest reason `c` matches the (already lowercased) `q`, if any.
@@ -208,9 +216,9 @@ fn why_matched(c: &Candidate, q: &str) -> Option<Why> {
 
 /// The unambiguous winner among ranked `hits`, if there is one.
 ///
-/// Four conditions, all required, so `add` never silently installs a guess:
-/// the top hit matched EXACTLY, ubix can install it, no other candidate scored
-/// as high, and it is not SHADOWED — i.e. its own `files[]` don't prove it
+/// Five conditions, all required, so `add` never silently installs a guess:
+/// the top hit matched EXACTLY, ubix can install it, the registry does not rule
+/// this host out, no other candidate scored as high, and it is not SHADOWED — i.e. its own `files[]` don't prove it
 /// installs some other command while a rival exact match does install the one
 /// that was asked for.
 ///
@@ -222,7 +230,12 @@ pub fn pick(hits: &[Hit]) -> Option<&Hit> {
     let top = hits.first()?;
     let unique = hits.get(1).is_none_or(|next| next.score < top.score);
     let shadowed = !top.provides && hits[1..].iter().any(|h| h.provides && h.why.is_exact());
-    (top.why.is_exact() && top.spec.is_some() && unique && !shadowed).then_some(top)
+    (top.why.is_exact()
+        && top.spec.is_some()
+        && !top.candidate.unavailable
+        && unique
+        && !shadowed)
+        .then_some(top)
 }
 
 #[cfg(test)]

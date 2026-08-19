@@ -161,8 +161,9 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
     if vo.version_prefix.is_some() {
         b.version_prefix = vo.version_prefix.clone();
     }
-    if !vo.overrides.is_empty() {
-        b.overrides = vo.overrides.clone();
+    // Declared, even as `overrides: []`, replaces the package's; omitted inherits.
+    if let Some(ov) = &vo.overrides {
+        b.overrides = ov.clone();
     }
     if vo.type_.is_some() {
         b.type_ = vo.type_.clone();
@@ -173,9 +174,9 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
     b
 }
 
-/// Resolve the effective fields for a single (goos, goarch), applying the
-/// matching platform override (specificity-first). Returns `Ok(None)` when the
-/// platform is unavailable (unsupported env or `no_asset`).
+/// Resolve the effective fields for a single (goos, goarch), applying the one
+/// matching platform override. Returns `Ok(None)` when the platform is
+/// unavailable (unsupported env, `no_asset`, or no asset template at all).
 pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option<Effective>> {
     // A branch marked `no_asset` has no binary for any platform → unavailable.
     if branch.no_asset {
@@ -191,9 +192,6 @@ pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option
     let mut replacements = branch.replacements.clone();
 
     if let Some(ov) = pick_override(&branch.overrides, goos, goarch) {
-        if ov.no_asset {
-            return Ok(None);
-        }
         if ov.asset.is_some() {
             asset = ov.asset.clone();
         }
@@ -247,42 +245,48 @@ pub fn env_supported(supported_envs: &[String], goos: &str, goarch: &str) -> boo
     })
 }
 
-/// Pick the matching platform override with **specificity-first** priority
-/// (plan §7): `goos+goarch` > `goos`-only > (goarch-only) > unconstrained;
-/// list order only as a tiebreaker within the same specificity.
+/// Pick the platform override that applies to `(goos, goarch)`.
+///
+/// aqua takes the FIRST match in declaration order (`PackageInfo.getOverride`
+/// → `Override.Match`); there is no specificity ranking, so a registry that
+/// lists a broad entry before a narrower one gets the broad one. Only one
+/// override is ever applied.
 fn pick_override<'a>(
     overrides: &'a [PlatformOverride],
     goos: &str,
     goarch: &str,
 ) -> Option<&'a PlatformOverride> {
-    // Score: higher = more specific. -1 = does not apply.
-    fn score(ov: &PlatformOverride, goos: &str, goarch: &str) -> i32 {
-        let os_ok = ov.goos.as_deref().map(|g| g == goos);
-        let arch_ok = ov.goarch.as_deref().map(|a| a == goarch);
-        match (os_ok, arch_ok) {
-            // both specified and match → most specific
-            (Some(true), Some(true)) => 3,
-            (Some(true), None) => 2,       // goos-only
-            (None, Some(true)) => 1,       // goarch-only
-            (None, None) => 0,             // unconstrained
-            // any explicit mismatch → does not apply
-            (Some(false), _) | (_, Some(false)) => -1,
-        }
-    }
+    overrides.iter().find(|ov| {
+        override_matches(
+            ov.goos.as_deref(),
+            ov.goarch.as_deref(),
+            ov.envs.as_deref(),
+            goos,
+            goarch,
+        )
+    })
+}
 
-    let mut best: Option<(&PlatformOverride, i32)> = None;
-    for ov in overrides {
-        let s = score(ov, goos, goarch);
-        if s < 0 {
-            continue;
-        }
-        match best {
-            // strictly greater specificity wins; equal keeps the earlier (list order)
-            Some((_, bs)) if s <= bs => {}
-            _ => best = Some((ov, s)),
-        }
+/// Whether a platform override applies to `(goos, goarch)`: a declared
+/// `goos`/`goarch` must equal it, and a declared `envs:` must list it.
+///
+/// Shared with the root-index scanner ([`crate::aqua::registry`]) so discovery
+/// reports the commands from the same override the installer will apply.
+///
+/// aqua also gates on `variants:` (currently only `libc`), which ubix does not
+/// model — see `docs/KNOWN_LIMITATIONS.md`.
+pub fn override_matches(
+    ov_goos: Option<&str>,
+    ov_goarch: Option<&str>,
+    ov_envs: Option<&[String]>,
+    goos: &str,
+    goarch: &str,
+) -> bool {
+    if ov_goos.is_some_and(|g| g != goos) || ov_goarch.is_some_and(|a| a != goarch) {
+        return false;
     }
-    best.map(|(ov, _)| ov)
+    // An `envs:` list is a filter, not a default: absent ⇒ every platform.
+    ov_envs.is_none_or(|e| env_supported(e, goos, goarch))
 }
 
 // ---- version constraint evaluation ----
@@ -536,8 +540,9 @@ packages:
     }
 
     #[test]
-    fn merge_specificity_goos_arch_beats_goos_only_regardless_of_order() {
-        // goos-only listed BEFORE goos+goarch → the more specific one must win.
+    fn pick_override_takes_the_first_match_in_declaration_order() {
+        // goos-only listed BEFORE goos+goarch → the broader one still wins,
+        // because aqua stops at the first `Override.Match`.
         let overrides = vec![
             PlatformOverride {
                 goos: Some("linux".into()),
@@ -552,10 +557,15 @@ packages:
             },
         ];
         let picked = pick_override(&overrides, "linux", "arm64").unwrap();
-        assert_eq!(picked.format.as_deref(), Some("tar.xz"));
-        // linux/amd64 has no goos+goarch match → falls to goos-only.
-        let picked2 = pick_override(&overrides, "linux", "amd64").unwrap();
-        assert_eq!(picked2.format.as_deref(), Some("tar.gz"));
+        assert_eq!(picked.format.as_deref(), Some("tar.gz"));
+        // A declared goos/goarch that mismatches rules an entry out entirely.
+        assert!(pick_override(&overrides, "darwin", "arm64").is_none());
+        // Reversed, the narrower entry is reached first.
+        let reversed: Vec<_> = overrides.into_iter().rev().collect();
+        assert_eq!(
+            pick_override(&reversed, "linux", "arm64").unwrap().format.as_deref(),
+            Some("tar.xz")
+        );
     }
 
     #[test]
@@ -583,20 +593,59 @@ packages:
     }
 
     #[test]
-    fn no_asset_makes_platform_unavailable() {
+    fn the_first_matching_override_wins_not_the_most_specific() {
+        // aqua's `getOverride` returns the first match in declaration order, so a
+        // broad entry listed first shadows a narrower one after it.
         let branch = Branch {
-            asset: Some("x-{{.OS}}".into()),
-            format: Some("raw".into()),
-            overrides: vec![PlatformOverride {
-                goos: Some("linux".into()),
-                no_asset: true,
-                ..Default::default()
-            }],
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("broad".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    goarch: Some("amd64".into()),
+                    asset: Some("narrow".into()),
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
         };
-        assert!(effective_for(&branch, "linux", "amd64").unwrap().is_none());
-        // darwin unaffected.
-        assert!(effective_for(&branch, "darwin", "amd64").unwrap().is_some());
+        let eff = effective_for(&branch, "linux", "amd64").unwrap().unwrap();
+        assert_eq!(eff.asset, "broad");
+    }
+
+    #[test]
+    fn an_override_envs_list_gates_it_like_supported_envs() {
+        // `eza-community/eza` leads with an `envs:`-only override that must not
+        // apply on linux, letting the goos-scoped one after it win.
+        let branch = Branch {
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    envs: Some(vec!["darwin".into(), "windows/arm64".into()]),
+                    asset: Some("mac-or-winarm".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("linux".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(effective_for(&branch, "linux", "amd64").unwrap().unwrap().asset, "linux");
+        assert_eq!(
+            effective_for(&branch, "darwin", "arm64").unwrap().unwrap().asset,
+            "mac-or-winarm"
+        );
+        assert_eq!(
+            effective_for(&branch, "windows", "amd64").unwrap().unwrap().asset,
+            "base"
+        );
     }
 
     #[test]

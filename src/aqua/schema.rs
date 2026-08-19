@@ -107,12 +107,16 @@ pub struct VersionOverride {
     pub no_asset: bool,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
+    /// `Option` because DECLARING `overrides: []` clears the package's, while
+    /// omitting the key inherits them — aqua distinguishes the two with a nil
+    /// check (`overrideVersion`, `if child.Overrides != nil`).
     #[serde(default)]
-    pub overrides: Vec<PlatformOverride>,
+    pub overrides: Option<Vec<PlatformOverride>>,
 }
 
 /// An `overrides[]` entry: platform-scoped field tweaks. `goos`/`goarch`
-/// select which platforms it applies to (specificity-first match, plan §7).
+/// select which platforms it applies to. aqua applies the FIRST entry that
+/// matches, in declaration order — see [`pick_override`](super::resolve).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PlatformOverride {
@@ -130,9 +134,10 @@ pub struct PlatformOverride {
     pub files: Option<Vec<FileEntry>>,
     #[serde(default)]
     pub replacements: Option<BTreeMap<String, String>>,
-    /// `no_asset: true` → this platform has no downloadable asset (unavailable).
+    /// `envs:` — an extra platform filter on top of `goos`/`goarch`, with the
+    /// same entry syntax as `supported_envs` (aqua's `Override.Envs`).
     #[serde(default)]
-    pub no_asset: bool,
+    pub envs: Option<Vec<String>>,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
 }
@@ -173,7 +178,8 @@ mod tests {
         // The `"true"` branch carries a linux→tar.gz override and darwin replacement.
         let last = p.version_overrides.last().unwrap();
         assert_eq!(last.version_constraint.as_deref(), Some("true"));
-        assert!(last.overrides.iter().any(|o| o.goos.as_deref() == Some("linux")
+        assert!(last.overrides.as_ref().unwrap().iter().any(|o| o.goos.as_deref()
+            == Some("linux")
             && o.format.as_deref() == Some("tar.gz")));
         assert_eq!(last.replacements.as_ref().unwrap()["darwin"], "macOS");
     }

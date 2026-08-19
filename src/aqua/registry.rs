@@ -200,6 +200,11 @@ pub struct Candidate {
     /// union, and only this one describes a current install. Evidence only —
     /// never matched against a query (see `docs/KNOWN_LIMITATIONS.md`).
     pub override_exes: Vec<String>,
+    /// The registry says this package installs NOTHING on this host: its
+    /// `supported_envs` exclude it, or the entry ubix would install from is
+    /// `no_asset`. `aqua:ahkohd/oyo` (`oy`) is darwin-only, so discovery still
+    /// reports it for a linux `ubix add oy` — but as a dead end, never a pick.
+    pub unavailable: bool,
 }
 
 /// How sure we are about the commands a package installs.
@@ -268,18 +273,35 @@ enum Block {
     Description,
 }
 
-/// Which `files:` list the scanner is reading `name:` entries into, and the
-/// indent of the `files:` key that opened it (entries sit two columns deeper).
+/// Which list the scanner is currently reading entries into.
 #[derive(PartialEq, Eq, Clone, Copy)]
-enum Sink {
-    /// The package's own `files:` — the list a query matches on.
+enum List {
+    /// `files:` — entries are `- name: <command>` mappings.
+    Files,
+    /// `supported_envs:` (a package or branch) or `envs:` (a platform override)
+    /// — entries are plain scalars.
+    Envs,
+}
+
+/// Whose list it is. A package's own and a branch's are kept apart because a
+/// branch REPLACES what it declares rather than adding to it.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Scope {
+    /// The package entry itself.
     Package,
-    /// A base-level platform `overrides[].files:`.
-    BaseOverride,
-    /// The current branch's own `files:`.
+    /// The `version_overrides` branch being scanned.
     Branch,
-    /// A platform `overrides[].files:` inside the current branch.
-    BranchOverride,
+    /// The platform `overrides[]` item being scanned, in either of those.
+    Override,
+}
+
+/// The list being read, and the indent of the key that opened it (entries sit
+/// two columns deeper).
+#[derive(PartialEq, Eq, Clone, Copy)]
+struct Sink {
+    list: List,
+    scope: Scope,
+    at: usize,
 }
 
 /// How a `files:` / `overrides:` key declares its list.
@@ -312,66 +334,69 @@ fn list_decl(line: &str, key: &str) -> Option<ListDecl> {
 struct OverrideBuf {
     goos: Option<String>,
     goarch: Option<String>,
-    /// `files:` declared by this item; `None` when it declares none.
+    /// `files:` declared by this item; `None` when it declares none (the scope's
+    /// own list is then inherited, exactly as in `effective_for`).
     files: Option<Vec<String>>,
+    /// `envs:` — an extra platform filter on top of `goos`/`goarch`.
+    envs: Option<Vec<String>>,
 }
 
-impl OverrideBuf {
-    /// aqua's specificity rank for `(os, arch)` — higher wins — or `None` when the
-    /// item does not apply to this host at all. Mirrors
-    /// [`effective_for`](super::resolve::effective_for): an absent `goos`/`goarch`
-    /// matches everything, and a declared one must match exactly.
-    fn rank(&self, os: &str, arch: &str) -> Option<u8> {
-        let applies = |decl: Option<&str>, host: &str| decl.is_none_or(|d| d == host);
-        if !applies(self.goos.as_deref(), os) || !applies(self.goarch.as_deref(), arch) {
-            return None;
-        }
-        Some(u8::from(self.goos.is_some()) + u8::from(self.goarch.is_some()))
-    }
-}
-
-/// The `files:` and platform `overrides:` of one scope — a package base, or one of
-/// its `version_overrides` branches.
+/// The `files:`, platform `overrides:` and `supported_envs:` of one scope — a
+/// package base, or one of its `version_overrides` branches.
 ///
-/// Both are `Option` because DECLARING either replaces what a branch would
-/// inherit while declaring nothing inherits it, and the two fields are
-/// independent (`docker/hub-tool`'s `"true"` branch declares `overrides: []`,
-/// clearing the base's while keeping its `files:`).
+/// All three are `Option` because DECLARING one replaces what a branch would
+/// inherit while declaring nothing inherits it, and they are independent
+/// (`docker/hub-tool`'s `"true"` branch declares `overrides: []`, clearing the
+/// base's while keeping its `files:`). aqua draws the same distinction with a nil
+/// check in `overrideVersion`.
 #[derive(Default)]
 struct FileScope {
     files: Option<Vec<String>>,
     overrides: Option<Vec<OverrideBuf>>,
+    envs: Option<Vec<String>>,
 }
 
+/// What a scope installs on one host: the commands, or [`None`] when the host
+/// gets nothing at all (unsupported env, or `no_asset`).
+type Outcome<'a> = Option<Option<&'a [String]>>;
+
 impl FileScope {
-    /// The commands this scope installs on `(os, arch)` when it stands alone.
-    fn effective(&self, os: &str, arch: &str) -> Option<&[String]> {
+    /// [`Self::effective_over`] for a scope that stands alone (the package base).
+    fn effective(&self, os: &str, arch: &str) -> Outcome<'_> {
         self.effective_over(self, os, arch)
     }
 
-    /// The commands this scope installs on `(os, arch)` when it is a branch
-    /// layered onto the package `base`: each field it does not declare is
-    /// inherited ([`merge_branch`](super::resolve::merge_branch)), and only then
-    /// does the host's platform override replace the list
-    /// ([`merge_platform`](super::resolve::merge_platform)).
+    /// What this scope installs on `(os, arch)` when it is a branch layered onto
+    /// the package `base`: each field it does not declare is inherited
+    /// ([`merge_branch`](super::resolve::merge_branch)), then the FIRST platform
+    /// override that applies is layered on
+    /// ([`effective_for`](super::resolve::effective_for)).
     ///
     /// Platform scoping cuts both ways: `jgm/pandoc` and `ImageMagick/ImageMagick`
     /// name their commands ONLY under a `goos: linux` override, while
     /// `kubernetes/node-problem-detector` names windows `.exe` variants a linux
-    /// install never produces.
-    fn effective_over<'a>(&'a self, base: &'a FileScope, os: &str, arch: &str) -> Option<&'a [String]> {
+    /// install never produces. Note that ONE override wins outright — if it
+    /// declares no `files:`, the inherited list stands even when a later override
+    /// declares one, which is what `effective_for` does.
+    fn effective_over<'a>(&'a self, base: &'a FileScope, os: &str, arch: &str) -> Outcome<'a> {
+        let envs = self.envs.as_deref().or(base.envs.as_deref()).unwrap_or_default();
+        if !super::resolve::env_supported(envs, os, arch) {
+            return None;
+        }
+        let files = || self.files.as_deref().or(base.files.as_deref());
         let overrides = self.overrides.as_deref().or(base.overrides.as_deref());
-        let best = overrides
-            .unwrap_or_default()
-            .iter()
-            .filter(|o| o.files.is_some())
-            // Equal specificity → the later declaration wins, as merging in
-            // declaration order does (`max_by_key` keeps the last maximum).
-            .filter_map(|o| Some((o.rank(os, arch)?, o)))
-            .max_by_key(|(rank, _)| *rank);
-        match best {
-            Some((_, o)) => o.files.as_deref(),
-            None => self.files.as_deref().or(base.files.as_deref()),
+        let applied = overrides.unwrap_or_default().iter().find(|o| {
+            super::resolve::override_matches(
+                o.goos.as_deref(),
+                o.goarch.as_deref(),
+                o.envs.as_deref(),
+                os,
+                arch,
+            )
+        });
+        match applied {
+            Some(o) => Some(o.files.as_deref().or_else(files)),
+            None => Some(files()),
         }
     }
 }
@@ -395,11 +420,14 @@ struct PkgBuf {
     branches: Vec<BranchBuf>,
     /// The package-level `version_constraint`.
     constraint: Option<String>,
+    /// A package-level `no_asset: true`.
+    no_asset: bool,
 }
 
 impl PkgBuf {
-    /// The commands a current release installs on `(os, arch)`, or empty when the
-    /// registry does not say (see [`Candidate::override_exes`]).
+    /// What a current release installs on `(os, arch)`: `None` when this host gets
+    /// nothing, else the commands — empty when the registry does not say (see
+    /// [`Candidate::override_exes`]).
     ///
     /// Mirrors [`select_branch`](super::resolve::select_branch) as far as a scan
     /// can: aqua reads `version_overrides` only when the package-level
@@ -412,20 +440,19 @@ impl PkgBuf {
     /// branch is constrained, which applies is a function of the version being
     /// installed, and guessing the last-listed one made `dineshba/tf-summarize`
     /// claim `terraform-plan-summarize`, a command it no longer ships.
-    fn commands(&self, os: &str, arch: &str) -> Vec<String> {
+    fn commands(&self, os: &str, arch: &str) -> Outcome<'_> {
+        if self.no_asset {
+            return None;
+        }
         if self.constraint.as_deref() != Some("false") {
-            return self.base.effective(os, arch).unwrap_or_default().to_vec();
+            return self.base.effective(os, arch);
         }
         match self.branches.iter().find(|b| b.is_true) {
-            // The branch installs nothing, so the commands it would inherit say
-            // nothing either. (Empty means "no evidence", so the caller falls back
-            // to the package-level list — `apache/tomcat`, the one package whose
-            // `"true"` branch is `no_asset`, still reads as installing
-            // `catalina.sh`. Saying "installs nothing" needs a tri-state
-            // [`Candidate`] field, which one package does not pay for.)
-            Some(b) if b.no_asset => Vec::new(),
-            Some(b) => b.scope.effective_over(&self.base, os, arch).unwrap_or_default().to_vec(),
-            None => Vec::new(),
+            Some(b) if b.no_asset => None,
+            Some(b) => b.scope.effective_over(&self.base, os, arch),
+            // Every branch is constrained: which one applies depends on the
+            // version, so claim neither commands nor unavailability.
+            None => Some(None),
         }
     }
 
@@ -441,6 +468,30 @@ impl PkgBuf {
     /// The platform `overrides[]` item being scanned in the current scope.
     fn override_item(&mut self) -> Option<&mut OverrideBuf> {
         self.scope().overrides.as_mut()?.last_mut()
+    }
+
+    /// The list a [`Sink`] feeds, creating it if the key that opened it has not
+    /// been recorded yet. `None` when the item it belongs to is missing (a
+    /// malformed `overrides:` with no `- ` item).
+    fn list(&mut self, sink: Sink) -> Option<&mut Vec<String>> {
+        let (files, envs) = match sink.scope {
+            Scope::Package => (&mut self.base.files, &mut self.base.envs),
+            Scope::Branch => {
+                let s = self.scope();
+                (&mut s.files, &mut s.envs)
+            }
+            Scope::Override => {
+                let item = self.override_item()?;
+                (&mut item.files, &mut item.envs)
+            }
+        };
+        Some(
+            match sink.list {
+                List::Files => files,
+                List::Envs => envs,
+            }
+            .get_or_insert_default(),
+        )
     }
 }
 
@@ -476,8 +527,8 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
     let mut cur: Option<Candidate> = None;
     let mut pkg = PkgBuf::default();
     let mut block = Block::None;
-    // The `files:` list being read, and the indent of its key.
-    let mut sink: Option<(Sink, usize)> = None;
+    // The `files:` / env list being read, and where its key sits.
+    let mut sink: Option<Sink> = None;
     // Which indent-4 list the deeper lines belong to.
     let mut in_base_overrides = false;
     let mut in_branches = false;
@@ -503,25 +554,26 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
             continue;
         }
         // A key at or left of the `files:` that opened the list ends it.
-        if sink.is_some_and(|(_, at)| indent <= at) {
+        if sink.is_some_and(|s| indent <= s.at) {
             sink = None;
         }
         // An entry of the `files:` list currently open, whatever depth it sits at.
         // Checked before the structural arms below, since a `files:` may be opened
         // by any of them and its entries then land on THEIR field indent.
-        if let Some((target, at)) = sink {
-            if indent == at + 2 {
-                if let Some(v) = field(t.strip_prefix("- ").unwrap_or(t), "name:") {
-                    let names = match target {
-                        Sink::Package => pkg.base.files.get_or_insert_default(),
-                        Sink::Branch => pkg.scope().files.get_or_insert_default(),
-                        Sink::BaseOverride | Sink::BranchOverride => match pkg.override_item() {
-                            Some(item) => item.files.get_or_insert_default(),
-                            None => continue,
-                        },
-                    };
-                    if !names.iter().any(|e| e == v) {
-                        names.push(v.to_string());
+        if let Some(target) = sink {
+            if indent == target.at + 2 {
+                let entry = t.strip_prefix("- ").unwrap_or(t);
+                // `files:` entries are mappings keyed by `name:`; env entries are
+                // bare scalars (`- darwin`, `- windows/arm64`).
+                let value = match target.list {
+                    List::Files => field(entry, "name:"),
+                    List::Envs => t
+                        .strip_prefix("- ")
+                        .map(|v| v.trim().trim_matches('"').trim_matches('\'')),
+                };
+                if let (Some(v), Some(items)) = (value, pkg.list(target)) {
+                    if !items.iter().any(|e| e == v) {
+                        items.push(v.to_string());
                     }
                 }
                 continue;
@@ -545,12 +597,14 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
             4 => {
                 let files = list_decl(t, "files:");
                 let overrides = list_decl(t, "overrides:");
+                let envs = list_decl(t, "supported_envs:");
                 in_base_overrides = overrides == Some(ListDecl::Open);
                 in_branches = t == "version_overrides:";
                 in_branch_overrides = false;
                 if let Some(v) = field(t, "version_constraint:") {
                     pkg.constraint = Some(v.to_string());
                 }
+                pkg.no_asset |= field(t, "no_asset:") == Some("true");
                 block = match t {
                     "aliases:" => Block::Aliases,
                     _ if is_block_description(t) => Block::Description,
@@ -562,9 +616,14 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
                 if overrides.is_some() {
                     pkg.base.overrides = Some(Vec::new());
                 }
-                if files == Some(ListDecl::Open) {
-                    sink = Some((Sink::Package, indent));
+                if envs.is_some() {
+                    pkg.base.envs = Some(Vec::new());
                 }
+                sink = match (files, envs) {
+                    (Some(ListDecl::Open), _) => Some(Sink { list: List::Files, scope: Scope::Package, at: indent }),
+                    (_, Some(ListDecl::Open)) => Some(Sink { list: List::Envs, scope: Scope::Package, at: indent }),
+                    _ => sink,
+                };
                 if let Some(c) = cur.as_mut() {
                     if block == Block::Description {
                         // The `|`/`>` marker is not the text; the following lines are.
@@ -584,8 +643,12 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
                     in_branch_overrides = false;
                 }
                 if in_base_overrides || in_branches {
-                    // The item's first field rides the dash line.
-                    absorb_scope_field(&mut pkg, entry, in_base_overrides, &mut in_branch_overrides, &mut sink, indent);
+                    // The item's first field rides the dash line, so it sits two
+                    // columns right of the dash — where the item's other fields
+                    // are. Passing the dash's own indent would make a list opened
+                    // here swallow the sibling key that follows it.
+                    let at = if t.starts_with("- ") { indent + 2 } else { indent };
+                    absorb_scope_field(&mut pkg, entry, in_base_overrides, &mut in_branch_overrides, &mut sink, at);
                 } else if block == Block::Aliases {
                     if let (Some(v), Some(c)) = (field(entry, "name:"), cur.as_mut()) {
                         c.aliases.push(v.to_string());
@@ -604,7 +667,8 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
                 let entry = if indent == 10 { t.strip_prefix("- ") } else { None };
                 if let Some(entry) = entry {
                     pkg.scope().overrides.get_or_insert_default().push(OverrideBuf::default());
-                    absorb_scope_field(&mut pkg, entry, false, &mut in_branch_overrides, &mut sink, indent);
+                    // Same dash-line offset as at indent 6, above.
+                    absorb_scope_field(&mut pkg, entry, false, &mut in_branch_overrides, &mut sink, indent + 2);
                 } else {
                     absorb_scope_field(&mut pkg, t, false, &mut in_branch_overrides, &mut sink, indent);
                 }
@@ -625,27 +689,31 @@ fn absorb_scope_field(
     t: &str,
     base_override: bool,
     in_branch_overrides: &mut bool,
-    sink: &mut Option<(Sink, usize)>,
+    sink: &mut Option<Sink>,
     indent: usize,
 ) {
+    let in_override = base_override || *in_branch_overrides;
+    let scope = if in_override { Scope::Override } else { Scope::Branch };
     if let Some(decl) = list_decl(t, "files:") {
-        let target = match (base_override, *in_branch_overrides) {
-            (true, _) => Sink::BaseOverride,
-            (_, true) => Sink::BranchOverride,
-            _ => Sink::Branch,
-        };
-        match target {
-            Sink::Branch => pkg.scope().files = Some(Vec::new()),
-            _ => {
-                if let Some(item) = pkg.override_item() {
-                    item.files = Some(Vec::new());
-                }
-            }
+        // Record the key even when the list is inline-empty (`files: []`), which
+        // DECLARES an empty list rather than inheriting one.
+        if let Some(items) = pkg.list(Sink { list: List::Files, scope, at: indent }) {
+            items.clear();
         }
-        *sink = (decl == ListDecl::Open).then_some((target, indent));
+        *sink = (decl == ListDecl::Open).then_some(Sink { list: List::Files, scope, at: indent });
         return;
     }
-    if !base_override && !*in_branch_overrides {
+    // `envs:` scopes ONE platform override; `supported_envs:` scopes a whole
+    // branch. aqua spells them differently and they never appear together.
+    let env_key = if in_override { "envs:" } else { "supported_envs:" };
+    if let Some(decl) = list_decl(t, env_key) {
+        if let Some(items) = pkg.list(Sink { list: List::Envs, scope, at: indent }) {
+            items.clear();
+        }
+        *sink = (decl == ListDecl::Open).then_some(Sink { list: List::Envs, scope, at: indent });
+        return;
+    }
+    if !in_override {
         if let Some(decl) = list_decl(t, "overrides:") {
             // A branch declaring its own platform overrides replaces the base's —
             // including `overrides: []`, which clears them.
@@ -654,7 +722,7 @@ fn absorb_scope_field(
             return;
         }
     }
-    if base_override || *in_branch_overrides {
+    if in_override {
         for (key, set) in [("goos:", true), ("goarch:", false)] {
             if let Some(v) = field(t, key) {
                 if let Some(item) = pkg.override_item() {
@@ -693,9 +761,13 @@ fn finish_package(
 ) {
     let Some(mut c) = cand else { return };
     c.exes = pkg.base.files.clone().unwrap_or_default();
-    let cmds = pkg.commands(os, arch);
-    // `override_exes` records only what OVERRIDES the matched list.
-    c.override_exes = if cmds == c.exes { Vec::new() } else { cmds };
+    match pkg.commands(os, arch) {
+        // The registry says this host installs nothing at all.
+        None => c.unavailable = true,
+        // `override_exes` records only what OVERRIDES the matched list.
+        Some(Some(cmds)) if cmds != c.exes.as_slice() => c.override_exes = cmds.to_vec(),
+        Some(_) => {}
+    }
     push_candidate(out, seen, Some(c));
 }
 
@@ -1202,7 +1274,9 @@ packages:
     /// report windows/qemu binaries as the commands of a linux install.
     #[test]
     fn parse_index_ignores_platform_files_nested_in_the_selected_branch() {
-        let cands = parse_index(
+        // Pinned to a non-windows host: the override below deliberately does not
+        // apply, and the assertions describe exactly that.
+        let cands = parse_index_on(
             r#"
 packages:
   - repo_owner: kubernetes
@@ -1220,6 +1294,8 @@ packages:
               - name: node-problem-detector.exe
               - name: health-checker.exe
 "#,
+            "linux",
+            "amd64",
         );
         let c = &cands[0];
         assert!(c.override_exes.is_empty(), "{:?}", c.override_exes);
@@ -1317,14 +1393,63 @@ packages:
         assert_eq!(c.commands(), (Certainty::Declared, vec!["generic-b"]));
     }
 
-    /// `effective_for` picks the MOST SPECIFIC applying override: `goos`+`goarch`
-    /// outranks `goos` alone, and equal specificity is decided by declaration
-    /// order, since aqua merges them one after another.
+    /// A package whose `supported_envs` exclude this host installs nothing here,
+    /// however many commands its `files[]` advertise (`aqua:ahkohd/oyo` is
+    /// darwin-only, so a linux `ubix add oy` is a dead end, not a pick).
     #[test]
-    fn parse_index_prefers_the_most_specific_platform_override() {
+    fn parse_index_marks_a_package_unsupported_here_as_unavailable() {
+        let yaml = "packages:\n  - repo_owner: ahkohd\n    repo_name: oyo\n    files:\n      - name: oy\n    supported_envs:\n      - darwin\n";
+        let linux = &parse_index_on(yaml, "linux", "amd64")[0];
+        assert!(linux.unavailable);
+        // The advertised list is still reported — it is what OTHER hosts get.
+        assert_eq!(linux.exes, vec!["oy"]);
+        let mac = &parse_index_on(yaml, "darwin", "arm64")[0];
+        assert!(!mac.unavailable);
+    }
+
+    /// `supported_envs` declared by the branch we install from replaces the
+    /// package's, exactly as `merge_branch` does.
+    #[test]
+    fn parse_index_lets_the_selected_branch_replace_supported_envs() {
+        let yaml = "packages:\n  - repo_owner: a\n    repo_name: b\n    supported_envs:\n      - darwin\n    version_constraint: \"false\"\n    version_overrides:\n      - version_constraint: \"true\"\n        supported_envs:\n          - linux/amd64\n        files:\n          - name: b-linux\n";
+        let c = &parse_index_on(yaml, "linux", "amd64")[0];
+        assert!(!c.unavailable, "the branch widened the envs to this host");
+        assert_eq!(c.commands(), (Certainty::Declared, vec!["b-linux"]));
+        // …and narrowed them away from the package's own darwin.
+        assert!(parse_index_on(yaml, "darwin", "arm64")[0].unavailable);
+    }
+
+    /// A branch marked `no_asset` installs nothing anywhere — `apache/tomcat`'s
+    /// `"true"` branch is the registry's one real case.
+    #[test]
+    fn parse_index_marks_a_no_asset_branch_as_unavailable() {
+        let yaml = "packages:\n  - repo_owner: apache\n    repo_name: tomcat\n    version_constraint: \"false\"\n    version_overrides:\n      - version_constraint: \"true\"\n        no_asset: true\n";
+        for (os, arch) in [("linux", "amd64"), ("darwin", "arm64"), ("windows", "amd64")] {
+            assert!(parse_index_on(yaml, os, arch)[0].unavailable, "{os}/{arch}");
+        }
+    }
+
+    /// An override's `envs:` gates it just like `supported_envs` — `eza` leads
+    /// with a darwin/windows-arm64 entry that must not swallow a linux install.
+    #[test]
+    fn parse_index_honors_an_override_envs_gate() {
+        let yaml = "packages:\n  - repo_owner: eza-community\n    repo_name: eza\n    overrides:\n      - envs:\n          - darwin\n          - windows/arm64\n        files:\n          - name: eza-cargo\n      - goos: linux\n        files:\n          - name: eza-linux\n";
+        let cmds = |os, arch| parse_index_on(yaml, os, arch)[0].command_names().join(",");
+        assert_eq!(cmds("linux", "amd64"), "eza-linux");
+        assert_eq!(cmds("darwin", "arm64"), "eza-cargo");
+        assert_eq!(cmds("windows", "arm64"), "eza-cargo");
+        // windows/amd64 matches neither → the repo name is all that is left.
+        assert_eq!(cmds("windows", "amd64"), "eza");
+    }
+
+    /// `effective_for` applies the FIRST override that matches, in declaration
+    /// order — aqua's `getOverride` does not rank by specificity.
+    #[test]
+    fn parse_index_applies_the_first_matching_platform_override() {
         let yaml = "packages:\n  - repo_owner: a\n    repo_name: b\n    overrides:\n      - goos: linux\n        files:\n          - name: os-only\n      - goos: linux\n        goarch: amd64\n        files:\n          - name: os-and-arch\n      - goarch: arm64\n        files:\n          - name: arch-only\n";
         let cmds = |os, arch| parse_index_on(yaml, os, arch)[0].command_names().join(",");
-        assert_eq!(cmds("linux", "amd64"), "os-and-arch");
+        // linux/amd64 matches the first entry, so the narrower one never runs.
+        assert_eq!(cmds("linux", "amd64"), "os-only");
         assert_eq!(cmds("linux", "riscv64"), "os-only");
         assert_eq!(cmds("darwin", "arm64"), "arch-only");
         // Nothing applies → the repo name is the only guess left.
