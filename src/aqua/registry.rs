@@ -184,6 +184,26 @@ pub struct Candidate {
     pub description: Option<String>,
     /// `aliases[].name` — former package names, kept so a rename still resolves.
     pub aliases: Vec<String>,
+    /// `files[].name` declared INSIDE a version/platform override, i.e. the
+    /// commands this package installs for some versions but not provably for the
+    /// one we would resolve. Evidence only — never matched against a query (see
+    /// `docs/KNOWN_LIMITATIONS.md`), but enough to stop us claiming a package
+    /// installs a command it doesn't (`docker/cli/rootless` installs
+    /// `rootlesskit`/`vpnkit`).
+    pub override_exes: Vec<String>,
+}
+
+/// How sure we are about the commands a package installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Certainty {
+    /// Declared at the package level: this is what lands on PATH.
+    Declared,
+    /// Declared only inside version/platform overrides, so the real set depends
+    /// on the version resolved at install time.
+    PerVersion,
+    /// Nothing declared anywhere: aqua installs the repo-named command (or the
+    /// last segment of a nested package name).
+    Implied,
 }
 
 impl Candidate {
@@ -198,18 +218,40 @@ impl Candidate {
         }
     }
 
-    /// The command names this package installs: the declared `files[].name`
-    /// entries, else the last segment of a nested package name (aqua names
-    /// `kubernetes/kubernetes/kubectl` after the command it produces), else the
-    /// repo name.
-    pub fn command_names(&self) -> Vec<&str> {
+    /// The commands this package installs, and how sure we are.
+    ///
+    /// Best evidence first: package-level `files[]`, else the ones an override
+    /// declares (true for some version — better than guessing), else the aqua
+    /// default (the last segment of a nested package name, since aqua names
+    /// `kubernetes/kubernetes/kubectl` after the command it produces, else the
+    /// repo name).
+    pub fn commands(&self) -> (Certainty, Vec<&str>) {
+        fn names(v: &[String]) -> Vec<&str> {
+            v.iter().map(String::as_str).collect()
+        }
         if !self.exes.is_empty() {
-            return self.exes.iter().map(String::as_str).collect();
+            return (Certainty::Declared, names(&self.exes));
         }
-        match self.name.as_deref() {
-            Some(n) if n.contains('/') => vec![n.rsplit('/').next().unwrap_or(n)],
-            _ => vec![self.repo.as_str()],
+        if !self.override_exes.is_empty() {
+            // Newest evidence first: aqua lists `version_overrides` oldest →
+            // newest, so the LAST one describes current releases. Reporting
+            // BurntSushi/ripgrep as "rg, xrep" beats leading with the name it
+            // shipped under before 0.0.10.
+            let mut cmds = names(&self.override_exes);
+            cmds.reverse();
+            return (Certainty::PerVersion, cmds);
         }
+        let implied = match self.name.as_deref() {
+            Some(n) if n.contains('/') => n.rsplit('/').next().unwrap_or(n),
+            _ => self.repo.as_str(),
+        };
+        (Certainty::Implied, vec![implied])
+    }
+
+    /// Just the command names from [`Self::commands`], for callers that only
+    /// display them.
+    pub fn command_names(&self) -> Vec<&str> {
+        self.commands().1
     }
 }
 
@@ -241,12 +283,28 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
     let mut seen: std::collections::HashSet<Candidate> = std::collections::HashSet::new();
     let mut cur: Option<Candidate> = None;
     let mut block = Block::None;
+    // Indent of a `files:` key nested inside an override body, while we are
+    // collecting its entries.
+    let mut deep_files: Option<usize> = None;
     for line in text.lines() {
         let t = line.trim_start().trim_end_matches('\r');
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
         let indent = line.len() - line.trim_start().len();
+        // A description block scalar owns every following deeper-indented line,
+        // whatever that indent is (an explicit indicator like `|4-` pushes the
+        // text further right than the usual +2).
+        if block == Block::Description && indent >= 6 {
+            if let Some(c) = cur.as_mut() {
+                let d = c.description.get_or_insert_with(String::new);
+                if !d.is_empty() {
+                    d.push(' ');
+                }
+                d.push_str(t);
+            }
+            continue;
+        }
         match indent {
             2 if t.starts_with("- ") => {
                 push_candidate(&mut out, &mut seen, cur.take());
@@ -254,8 +312,10 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 absorb(&mut c, &t[2..]); // the first field rides the dash line
                 cur = Some(c);
                 block = Block::None;
+                deep_files = None;
             }
             4 => {
+                deep_files = None;
                 block = match t {
                     "files:" => Block::Files,
                     "aliases:" => Block::Aliases,
@@ -272,39 +332,56 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 }
             }
             6 => {
+                // An override list item starts here, ending any `files:` block
+                // we were mining inside the previous one.
+                deep_files = None;
                 let Some(c) = cur.as_mut() else { continue };
-                match block {
-                    Block::Description => {
-                        let d = c.description.get_or_insert_with(String::new);
-                        if !d.is_empty() {
-                            d.push(' ');
-                        }
-                        d.push_str(t);
-                    }
-                    Block::Files | Block::Aliases => {
-                        let entry = t.strip_prefix("- ").unwrap_or(t);
-                        if let Some(v) = field(entry, "name:") {
-                            if block == Block::Files {
-                                c.exes.push(v.to_string());
-                            } else {
-                                c.aliases.push(v.to_string());
-                            }
+                if block == Block::Files || block == Block::Aliases {
+                    let entry = t.strip_prefix("- ").unwrap_or(t);
+                    if let Some(v) = field(entry, "name:") {
+                        if block == Block::Files {
+                            c.exes.push(v.to_string());
+                        } else {
+                            c.aliases.push(v.to_string());
                         }
                     }
-                    Block::None => {}
                 }
             }
-            _ => {}
+            // Indent 8+ is an override body (`version_overrides[].overrides[]…`).
+            // Its `files:` are not this package's commands, but they are evidence
+            // of what it installs for SOME version — see `Candidate::override_exes`.
+            _ => {
+                if t == "files:" {
+                    deep_files = Some(indent);
+                } else if let Some(fi) = deep_files {
+                    let entry = t.strip_prefix("- ").unwrap_or(t);
+                    match (indent == fi + 2).then(|| field(entry, "name:")).flatten() {
+                        Some(v) => {
+                            if let Some(c) = cur.as_mut() {
+                                if !c.override_exes.iter().any(|e| e == v) {
+                                    c.override_exes.push(v.to_string());
+                                }
+                            }
+                        }
+                        None if indent <= fi => deep_files = None,
+                        None => {}
+                    }
+                }
+            }
         }
     }
     push_candidate(&mut out, &mut seen, cur.take());
     out
 }
 
-/// Whether a `description:` line opens a YAML block scalar (`|`, `|-`, `>`, `>-`)
+/// Whether a `description:` line opens a YAML block scalar (`|`, `|-`, `>2`, …)
 /// instead of carrying its text inline.
+///
+/// Judged on the RAW value: a block scalar is never quoted, so a plain
+/// description that happens to start with `|` (`description: "| piped"`) must not
+/// be mistaken for one.
 fn is_block_description(line: &str) -> bool {
-    field(line, "description:").is_some_and(|v| v.starts_with('|') || v.starts_with('>'))
+    raw_field(line, "description:").is_some_and(|v| v.starts_with('|') || v.starts_with('>'))
 }
 
 /// Finish a scanned package: normalize the default `type`, drop the unusable
@@ -395,8 +472,13 @@ fn matches_name(c: &Candidate, q: &str) -> bool {
 /// Extract the value of `key` from a trimmed YAML line (`key: value`), stripping
 /// surrounding quotes/whitespace. Returns `None` if the line isn't that key.
 fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
-    let rest = line.strip_prefix(key)?;
-    Some(rest.trim().trim_matches('"').trim_matches('\''))
+    Some(raw_field(line, key)?.trim_matches('"').trim_matches('\''))
+}
+
+/// Like [`field`] but keeps the quotes, for callers that must tell a quoted
+/// string from YAML syntax.
+fn raw_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    Some(line.strip_prefix(key)?.trim())
 }
 
 #[cfg(test)]
@@ -625,6 +707,10 @@ packages:
         // Only the TOP-LEVEL files entry — the version_overrides one is nested
         // deeper and must not be picked up.
         assert_eq!(gh.exes, vec!["gh"]);
+        // …it is only recorded as per-version evidence, and a package-level
+        // declaration outranks it.
+        assert_eq!(gh.override_exes, vec!["legacy-gh"]);
+        assert_eq!(gh.commands(), (Certainty::Declared, vec!["gh"]));
         assert_eq!(gh.description.as_deref(), Some("GitHub's official command line tool"));
 
         let fd = find(&cands, "fd", "github_release");
@@ -671,6 +757,75 @@ packages:
         assert_eq!(hits[0].kind, "go_install");
         // The continuation lines must not be mistaken for fields of the package.
         assert!(go.exes.is_empty() && go.aliases.is_empty());
+    }
+
+    /// The shape of the real `docker/cli/rootless`: no package-level `files:`, so
+    /// the only evidence of what it installs sits inside a `version_overrides`
+    /// entry — and the aqua name's last segment ("rootless") is NOT a command.
+    const OVERRIDE_ONLY: &str = r#"
+packages:
+  - type: github_release
+    repo_owner: docker
+    repo_name: cli
+    name: docker/cli/rootless
+    description: "| pipes are fine inside a quoted scalar"
+    version_overrides:
+      - version_constraint: "true"
+        files:
+          - name: rootlesskit
+            src: docker-rootless-extras/rootlesskit
+          - name: vpnkit
+        overrides:
+          - goos: darwin
+            files:
+              - name: vpnkit-darwin
+"#;
+
+    #[test]
+    fn parse_index_mines_override_only_files_as_per_version_evidence() {
+        let cands = parse_index(OVERRIDE_ONLY);
+        assert_eq!(cands.len(), 1, "{cands:#?}");
+        let c = &cands[0];
+        assert!(c.exes.is_empty(), "nothing is declared package-wide");
+        // Every nesting depth of `files:` under the override contributes.
+        assert_eq!(c.override_exes, vec!["rootlesskit", "vpnkit", "vpnkit-darwin"]);
+
+        // Evidence, not a promise: the caller must not treat these as the
+        // commands this package installs for the version we would resolve.
+        // …and they are reported newest-override-first, since aqua lists the
+        // overrides oldest → newest.
+        let (certainty, cmds) = c.commands();
+        assert_eq!(certainty, Certainty::PerVersion);
+        assert_eq!(cmds, vec!["vpnkit-darwin", "vpnkit", "rootlesskit"]);
+        // …and the nested-name fallback ("rootless") is never reported as an exe.
+        assert!(!cmds.contains(&"rootless"));
+    }
+
+    /// A `description:` whose value merely STARTS with `|` (inside quotes) is an
+    /// ordinary inline scalar, not a block scalar; folding it would swallow the
+    /// fields that follow.
+    #[test]
+    fn parse_index_keeps_a_quoted_pipe_description_inline() {
+        let c = &parse_index(OVERRIDE_ONLY)[0];
+        assert_eq!(c.description.as_deref(), Some("| pipes are fine inside a quoted scalar"));
+        assert_eq!(c.owner, "docker");
+        assert_eq!(c.name.as_deref(), Some("docker/cli/rootless"));
+    }
+
+    /// Block scalars carry optional indentation/chomping indicators and their
+    /// content may sit deeper than the usual 6 columns.
+    #[test]
+    fn parse_index_folds_indented_and_chomped_block_scalars() {
+        let cands = parse_index(
+            "packages:\n  - repo_owner: a\n    repo_name: b\n    description: |4-\n        deep block\n        second line\n    files:\n      - name: exe-b\n  - repo_owner: c\n    repo_name: d\n    description: >-\n      folded\n",
+        );
+        assert_eq!(cands.len(), 2, "{cands:#?}");
+        assert_eq!(cands[0].description.as_deref(), Some("deep block second line"));
+        // Folding stopped at the next 4-column field instead of eating it.
+        assert_eq!(cands[0].exes, vec!["exe-b"]);
+        // …and at the next package boundary.
+        assert_eq!(cands[1].repo, "d");
+        assert_eq!(cands[1].description.as_deref(), Some("folded"));
     }
 
     #[test]

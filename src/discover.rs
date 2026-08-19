@@ -75,9 +75,10 @@ pub struct Hit {
     /// source for this aqua package type.
     pub spec: Option<String>,
     pub score: u32,
-    /// Whether this package actually installs a command named like the query.
+    /// Whether this package is KNOWN to install a command named like the query.
     /// A package whose declared `files[]` prove otherwise (`bottom` installs
-    /// `btm`) must not out-pick one that does — see [`pick`].
+    /// `btm`) must not out-pick one that does — see [`pick`] — and neither must
+    /// one where the commands are only known per-version.
     pub provides: bool,
 }
 
@@ -140,7 +141,7 @@ pub fn rank(cands: &[Candidate], query: &str) -> Vec<Hit> {
                 score: why.base() + kind_bonus(&c.kind),
                 why,
                 spec: spec_for(c),
-                provides: c.command_names().iter().any(|n| n.to_ascii_lowercase() == q),
+                provides: provides(c, &q),
                 candidate: c.clone(),
             })
         })
@@ -152,6 +153,18 @@ pub fn rank(cands: &[Candidate], query: &str) -> Vec<Hit> {
     let mut seen = std::collections::HashSet::new();
     hits.retain(|h| seen.insert(h.spec.clone().unwrap_or_else(|| h.candidate.pkg_path())));
     hits
+}
+
+/// Whether `c` is KNOWN to install a command named `q` (already lowercased).
+///
+/// [`Candidate::commands`] is what makes this trustworthy: when a package
+/// declares `files[]` only inside its version overrides, those names — not the
+/// implied repo/package name — are the evidence. `sharkdp/bat` declares `bat`
+/// there, so it provides `bat`; `docker/cli/rootless` declares
+/// `rootlesskit`/`vpnkit`, so it does NOT provide `rootless` even though its
+/// package name ends that way.
+fn provides(c: &Candidate, q: &str) -> bool {
+    c.commands().1.iter().any(|n| n.to_ascii_lowercase() == *q)
 }
 
 /// The strongest reason `c` matches the (already lowercased) `q`, if any.
@@ -329,6 +342,55 @@ mod tests {
             pick(&hits).map(|h| h.candidate.command_names()),
             Some(vec!["btm"]),
             "no rival installs `bottom`, so this is unambiguous"
+        );
+    }
+
+    /// `docker/cli/rootless` matches `rootless` on its aqua name, but the only
+    /// commands it declares (`rootlesskit`, `vpnkit`) live in a version override.
+    /// Nothing named `rootless` is ever installed, so we must not claim it is.
+    #[test]
+    fn per_version_evidence_never_claims_to_provide_the_query() {
+        let rootless = Candidate {
+            name: Some("docker/cli/rootless".into()),
+            override_exes: vec!["rootlesskit".into(), "vpnkit".into()],
+            ..cand("docker", "cli", "github_release")
+        };
+        let hits = rank(std::slice::from_ref(&rootless), "rootless");
+        assert_eq!(hits[0].why, Why::Name, "the aqua name still matches exactly");
+        assert!(!hits[0].provides, "the override names it installs are not `rootless`");
+        // Unrivaled, so it is still offered — with an honest per-version note.
+        assert!(pick(&hits).is_some());
+
+        // But a package that really does ship `rootless` shadows it.
+        let real = Candidate {
+            exes: vec!["rootless".into()],
+            ..cand("someone", "rootless-tool", "github_release")
+        };
+        let hits = rank(&[rootless, real], "rootless");
+        assert!(hits.iter().any(|h| h.provides));
+        assert!(pick(&hits).is_none());
+    }
+
+    /// The flip side: `sharkdp/bat` has NO package-level `files[]` either — every
+    /// one of its `version_overrides` declares `bat`. That IS evidence it installs
+    /// `bat`, so it must not be shadowed by the `crates.io/bat` cargo entry.
+    #[test]
+    fn an_override_that_declares_the_query_still_counts_as_providing_it() {
+        let release = Candidate {
+            override_exes: vec!["bat".into()],
+            ..cand("sharkdp", "bat", "github_release")
+        };
+        let cargo = Candidate {
+            name: Some("crates.io/bat".into()),
+            locator: Some("bat".into()),
+            ..cand("sharkdp", "bat", "cargo")
+        };
+        let hits = rank(&[release, cargo], "bat");
+        assert!(hits[0].provides, "declared per version, but declared");
+        assert_eq!(
+            pick(&hits).and_then(|h| h.spec.clone()),
+            Some("aqua:sharkdp/bat".into()),
+            "the prebuilt release still wins outright"
         );
     }
 

@@ -286,14 +286,14 @@ impl App {
         // (not `cli`, the repo behind it).
         if crate::discover::is_bare_name(&args.spec) {
             let query = args.spec.trim().to_string();
-            let (spec, cmds) = self.discover_spec(&query, &args)?;
+            let (spec, note) = self.discover_spec(&query, &args)?;
             // Name what will actually land on PATH whenever it differs from what
             // was typed (`bottom` installs `btm`), so a resolution can never
             // silently hand back a differently-named command.
-            if cmds.iter().any(|c| !c.eq_ignore_ascii_case(&query)) {
-                step!("resolved `{query}` → {spec} (installs {})", cmds.join(", "));
-            } else {
+            if note.is_empty() {
                 step!("resolved `{query}` → {spec}");
+            } else {
+                step!("resolved `{query}` → {spec} ({note})");
             }
             args.spec = spec;
             args.name = args.name.or(Some(query));
@@ -1349,8 +1349,8 @@ impl App {
 
     /// Resolve a bare tool name (`bat`) to an installable spec.
     ///
-    /// Returns the spec plus the command names it installs (for the caller's
-    /// resolution note).
+    /// Returns the spec plus a note naming what it installs when that differs
+    /// from the query (empty otherwise).
     ///
     /// Only an unambiguous exact match installs itself (see [`discover::pick`]).
     /// Anything else prints the candidate table and requires a choice: `--pick N`,
@@ -1358,7 +1358,7 @@ impl App {
     /// does NOT resolve ambiguity — it suppresses prompts, and letting it also
     /// take "whatever ranked first" would install an arbitrary lookalike (`ubix
     /// add cli --yes` has hundreds of equally-scored candidates).
-    fn discover_spec(&self, query: &str, args: &AddArgs) -> Result<(String, Vec<String>)> {
+    fn discover_spec(&self, query: &str, args: &AddArgs) -> Result<(String, String)> {
         let hits = self.discover_hits(query, args.from.as_deref(), args.refresh)?;
 
         // --pick N indexes the list `ubix which` prints (1-based).
@@ -1367,15 +1367,19 @@ impl App {
             let hit = hits
                 .get(idx)
                 .with_context(|| format!("--pick {n} is out of range ({} candidates)", hits.len()))?;
-            return installable_spec(hit);
+            return installable_spec(query, hit);
         }
         if let Some(hit) = crate::discover::pick(&hits) {
-            return installable_spec(hit);
+            return installable_spec(query, hit);
         }
 
         print_discovery(query, &hits, DISCOVERY_LIMIT);
-        if let Some(hit) = prompt_pick(&hits) {
-            return installable_spec(hit);
+        // `--yes` means "don't ask me", so it must not stop at a prompt either —
+        // it goes straight to the explanatory error.
+        if !self.assume_yes {
+            if let Some(hit) = prompt_pick(&hits) {
+                return installable_spec(query, hit);
+            }
         }
         bail!(
             "`{query}` did not resolve to a single source; pick one with `--pick N`, \
@@ -1717,7 +1721,9 @@ const WHICH_LIMIT: usize = 25;
 /// The spec for a chosen candidate, or an error naming the aqua type ubix has no
 /// source for (`github_content`/`github_archive`: registry file layouts, not
 /// release artifacts).
-fn installable_spec(hit: &crate::discover::Hit) -> Result<(String, Vec<String>)> {
+/// Returns the spec plus a note naming what actually lands on PATH, empty when
+/// that is just the query itself.
+fn installable_spec(query: &str, hit: &crate::discover::Hit) -> Result<(String, String)> {
     let spec = hit.spec.clone().with_context(|| {
         format!(
             "{} is an aqua `{}` package, which ubix has no source for",
@@ -1725,8 +1731,25 @@ fn installable_spec(hit: &crate::discover::Hit) -> Result<(String, Vec<String>)>
             hit.candidate.kind
         )
     })?;
-    let cmds = hit.candidate.command_names().iter().map(|s| s.to_string()).collect();
-    Ok((spec, cmds))
+    Ok((spec, commands_note(query, &hit.candidate)))
+}
+
+/// What a package puts on PATH, phrased for a human — empty when that is exactly
+/// the queried command and there is nothing to warn about.
+///
+/// Naming the real binary is the fastest way to tell a genuine hit from a
+/// same-named lookalike, and the per-version hedge matters because those
+/// commands are declared only for SOME versions.
+fn commands_note(query: &str, c: &crate::aqua::registry::Candidate) -> String {
+    use crate::aqua::registry::Certainty;
+    let (certainty, cmds) = c.commands();
+    match certainty {
+        // Nothing to say when the package installs exactly what was asked for —
+        // including when only an override declares it (`sharkdp/bat` → `bat`).
+        _ if cmds.len() == 1 && cmds[0].eq_ignore_ascii_case(query) => String::new(),
+        Certainty::PerVersion => format!("installs {} for some versions", cmds.join(", ")),
+        _ => format!("installs {}", cmds.join(", ")),
+    }
 }
 
 /// Print ranked discovery candidates, best first, each with the spec it installs
@@ -1745,13 +1768,10 @@ fn print_discovery(query: &str, hits: &[crate::discover::Hit], limit: usize) {
     for (i, h) in shown.iter().enumerate() {
         let spec = h.spec.as_deref().unwrap_or("-");
         let star = if auto.as_deref() == Some(spec) { "*" } else { " " };
-        // Naming what actually lands on PATH is the fastest way to tell a real
-        // hit from a same-named lookalike, so surface it whenever the package
-        // installs something other than the queried command.
-        let cmds = h.candidate.command_names();
         let mut desc = String::new();
-        if cmds != [query] {
-            desc.push_str(&format!("installs {} · ", cmds.join(", ")));
+        let note = commands_note(query, &h.candidate);
+        if !note.is_empty() {
+            desc.push_str(&format!("{note} · "));
         }
         if let Some(d) = h.candidate.description.as_deref() {
             desc.push_str(d);
@@ -2879,6 +2899,54 @@ mod tests {
     }
 
     // ---- search hit rendering ----
+
+    /// The note `add` prints after `resolved <query> → <spec>`: silent when the
+    /// package installs exactly what was asked for, explicit when it renames the
+    /// binary, and hedged when the command set is only known per version.
+    #[test]
+    fn resolution_note_states_what_actually_lands_on_path() {
+        let note = |c: crate::aqua::registry::Candidate, q: &str| {
+            let hits = crate::discover::rank(&[c], q);
+            installable_spec(q, &hits[0]).unwrap().1
+        };
+        let gh = crate::aqua::registry::Candidate {
+            owner: "cli".into(),
+            repo: "cli".into(),
+            kind: "github_release".into(),
+            exes: vec!["gh".into()],
+            ..Default::default()
+        };
+        assert_eq!(note(gh.clone(), "gh"), "", "installs the queried command, nothing to add");
+
+        let bottom = crate::aqua::registry::Candidate {
+            owner: "ClementTsang".into(),
+            repo: "bottom".into(),
+            exes: vec!["btm".into()],
+            ..gh.clone()
+        };
+        assert_eq!(note(bottom, "bottom"), "installs btm");
+
+        // Only a version override declares files[] — `rootless` itself is never
+        // a binary, so the note must not promise one.
+        let rootless = crate::aqua::registry::Candidate {
+            name: Some("docker/cli/rootless".into()),
+            exes: vec![],
+            override_exes: vec!["rootlesskit".into(), "vpnkit".into()],
+            ..gh
+        };
+        assert_eq!(note(rootless, "rootless"), "installs vpnkit, rootlesskit for some versions");
+
+        // …but a per-version declaration OF the query needs no hedge: that is
+        // just how `sharkdp/bat` spells "installs bat".
+        let bat = crate::aqua::registry::Candidate {
+            owner: "sharkdp".into(),
+            repo: "bat".into(),
+            kind: "github_release".into(),
+            override_exes: vec!["bat".into()],
+            ..Default::default()
+        };
+        assert_eq!(note(bat, "bat"), "");
+    }
 
     fn aqua_hit(name: Option<&str>, owner: &str, repo: &str, kind: &str, exes: &[&str]) -> SearchHit {
         SearchHit::Aqua(crate::aqua::registry::Candidate {

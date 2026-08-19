@@ -44,14 +44,18 @@ case works today; each note records the edge and why it was left.
   in state (removal is already unlink-by-tracked-file). (`src/aqua/synth.rs`)
 
 ## bare-name discovery (`add <name>` / `which`)
-- **Commands declared only inside a `version_overrides` branch are invisible.**
-  The root-index scanner reads name-ish fields at the package level, so
-  `BurntSushi/ripgrep` — whose `files: - name: rg` lives in a version override —
-  contributes no `rg` command name, and `ubix which rg` ranks
-  `microsoft/ripgrep-prebuilt` (a mirror that declares it at the top level) first.
-  Merging override branches during the scan would mean parsing the 3.2 MB index
-  structurally; the planned fix instead falls back to a GitHub repo search ranked
-  by stars. Workaround: `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
+- **Commands declared only inside a `version_overrides` branch don't create a
+  match.** The scanner does collect them (`Candidate::override_exes`), but only as
+  EVIDENCE: they decide what the resolution note says and whether a hit counts as
+  providing the queried command — never whether it matches in the first place.
+  Override names are version-specific and often historical (`BurntSushi/ripgrep`
+  declares both `xrep` and `rg` across its overrides; `volta` declares `notion`),
+  so matching on them would resolve bare names through binaries a tool stopped
+  shipping years ago. Consequence: `ubix which rg` still ranks
+  `microsoft/ripgrep-prebuilt` (a mirror that declares `rg` at the package level)
+  above `BurntSushi/ripgrep`. Fixing it properly needs the newest override branch
+  only, which means evaluating aqua's `version_constraint` expressions.
+  Workaround: `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
 - **Only aqua is searched.** A tool that exists solely on PyPI, npm, or
   conda-forge doesn't resolve from a bare name; use the explicit prefix (or
   `ubix search --pixi`). Probing those registries per query is deferred because
