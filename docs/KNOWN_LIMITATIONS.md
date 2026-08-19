@@ -45,17 +45,24 @@ case works today; each note records the edge and why it was left.
 
 ## bare-name discovery (`add <name>` / `which`)
 - **Commands declared only inside a `version_overrides` branch don't create a
-  match.** The scanner does collect them (`Candidate::override_exes`), but only as
-  EVIDENCE: they decide what the resolution note says and whether a hit counts as
-  providing the queried command — never whether it matches in the first place.
-  Override names are version-specific and often historical (`BurntSushi/ripgrep`
-  declares both `xrep` and `rg` across its overrides; `volta` declares `notion`),
-  so matching on them would resolve bare names through binaries a tool stopped
-  shipping years ago. Consequence: `ubix which rg` still ranks
-  `microsoft/ripgrep-prebuilt` (a mirror that declares `rg` at the package level)
-  above `BurntSushi/ripgrep`. Fixing it properly needs the newest override branch
-  only, which means evaluating aqua's `version_constraint` expressions.
-  Workaround: `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
+  match.** The scanner does collect them (`Candidate::override_exes` — the
+  `"true"` branch, else the last one listed, mirroring `resolve::select_branch`),
+  but only as EVIDENCE: they decide what the resolution note says and whether a
+  hit counts as providing the queried command, never whether it matches in the
+  first place. Matching on them would need the branch selection to be exact per
+  query, and a near-miss resolves a bare name through a binary the tool stopped
+  shipping (`volta` shipped as `notion`, `ripgrep` as `xrep`). Consequence:
+  `ubix which rg` still ranks `microsoft/ripgrep-prebuilt` (a mirror that declares
+  `rg` at the package level) above `BurntSushi/ripgrep`. Workaround:
+  `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
+- **Branch selection is approximated, not evaluated.** The scanner can't run
+  aqua's `version_constraint` expressions, so it takes the `"true"` branch when
+  there is one — which is what `resolve::select_branch` installs from — and
+  otherwise the last branch listed. For `>=`-ordered packages the `"true"` branch
+  is the OLDEST fallback, so `ubix which func` reports `installs faas for some
+  versions`: accurate about what ubix would install today (aqua itself would
+  honor the package-level `version_constraint` and install `func`), but not about
+  the tool. (`src/aqua/registry.rs`, `src/aqua/resolve.rs`)
 - **Only aqua is searched.** A tool that exists solely on PyPI, npm, or
   conda-forge doesn't resolve from a bare name; use the explicit prefix (or
   `ubix search --pixi`). Probing those registries per query is deferred because

@@ -2934,7 +2934,7 @@ mod tests {
             override_exes: vec!["rootlesskit".into(), "vpnkit".into()],
             ..gh
         };
-        assert_eq!(note(rootless, "rootless"), "installs vpnkit, rootlesskit for some versions");
+        assert_eq!(note(rootless, "rootless"), "installs rootlesskit, vpnkit for some versions");
 
         // …but a per-version declaration OF the query needs no hedge: that is
         // just how `sharkdp/bat` spells "installs bat".

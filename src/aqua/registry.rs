@@ -184,12 +184,16 @@ pub struct Candidate {
     pub description: Option<String>,
     /// `aliases[].name` — former package names, kept so a rename still resolves.
     pub aliases: Vec<String>,
-    /// `files[].name` declared INSIDE a version/platform override, i.e. the
-    /// commands this package installs for some versions but not provably for the
-    /// one we would resolve. Evidence only — never matched against a query (see
-    /// `docs/KNOWN_LIMITATIONS.md`), but enough to stop us claiming a package
-    /// installs a command it doesn't (`docker/cli/rootless` installs
-    /// `rootlesskit`/`vpnkit`).
+    /// `files[].name` from the ONE `version_overrides` branch that
+    /// [`crate::aqua::resolve::select_branch`] would take — the first branch
+    /// constrained `"true"`, else the last one listed (see
+    /// [`parse_index`]). Packages like `sharkdp/bat` and `docker/cli/rootless`
+    /// declare their commands nowhere else.
+    ///
+    /// Kept apart from [`Self::exes`] because a branch is version-scoped: the
+    /// names hold for the version ubix resolves today, not for the package in
+    /// general. Evidence only — never matched against a query (see
+    /// `docs/KNOWN_LIMITATIONS.md`).
     pub override_exes: Vec<String>,
 }
 
@@ -198,8 +202,8 @@ pub struct Candidate {
 pub enum Certainty {
     /// Declared at the package level: this is what lands on PATH.
     Declared,
-    /// Declared only inside version/platform overrides, so the real set depends
-    /// on the version resolved at install time.
+    /// Declared only inside the version/platform override branch we would
+    /// install from, so the set is scoped to that version range.
     PerVersion,
     /// Nothing declared anywhere: aqua installs the repo-named command (or the
     /// last segment of a nested package name).
@@ -220,9 +224,9 @@ impl Candidate {
 
     /// The commands this package installs, and how sure we are.
     ///
-    /// Best evidence first: package-level `files[]`, else the ones an override
-    /// declares (true for some version — better than guessing), else the aqua
-    /// default (the last segment of a nested package name, since aqua names
+    /// Best evidence first: package-level `files[]`, else the selected override
+    /// branch's (see [`Self::override_exes`]), else the aqua default (the last
+    /// segment of a nested package name, since aqua names
     /// `kubernetes/kubernetes/kubectl` after the command it produces, else the
     /// repo name).
     pub fn commands(&self) -> (Certainty, Vec<&str>) {
@@ -233,13 +237,7 @@ impl Candidate {
             return (Certainty::Declared, names(&self.exes));
         }
         if !self.override_exes.is_empty() {
-            // Newest evidence first: aqua lists `version_overrides` oldest →
-            // newest, so the LAST one describes current releases. Reporting
-            // BurntSushi/ripgrep as "rg, xrep" beats leading with the name it
-            // shipped under before 0.0.10.
-            let mut cmds = names(&self.override_exes);
-            cmds.reverse();
-            return (Certainty::PerVersion, cmds);
+            return (Certainty::PerVersion, names(&self.override_exes));
         }
         let implied = match self.name.as_deref() {
             Some(n) if n.contains('/') => n.rsplit('/').next().unwrap_or(n),
@@ -266,6 +264,15 @@ enum Block {
     Description,
 }
 
+/// One `version_overrides` branch's declared commands, as the scanner walks it.
+#[derive(Default)]
+struct BranchBuf {
+    /// `version_constraint: "true"` — the branch [`super::resolve::select_branch`]
+    /// takes outright.
+    is_true: bool,
+    names: Vec<String>,
+}
+
 /// Parse the root index into one [`Candidate`] per package.
 ///
 /// This is a block-aware line scan rather than a `serde_yml` parse: the document
@@ -275,6 +282,15 @@ enum Block {
 /// its own fields sit at indent 4, and `files:`/`aliases:` entries at indent 6.
 /// Anchoring on exact indents is what keeps a `files:` nested under
 /// `version_overrides:` (indent 8) from leaking in as a top-level exe.
+///
+/// A `files:` deeper than that is collected per BRANCH, not merged, because
+/// branches are mutually exclusive: `BurntSushi/ripgrep` installs `xrep` below
+/// 0.0.10 and `rg` after, and `knative/func` installs `func` or `faas` depending
+/// on the version. [`select_branch`](super::resolve::select_branch) picks the
+/// first branch constrained `"true"`, else the first whose constraint holds, so
+/// the scanner keeps the `"true"` branch when there is one and otherwise the last
+/// branch listed — the closest proxy for "newest" without evaluating aqua's
+/// constraint expressions.
 ///
 /// Packages we could not act on are dropped (see [`actionable`]) — a candidate
 /// with no installable spec would only be noise.
@@ -286,6 +302,14 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
     // Indent of a `files:` key nested inside an override body, while we are
     // collecting its entries.
     let mut deep_files: Option<usize> = None;
+    // Are we inside this package's `version_overrides:` list?
+    let mut in_branches = false;
+    // The branch being scanned, and the best one seen so far in this package.
+    let mut branch: Option<BranchBuf> = None;
+    let mut chosen: Option<BranchBuf> = None;
+    // `files:` found under a base-level platform `overrides:` — used only when the
+    // package has no version branches at all.
+    let mut base_deep: Vec<String> = Vec::new();
     for line in text.lines() {
         let t = line.trim_start().trim_end_matches('\r');
         if t.is_empty() || t.starts_with('#') {
@@ -307,15 +331,20 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
         }
         match indent {
             2 if t.starts_with("- ") => {
+                finish_branches(cur.as_mut(), &mut branch, &mut chosen, &mut base_deep);
                 push_candidate(&mut out, &mut seen, cur.take());
                 let mut c = Candidate::default();
                 absorb(&mut c, &t[2..]); // the first field rides the dash line
                 cur = Some(c);
                 block = Block::None;
                 deep_files = None;
+                in_branches = false;
             }
             4 => {
                 deep_files = None;
+                // Any indent-4 key ends the branch list we were walking.
+                commit_branch(&mut chosen, branch.take());
+                in_branches = t == "version_overrides:";
                 block = match t {
                     "files:" => Block::Files,
                     "aliases:" => Block::Aliases,
@@ -335,6 +364,14 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 // An override list item starts here, ending any `files:` block
                 // we were mining inside the previous one.
                 deep_files = None;
+                if in_branches && t.starts_with("- ") {
+                    commit_branch(&mut chosen, branch.take());
+                    branch = Some(BranchBuf {
+                        // The constraint may ride the dash line.
+                        is_true: field(&t[2..], "version_constraint:") == Some("true"),
+                        names: Vec::new(),
+                    });
+                }
                 let Some(c) = cur.as_mut() else { continue };
                 if block == Block::Files || block == Block::Aliases {
                     let entry = t.strip_prefix("- ").unwrap_or(t);
@@ -348,19 +385,28 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 }
             }
             // Indent 8+ is an override body (`version_overrides[].overrides[]…`).
-            // Its `files:` are not this package's commands, but they are evidence
-            // of what it installs for SOME version — see `Candidate::override_exes`.
+            // Its `files:` are not the package's own commands, but they ARE the
+            // commands of the branch we may install from — see
+            // `Candidate::override_exes`.
             _ => {
-                if t == "files:" {
+                if field(t, "version_constraint:") == Some("true") {
+                    if let Some(b) = branch.as_mut() {
+                        b.is_true = true;
+                    }
+                } else if t == "files:" {
                     deep_files = Some(indent);
                 } else if let Some(fi) = deep_files {
                     let entry = t.strip_prefix("- ").unwrap_or(t);
                     match (indent == fi + 2).then(|| field(entry, "name:")).flatten() {
                         Some(v) => {
-                            if let Some(c) = cur.as_mut() {
-                                if !c.override_exes.iter().any(|e| e == v) {
-                                    c.override_exes.push(v.to_string());
-                                }
+                            let names = match branch.as_mut() {
+                                Some(b) => &mut b.names,
+                                // Outside a version branch: a platform override
+                                // on the base package.
+                                None => &mut base_deep,
+                            };
+                            if !names.iter().any(|e| e == v) {
+                                names.push(v.to_string());
                             }
                         }
                         None if indent <= fi => deep_files = None,
@@ -370,8 +416,42 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
             }
         }
     }
+    finish_branches(cur.as_mut(), &mut branch, &mut chosen, &mut base_deep);
     push_candidate(&mut out, &mut seen, cur.take());
     out
+}
+
+/// Record a finished `version_overrides` branch as the one we would install from,
+/// mirroring [`select_branch`](super::resolve::select_branch): a `"true"` branch
+/// wins outright, otherwise the last branch listed stands in for "newest".
+/// Branches that declare no `files:` say nothing about the commands.
+fn commit_branch(chosen: &mut Option<BranchBuf>, branch: Option<BranchBuf>) {
+    let Some(b) = branch else { return };
+    if b.names.is_empty() || chosen.as_ref().is_some_and(|c| c.is_true) {
+        return;
+    }
+    *chosen = Some(b);
+}
+
+/// Close out a package's branch scan, moving the selected branch's commands onto
+/// the candidate and resetting the per-package state.
+fn finish_branches(
+    cur: Option<&mut Candidate>,
+    branch: &mut Option<BranchBuf>,
+    chosen: &mut Option<BranchBuf>,
+    base_deep: &mut Vec<String>,
+) {
+    commit_branch(chosen, branch.take());
+    if let Some(c) = cur {
+        c.override_exes = match chosen.take() {
+            Some(b) => b.names,
+            // No version branches — a platform override on the base package is
+            // still better evidence than the package name.
+            None => std::mem::take(base_deep),
+        };
+    }
+    *chosen = None;
+    base_deep.clear();
 }
 
 /// Whether a `description:` line opens a YAML block scalar (`|`, `|-`, `>2`, …)
@@ -787,18 +867,86 @@ packages:
         assert_eq!(cands.len(), 1, "{cands:#?}");
         let c = &cands[0];
         assert!(c.exes.is_empty(), "nothing is declared package-wide");
-        // Every nesting depth of `files:` under the override contributes.
+        // Every nesting depth of `files:` inside the selected branch contributes,
+        // in declaration order.
         assert_eq!(c.override_exes, vec!["rootlesskit", "vpnkit", "vpnkit-darwin"]);
 
-        // Evidence, not a promise: the caller must not treat these as the
-        // commands this package installs for the version we would resolve.
-        // …and they are reported newest-override-first, since aqua lists the
-        // overrides oldest → newest.
         let (certainty, cmds) = c.commands();
         assert_eq!(certainty, Certainty::PerVersion);
-        assert_eq!(cmds, vec!["vpnkit-darwin", "vpnkit", "rootlesskit"]);
+        assert_eq!(cmds, vec!["rootlesskit", "vpnkit", "vpnkit-darwin"]);
         // …and the nested-name fallback ("rootless") is never reported as an exe.
         assert!(!cmds.contains(&"rootless"));
+    }
+
+    /// Branches are MUTUALLY EXCLUSIVE, so their `files:` must not be merged.
+    /// `BurntSushi/ripgrep` shipped as `xrep` before 0.0.10 and `knative/func`
+    /// installs `faas` from its `"true"` branch and `func` from a newer one:
+    /// merging would claim both, and claiming a command the selected branch does
+    /// not install is exactly what `Hit.provides` must not do.
+    #[test]
+    fn parse_index_keeps_only_the_branch_that_would_be_installed() {
+        // A `"true"` branch wins outright, wherever it sits in the list — that is
+        // what `resolve::select_branch` does.
+        let func = parse_index(
+            r#"
+packages:
+  - repo_owner: knative
+    repo_name: func
+    version_overrides:
+      - version_constraint: semver(">= 0.9.0")
+        files:
+          - name: func
+      - version_constraint: "true"
+        files:
+          - name: faas
+"#,
+        );
+        assert_eq!(func[0].override_exes, vec!["faas"], "the `true` branch, not the union");
+
+        // With no `"true"` branch, the last one listed stands in for "newest".
+        let staged = parse_index(
+            r#"
+packages:
+  - repo_owner: a
+    repo_name: b
+    version_overrides:
+      - version_constraint: semver("<= 1.0.0")
+        files:
+          - name: old
+      - version_constraint: semver("<= 2.0.0")
+        files:
+          - name: new
+"#,
+        );
+        assert_eq!(staged[0].override_exes, vec!["new"]);
+
+        // A branch that declares no files says nothing, so an earlier branch's
+        // evidence survives instead of being blanked.
+        let sparse = parse_index(
+            r#"
+packages:
+  - repo_owner: a
+    repo_name: b
+    version_overrides:
+      - version_constraint: semver("<= 1.0.0")
+        files:
+          - name: only
+      - version_constraint: "true"
+        supported_envs:
+          - darwin
+"#,
+        );
+        assert_eq!(sparse[0].override_exes, vec!["only"]);
+    }
+
+    /// `files:` under a base-level platform `overrides:` belongs to no branch, but
+    /// it is still better evidence than the repo name.
+    #[test]
+    fn parse_index_reads_base_platform_override_files() {
+        let cands = parse_index(
+            "packages:\n  - repo_owner: a\n    repo_name: b\n    overrides:\n      - goos: windows\n        files:\n          - name: b.exe\n",
+        );
+        assert_eq!(cands[0].override_exes, vec!["b.exe"]);
     }
 
     /// A `description:` whose value merely STARTS with `|` (inside quotes) is an
