@@ -184,11 +184,16 @@ pub struct Candidate {
     pub description: Option<String>,
     /// `aliases[].name` — former package names, kept so a rename still resolves.
     pub aliases: Vec<String>,
-    /// `files[].name` from the ONE `version_overrides` branch that
-    /// [`crate::aqua::resolve::select_branch`] would take — the first branch
-    /// constrained `"true"`, else the last one listed (see
-    /// [`parse_index`]). Packages like `sharkdp/bat` and `docker/cli/rootless`
-    /// declare their commands nowhere else.
+    /// The commands that OVERRIDE [`Self::exes`]: `files[].name` declared inside
+    /// the one `version_overrides` branch [`crate::aqua::resolve::select_branch`]
+    /// would take (the first constrained `"true"`), or — for a package with no
+    /// version branches — under a base-level platform `overrides:`. Packages like
+    /// `sharkdp/bat` and `docker/cli/rootless` declare their commands nowhere
+    /// else, and `cubefs/cubefs` declares one at the package level that its
+    /// selected branch drops.
+    ///
+    /// Empty when the selected branch declares no `files:` (it inherits the
+    /// package's) or when no branch is selectable at all (see [`parse_index`]).
     ///
     /// Kept apart from [`Self::exes`] because a branch is version-scoped: the
     /// names hold for the version ubix resolves today, not for the package in
@@ -224,20 +229,22 @@ impl Candidate {
 
     /// The commands this package installs, and how sure we are.
     ///
-    /// Best evidence first: package-level `files[]`, else the selected override
-    /// branch's (see [`Self::override_exes`]), else the aqua default (the last
-    /// segment of a nested package name, since aqua names
-    /// `kubernetes/kubernetes/kubectl` after the command it produces, else the
-    /// repo name).
+    /// The selected override branch's `files[]` come FIRST, because a branch that
+    /// declares them replaces the package-level list rather than adding to it
+    /// (`resolve::merge_branch`) — `cubefs/cubefs` lists `cfs-preload` at the
+    /// package level and drops it in the branch we install from. Then the
+    /// package-level `files[]`, then the aqua default (the last segment of a
+    /// nested package name, since aqua names `kubernetes/kubernetes/kubectl`
+    /// after the command it produces, else the repo name).
     pub fn commands(&self) -> (Certainty, Vec<&str>) {
         fn names(v: &[String]) -> Vec<&str> {
             v.iter().map(String::as_str).collect()
         }
-        if !self.exes.is_empty() {
-            return (Certainty::Declared, names(&self.exes));
-        }
         if !self.override_exes.is_empty() {
             return (Certainty::PerVersion, names(&self.override_exes));
+        }
+        if !self.exes.is_empty() {
+            return (Certainty::Declared, names(&self.exes));
         }
         let implied = match self.name.as_deref() {
             Some(n) if n.contains('/') => n.rsplit('/').next().unwrap_or(n),
@@ -270,6 +277,12 @@ struct BranchBuf {
     /// `version_constraint: "true"` — the branch [`super::resolve::select_branch`]
     /// takes outright.
     is_true: bool,
+    /// The branch has its own `files:` key. Distinct from a non-empty `names`,
+    /// because declaring `files:` REPLACES the package-level list
+    /// ([`merge_branch`](super::resolve::merge_branch)) while declaring nothing
+    /// INHERITS it — and the two mean opposite things for a package like
+    /// `volta-cli/volta`, whose selected branch declares no files at all.
+    declared: bool,
     names: Vec<String>,
 }
 
@@ -287,10 +300,19 @@ struct BranchBuf {
 /// branches are mutually exclusive: `BurntSushi/ripgrep` installs `xrep` below
 /// 0.0.10 and `rg` after, and `knative/func` installs `func` or `faas` depending
 /// on the version. [`select_branch`](super::resolve::select_branch) picks the
-/// first branch constrained `"true"`, else the first whose constraint holds, so
-/// the scanner keeps the `"true"` branch when there is one and otherwise the last
-/// branch listed — the closest proxy for "newest" without evaluating aqua's
-/// constraint expressions.
+/// first branch constrained `"true"`, else the first whose constraint holds — so
+/// the scanner keeps the `"true"` branch and NOTHING otherwise: 88 of the ~2.3k
+/// packages constrain every branch, and which one applies is a function of the
+/// version being installed (`dineshba/tf-summarize`'s last-listed branch names a
+/// command it no longer ships). Guessing there would report commands the install
+/// does not produce, so those packages fall back to their package-level
+/// `files[]`.
+///
+/// The selected branch is then merged the way
+/// [`merge_branch`](super::resolve::merge_branch) does: its own `files:` REPLACE
+/// the package's, and a branch without `files:` inherits them
+/// (`volta-cli/volta`'s `"true"` branch declares none, so `volta` — not the
+/// long-gone `notion` — is what it installs).
 ///
 /// Packages we could not act on are dropped (see [`actionable`]) — a candidate
 /// with no installable spec would only be noise.
@@ -302,8 +324,11 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
     // Indent of a `files:` key nested inside an override body, while we are
     // collecting its entries.
     let mut deep_files: Option<usize> = None;
-    // Are we inside this package's `version_overrides:` list?
+    // Are we inside this package's `version_overrides:` list, and did we see one
+    // at all? (A package with constrained-but-never-`"true"` branches must not
+    // fall back to base-level platform files, which are not what it installs.)
     let mut in_branches = false;
+    let mut saw_branches = false;
     // The branch being scanned, and the best one seen so far in this package.
     let mut branch: Option<BranchBuf> = None;
     let mut chosen: Option<BranchBuf> = None;
@@ -331,7 +356,13 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
         }
         match indent {
             2 if t.starts_with("- ") => {
-                finish_branches(cur.as_mut(), &mut branch, &mut chosen, &mut base_deep);
+                finish_branches(
+                    cur.as_mut(),
+                    &mut branch,
+                    &mut chosen,
+                    &mut base_deep,
+                    saw_branches,
+                );
                 push_candidate(&mut out, &mut seen, cur.take());
                 let mut c = Candidate::default();
                 absorb(&mut c, &t[2..]); // the first field rides the dash line
@@ -339,12 +370,14 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 block = Block::None;
                 deep_files = None;
                 in_branches = false;
+                saw_branches = false;
             }
             4 => {
                 deep_files = None;
                 // Any indent-4 key ends the branch list we were walking.
                 commit_branch(&mut chosen, branch.take());
                 in_branches = t == "version_overrides:";
+                saw_branches |= in_branches;
                 block = match t {
                     "files:" => Block::Files,
                     "aliases:" => Block::Aliases,
@@ -369,7 +402,7 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                     branch = Some(BranchBuf {
                         // The constraint may ride the dash line.
                         is_true: field(&t[2..], "version_constraint:") == Some("true"),
-                        names: Vec::new(),
+                        ..BranchBuf::default()
                     });
                 }
                 let Some(c) = cur.as_mut() else { continue };
@@ -395,6 +428,11 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                     }
                 } else if t == "files:" {
                     deep_files = Some(indent);
+                    // Declaring the key is what replaces the package's list —
+                    // even if the entries carry no `name:` we can read.
+                    if let Some(b) = branch.as_mut() {
+                        b.declared = true;
+                    }
                 } else if let Some(fi) = deep_files {
                     let entry = t.strip_prefix("- ").unwrap_or(t);
                     match (indent == fi + 2).then(|| field(entry, "name:")).flatten() {
@@ -416,38 +454,58 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
             }
         }
     }
-    finish_branches(cur.as_mut(), &mut branch, &mut chosen, &mut base_deep);
+    finish_branches(
+        cur.as_mut(),
+        &mut branch,
+        &mut chosen,
+        &mut base_deep,
+        saw_branches,
+    );
     push_candidate(&mut out, &mut seen, cur.take());
     out
 }
 
-/// Record a finished `version_overrides` branch as the one we would install from,
-/// mirroring [`select_branch`](super::resolve::select_branch): a `"true"` branch
-/// wins outright, otherwise the last branch listed stands in for "newest".
-/// Branches that declare no `files:` say nothing about the commands.
+/// Record a finished `version_overrides` branch as the one we would install from.
+///
+/// Only a branch constrained `"true"` qualifies, and only the first one, because
+/// that is the single case [`select_branch`](super::resolve::select_branch)
+/// resolves without evaluating a constraint expression. Whether the branch
+/// declares any `files:` is deliberately NOT part of the choice: an inheriting
+/// branch is still the selected branch, and treating it as absent would leave a
+/// losing branch's names in place.
 fn commit_branch(chosen: &mut Option<BranchBuf>, branch: Option<BranchBuf>) {
     let Some(b) = branch else { return };
-    if b.names.is_empty() || chosen.as_ref().is_some_and(|c| c.is_true) {
-        return;
+    if b.is_true && chosen.is_none() {
+        *chosen = Some(b);
     }
-    *chosen = Some(b);
 }
 
-/// Close out a package's branch scan, moving the selected branch's commands onto
-/// the candidate and resetting the per-package state.
+/// Close out a package's branch scan, resolving the commands the way
+/// [`merge_branch`](super::resolve::merge_branch) would, and resetting the
+/// per-package state.
 fn finish_branches(
     cur: Option<&mut Candidate>,
     branch: &mut Option<BranchBuf>,
     chosen: &mut Option<BranchBuf>,
     base_deep: &mut Vec<String>,
+    saw_branches: bool,
 ) {
     commit_branch(chosen, branch.take());
     if let Some(c) = cur {
         c.override_exes = match chosen.take() {
-            Some(b) => b.names,
-            // No version branches — a platform override on the base package is
-            // still better evidence than the package name.
-            None => std::mem::take(base_deep),
+            // The selected branch's own `files:` REPLACE the package's.
+            Some(b) if b.declared => b.names,
+            // It declares none, so it inherits the package's `files[]` (or the
+            // implied name) — there is no override to report.
+            Some(_) => Vec::new(),
+            // Branches exist but none is unconditional: which one applies depends
+            // on the version, so we say nothing rather than guess.
+            None if saw_branches => Vec::new(),
+            // No version branches at all — a platform override on the base
+            // package beats the package name, but not a package-level `files[]`:
+            // it is platform-scoped, so it can name a windows-only `foo.exe`.
+            None if c.exes.is_empty() => std::mem::take(base_deep),
+            None => Vec::new(),
         };
     }
     *chosen = None;
@@ -787,9 +845,9 @@ packages:
         // Only the TOP-LEVEL files entry — the version_overrides one is nested
         // deeper and must not be picked up.
         assert_eq!(gh.exes, vec!["gh"]);
-        // …it is only recorded as per-version evidence, and a package-level
-        // declaration outranks it.
-        assert_eq!(gh.override_exes, vec!["legacy-gh"]);
+        // …and since no branch is unconditional, the constrained one is not
+        // evidence of anything: `gh` is what a current version installs.
+        assert!(gh.override_exes.is_empty(), "{:?}", gh.override_exes);
         assert_eq!(gh.commands(), (Certainty::Declared, vec!["gh"]));
         assert_eq!(gh.description.as_deref(), Some("GitHub's official command line tool"));
 
@@ -903,50 +961,90 @@ packages:
         );
         assert_eq!(func[0].override_exes, vec!["faas"], "the `true` branch, not the union");
 
-        // With no `"true"` branch, the last one listed stands in for "newest".
+        // With no `"true"` branch (88 real packages), which branch applies is a
+        // function of the version, so no branch is evidence — the package-level
+        // declaration stands. `dineshba/tf-summarize` has this shape, and its
+        // last-listed branch names a command it no longer ships.
         let staged = parse_index(
             r#"
 packages:
   - repo_owner: a
     repo_name: b
+    files:
+      - name: current
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         files:
           - name: old
       - version_constraint: semver("<= 2.0.0")
         files:
-          - name: new
+          - name: older-still
 "#,
         );
-        assert_eq!(staged[0].override_exes, vec!["new"]);
+        assert!(staged[0].override_exes.is_empty(), "{:?}", staged[0].override_exes);
+        assert_eq!(staged[0].commands(), (Certainty::Declared, vec!["current"]));
 
-        // A branch that declares no files says nothing, so an earlier branch's
-        // evidence survives instead of being blanked.
-        let sparse = parse_index(
+        // The selected branch declaring no `files:` INHERITS the package's, the
+        // way `resolve::merge_branch` does — it must not leave a losing branch's
+        // names standing (`volta-cli/volta` installs `volta`, not `notion`).
+        let volta = parse_index(
             r#"
 packages:
-  - repo_owner: a
-    repo_name: b
+  - repo_owner: volta-cli
+    repo_name: volta
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         files:
-          - name: only
+          - name: notion
       - version_constraint: "true"
         supported_envs:
           - darwin
 "#,
         );
-        assert_eq!(sparse[0].override_exes, vec!["only"]);
+        assert!(volta[0].override_exes.is_empty(), "{:?}", volta[0].override_exes);
+        assert_eq!(volta[0].commands(), (Certainty::Implied, vec!["volta"]));
+    }
+
+    /// `merge_branch` REPLACES the package-level `files[]` when the branch has its
+    /// own, so a command declared only at the package level is not installed.
+    /// `cubefs/cubefs` lists `cfs-preload` package-wide and drops it in its
+    /// `"true"` branch.
+    #[test]
+    fn parse_index_lets_the_selected_branch_replace_package_level_files() {
+        let cands = parse_index(
+            r#"
+packages:
+  - repo_owner: cubefs
+    repo_name: cubefs
+    files:
+      - name: cfs-cli
+      - name: cfs-preload
+    version_overrides:
+      - version_constraint: "true"
+        files:
+          - name: cfs-cli
+          - name: cfs-server
+"#,
+        );
+        let c = &cands[0];
+        assert_eq!(c.exes, vec!["cfs-cli", "cfs-preload"]);
+        assert_eq!(c.override_exes, vec!["cfs-cli", "cfs-server"]);
+        // The branch wins: `cfs-preload` is never reported as installed.
+        assert_eq!(c.commands(), (Certainty::PerVersion, vec!["cfs-cli", "cfs-server"]));
     }
 
     /// `files:` under a base-level platform `overrides:` belongs to no branch, but
-    /// it is still better evidence than the repo name.
+    /// it is still better evidence than the repo name — unless the package
+    /// declares its own, since a platform override can name a windows-only
+    /// `b.exe` that must not outrank the real command.
     #[test]
     fn parse_index_reads_base_platform_override_files() {
-        let cands = parse_index(
-            "packages:\n  - repo_owner: a\n    repo_name: b\n    overrides:\n      - goos: windows\n        files:\n          - name: b.exe\n",
-        );
-        assert_eq!(cands[0].override_exes, vec!["b.exe"]);
+        let base = "packages:\n  - repo_owner: a\n    repo_name: b\n    overrides:\n      - goos: windows\n        files:\n          - name: b.exe\n";
+        assert_eq!(parse_index(base)[0].override_exes, vec!["b.exe"]);
+
+        let declared = parse_index(&format!("{base}    files:\n      - name: real-b\n"));
+        assert!(declared[0].override_exes.is_empty(), "{:?}", declared[0].override_exes);
+        assert_eq!(declared[0].commands(), (Certainty::Declared, vec!["real-b"]));
     }
 
     /// A `description:` whose value merely STARTS with `|` (inside quotes) is an
