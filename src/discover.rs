@@ -13,7 +13,7 @@
 //! auto-installed (see [`pick`]); substring and description hits are shown but
 //! always require the user to choose.
 
-use crate::aqua::registry::Candidate;
+use crate::aqua::registry::{Candidate, Certainty};
 
 /// How a candidate matched the query, weakest → strongest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -78,7 +78,7 @@ pub struct Hit {
     /// Whether this package is KNOWN to install a command named like the query.
     /// A package whose declared `files[]` prove otherwise (`bottom` installs
     /// `btm`) must not out-pick one that does — see [`pick`] — and neither must
-    /// one where the commands are only known per-version.
+    /// one whose commands are declared only by the branch it installs from.
     pub provides: bool,
 }
 
@@ -179,12 +179,19 @@ fn why_matched(c: &Candidate, q: &str) -> Option<Why> {
     if c.name.as_deref().is_some_and(|n| eq(&last(n))) {
         return Some(Why::Name);
     }
-    if c.exes.iter().any(|e| eq(e)) {
+    // Match on what the package is KNOWN to install, which is not always what its
+    // package-level `files[]` advertise: `ImageMagick/ImageMagick` names `magick`
+    // only under a `goos: linux` override, while `ip7z/7zip` advertises a `7za`
+    // that a linux install never produces.
+    let (certainty, cmds) = c.commands();
+    if certainty == Certainty::Declared && cmds.iter().any(|n| eq(n)) {
         return Some(Why::Command);
     }
     if c.aliases.iter().any(|a| eq(&last(a))) {
         return Some(Why::Alias);
     }
+    // A substring match only claims the package is worth LOOKING at, so the
+    // advertised names count here even where an override would replace them.
     let contains = |s: &str| s.to_ascii_lowercase().contains(q);
     if contains(&c.repo)
         || c.name.as_deref().is_some_and(contains)
@@ -349,7 +356,7 @@ mod tests {
     /// commands it declares (`rootlesskit`, `vpnkit`) live in a version override.
     /// Nothing named `rootless` is ever installed, so we must not claim it is.
     #[test]
-    fn per_version_evidence_never_claims_to_provide_the_query() {
+    fn branch_only_evidence_never_claims_to_provide_the_query() {
         let rootless = Candidate {
             name: Some("docker/cli/rootless".into()),
             override_exes: vec!["rootlesskit".into(), "vpnkit".into()],
@@ -358,7 +365,8 @@ mod tests {
         let hits = rank(std::slice::from_ref(&rootless), "rootless");
         assert_eq!(hits[0].why, Why::Name, "the aqua name still matches exactly");
         assert!(!hits[0].provides, "the override names it installs are not `rootless`");
-        // Unrivaled, so it is still offered — with an honest per-version note.
+        // Unrivaled, so it is still offered — with an honest note naming what
+        // actually lands on PATH.
         assert!(pick(&hits).is_some());
 
         // But a package that really does ship `rootless` shadows it.
@@ -369,6 +377,32 @@ mod tests {
         let hits = rank(&[rootless, real], "rootless");
         assert!(hits.iter().any(|h| h.provides));
         assert!(pick(&hits).is_none());
+    }
+
+    /// An exact `Why::Command` follows the commands actually installed, not the
+    /// advertised `files[]`: `ImageMagick/ImageMagick` declares `magick` only under
+    /// a `goos: linux` override (so `magick` resolves outright), while `ip7z/7zip`
+    /// advertises a `7za` that a linux install never produces (so `7za` is offered
+    /// as a lead, never auto-installed).
+    #[test]
+    fn an_exact_command_match_follows_what_is_installed() {
+        let magick = Candidate {
+            override_exes: vec!["magick".into()],
+            ..cand("ImageMagick", "ImageMagick", "github_release")
+        };
+        let hits = rank(std::slice::from_ref(&magick), "magick");
+        assert_eq!(hits[0].why, Why::Command);
+        assert_eq!(pick(&hits).and_then(|h| h.spec.clone()), Some("aqua:ImageMagick/ImageMagick".into()));
+
+        let sevenzip = Candidate {
+            exes: vec!["7zzs".into(), "7zz".into(), "7za".into()],
+            override_exes: vec!["7zzs".into(), "7zz".into()],
+            ..cand("ip7z", "7zip", "github_release")
+        };
+        let hits = rank(std::slice::from_ref(&sevenzip), "7za");
+        assert_eq!(hits[0].why, Why::Substring, "still worth showing, but not an exact hit");
+        assert!(!hits[0].provides);
+        assert!(pick(&hits).is_none(), "a name it does not install must not auto-install");
     }
 
     /// The flip side: `sharkdp/bat` has NO package-level `files[]` either — every

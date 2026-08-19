@@ -54,10 +54,16 @@ pub struct Effective {
 /// Select the winning `version_override` branch for `latest_version`, merged
 /// onto the package base (plan §7 steps 1–3).
 ///
-/// * If any branch has `version_constraint == "true"`, take it.
+/// * If the PACKAGE-level `version_constraint` is absent or holds, the base entry
+///   applies and the branches are not consulted at all.
+/// * Else if any branch has `version_constraint == "true"`, take it.
 /// * Else evaluate each branch's constraint against `latest_version`; take the
 ///   first match (list order).
 /// * Else bail with the registry.yaml link.
+///
+/// Two deliberate divergences from aqua are recorded in
+/// `docs/KNOWN_LIMITATIONS.md`: the `"true"` hoist, and bailing where aqua would
+/// silently fall back to a base entry it just ruled out.
 ///
 /// `latest_version` is the resolved latest tag (may carry a `v`/prefix — we
 /// only compare the semver core).
@@ -65,6 +71,27 @@ pub fn select_branch(pkg: &Package, latest_version: &str, owner: &str, repo: &st
     // No version_overrides at all: the base itself is the branch (simple pkgs).
     if pkg.version_overrides.is_empty() {
         return Ok(base_branch(pkg));
+    }
+
+    // 0) The package-level `version_constraint` says WHEN THE BASE APPLIES; aqua
+    // reads `version_overrides` only when it does not hold
+    // (`PackageInfo.SetVersion`, aqua/pkg/config/registry/version_override.go).
+    // NO constraint means the base always applies and the branches are dead
+    // history; `"false"` is how a package says "always use a branch" (1693 of
+    // them, e.g. `sharkdp/bat`); anything else is a `>= <old version>` guard whose
+    // whole point is that current releases use the base. Skipping this step took
+    // the oldest fallback branch instead: `ubix add func` installed
+    // knative-v1.23.1 as `faas`, and `ajeetdsouza/zoxide` picked a branch whose
+    // asset template still carries the `v` prefix the base trims. An expression we
+    // cannot evaluate is read as HOLDING, since that is what it means for every
+    // current release.
+    match pkg.version_constraint.as_deref() {
+        None => return Ok(base_branch(pkg)),
+        Some("false") => {}
+        Some(c) if eval_constraint(c, latest_version).unwrap_or(true) => {
+            return Ok(base_branch(pkg));
+        }
+        Some(_) => {}
     }
 
     // 1) `version_constraint == "true"` wins outright.
@@ -398,14 +425,83 @@ mod tests {
         assert!(branch.replacements.contains_key("linux"));
     }
 
+    /// The package-level `version_constraint` gates the BASE entry: while it holds,
+    /// aqua never reads `version_overrides`. Ignoring it took the oldest fallback
+    /// branch — `ubix add func` installed knative-v1.23.1 as `faas`, and
+    /// `ajeetdsouza/zoxide` picked a branch whose asset keeps the `v` the base
+    /// trims.
+    #[test]
+    fn package_constraint_keeps_the_base_entry_over_a_true_branch() {
+        let yaml = r#"
+packages:
+  - type: github_release
+    repo_owner: ajeetdsouza
+    repo_name: zoxide
+    asset: zoxide-{{trimV .Version}}-{{.Arch}}.{{.Format}}
+    files:
+      - name: zoxide
+    version_constraint: semver(">= 0.8.2")
+    version_overrides:
+      - version_constraint: "true"
+        asset: zoxide-{{.Version}}-{{.Arch}}.{{.Format}}
+        files:
+          - name: legacy-zoxide
+"#;
+        let pkg = parse(yaml);
+        let now = select_branch(&pkg, "0.9.8", "ajeetdsouza", "zoxide").unwrap();
+        assert_eq!(now.asset.as_deref(), Some("zoxide-{{trimV .Version}}-{{.Arch}}.{{.Format}}"));
+        assert_eq!(now.files.unwrap()[0].name.as_deref(), Some("zoxide"));
+
+        // Below the constraint the branch takes over again.
+        let old = select_branch(&pkg, "0.5.0", "ajeetdsouza", "zoxide").unwrap();
+        assert_eq!(old.files.unwrap()[0].name.as_deref(), Some("legacy-zoxide"));
+
+        // An expression we cannot evaluate (`knative/func`'s `semverWithVersion(…)
+        // or …`) means the same thing for a current release: the base applies.
+        let unparseable = yaml.replace(r#"semver(">= 0.8.2")"#, r#"semverWithVersion(">= 1.7.0")"#);
+        let branch = select_branch(&parse(&unparseable), "1.23.1", "knative", "func").unwrap();
+        assert_eq!(branch.files.unwrap()[0].name.as_deref(), Some("zoxide"));
+
+        // `"false"` is the opposite instruction: always use a branch.
+        let never = yaml.replace(r#"semver(">= 0.8.2")"#, r#""false""#);
+        let branch = select_branch(&parse(&never), "0.9.8", "x", "y").unwrap();
+        assert_eq!(branch.files.unwrap()[0].name.as_deref(), Some("legacy-zoxide"));
+    }
+
+    #[test]
+    fn no_package_constraint_never_consults_the_branches() {
+        // `PackageInfo.SetVersion` returns the base entry outright when the
+        // package declares no `version_constraint`, however the branches are
+        // constrained — `RobotsAndPencils/xcodes` is the one such package, and its
+        // only branch is a `no_asset` hole for a single broken release.
+        let yaml = r#"
+packages:
+  - type: github_release
+    repo_owner: RobotsAndPencils
+    repo_name: xcodes
+    asset: xcodes.zip
+    version_overrides:
+      - version_constraint: Version == "1.4.0"
+        no_asset: true
+"#;
+        let pkg = parse(yaml);
+        for v in ["1.4.0", "1.6.2"] {
+            let branch = select_branch(&pkg, v, "RobotsAndPencils", "xcodes").unwrap();
+            assert!(!branch.no_asset, "{v}");
+            assert_eq!(branch.asset.as_deref(), Some("xcodes.zip"), "{v}");
+        }
+    }
+
     #[test]
     fn select_semver_fallback_when_no_true() {
-        // Synthesize a package with only comparison branches.
+        // Synthesize a package with only comparison branches. `"false"` is what
+        // hands the package over to them (an absent constraint keeps the base).
         let yaml = r#"
 packages:
   - type: github_release
     repo_owner: x
     repo_name: y
+    version_constraint: "false"
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         asset: old-{{.OS}}
@@ -427,6 +523,7 @@ packages:
   - type: github_release
     repo_owner: x
     repo_name: y
+    version_constraint: "false"
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         asset: old
@@ -513,6 +610,7 @@ packages:
     repo_name: y
     asset: base-{{.OS}}
     format: raw
+    version_constraint: "false"
     version_overrides:
       - version_constraint: "true"
         no_asset: true

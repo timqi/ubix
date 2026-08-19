@@ -42,37 +42,61 @@ case works today; each note records the edge and why it was left.
   `fly` alias, and `kubectl <plugin>` dispatch requires the `kubectl-*` name.
   Supporting them needs an `aliases` config field + post-install symlinks tracked
   in state (removal is already unlink-by-tracked-file). (`src/aqua/synth.rs`)
+- **`select_branch` hoists the unconditional `"true"` branch.** aqua evaluates
+  `version_overrides` in declaration order and takes the FIRST whose constraint
+  holds; ubix takes the `"true"` branch — always the last one in the registry —
+  before evaluating any earlier branch. It only diverges when installing an OLD
+  version of a package whose earlier branches would match: `golang/tools/godoc`,
+  `golang/tools/guru`, `theupdateframework/go-tuf/{tuf,tuf-client}` and
+  `oxc-project/oxc/oxlint`. Ordering it aqua's way requires the next bullet first,
+  since a misparsed constraint would then silently win.
+  (`src/aqua/resolve.rs::select_branch`)
+- **`eval_constraint` reads only the first comparison of an expression.**
+  `semver("> 1.0.0, <= 2.0.0")` is evaluated as `> 1.0.0`, and
+  `semver(...) or semver(...)` as its left operand, so ~40 packages can accept a
+  branch aqua would rule out (or the reverse). Fixing it means implementing
+  aqua's expr grammar, not just its `semver()` helper.
+  (`src/aqua/resolve.rs::eval_constraint`)
+- **No base-entry fallback when every branch is ruled out.** aqua returns the base
+  entry it just rejected; ubix bails with an error instead of synthesizing from a
+  version the registry says the entry does not describe.
+  (`src/aqua/resolve.rs::select_branch`)
 
 ## bare-name discovery (`add <name>` / `which`)
-- **Commands declared only inside a `version_overrides` branch don't create a
-  match.** The scanner does collect them (`Candidate::override_exes` — from the
-  `"true"` branch, mirroring `resolve::select_branch` + `merge_branch`), but only
-  as EVIDENCE: they decide what the resolution note says and whether a
-  hit counts as providing the queried command, never whether it matches in the
-  first place. Matching on them would need the branch selection to be exact per
-  query, and a near-miss resolves a bare name through a binary the tool stopped
-  shipping (`volta` shipped as `notion`, `ripgrep` as `xrep`). Consequence:
-  `ubix which rg` still ranks `microsoft/ripgrep-prebuilt` (a mirror that declares
-  `rg` at the package level) above `BurntSushi/ripgrep`. Workaround:
-  `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
 - **Branch selection is approximated, not evaluated.** The scanner can't run
-  aqua's `version_constraint` expressions, so branch evidence exists only for the
-  ~1.8k packages with an unconditional `"true"` branch — which is the one
-  `resolve::select_branch` installs from. For the 88 packages whose every branch
-  is constrained, the scanner reports the package-level `files[]` instead of
-  guessing a branch (guessing the last-listed one made `dineshba/tf-summarize`
-  claim `terraform-plan-summarize`, a command it no longer ships). And for
-  `>=`-ordered packages the `"true"` branch is the OLDEST fallback, so
-  `ubix which func` reports `installs faas for some versions`: accurate about what
-  ubix would install today (aqua itself would honor the package-level
-  `version_constraint` and install `func`), but not about the tool.
-  (`src/aqua/registry.rs`, `src/aqua/resolve.rs`)
-- **A queried command can match a package that no longer installs it.** Matching
-  uses package-level `files[]`; the selected branch only corrects the note. So
-  `ubix add cfs-preload` resolves `aqua:cubefs/cubefs` with
-  `installs cfs-authtool, cfs-bcache, … ` — truthful, but it resolves rather than
-  refuses. Matching on branch names instead would need per-query branch selection
-  (see the previous note). (`src/discover.rs`, `src/aqua/registry.rs`)
+  aqua's `version_constraint` expressions. It reads `version_overrides` only where
+  the package-level constraint is the literal `"false"` (1693 packages) — the one
+  value that can never hold, and so the only one that hands the package to its
+  branches — and there it takes the unconditional `"true"` branch, which is what
+  `resolve::select_branch` installs from. Every other package-level constraint is
+  a version guard whose truth depends on the version being installed, so the base
+  entry is reported (which is also what aqua falls back to when no branch
+  matches). For the ~88 packages whose every branch is constrained, the scanner
+  reports the package-level `files[]` rather than guessing a branch — guessing the
+  last-listed one made `dineshba/tf-summarize` claim `terraform-plan-summarize`, a
+  command it no longer ships. (`src/aqua/registry.rs`, `src/aqua/resolve.rs`)
+- **Command evidence is scoped to the running host.** A platform `overrides[]`
+  entry counts only when its `goos`/`goarch` match this machine, mirroring
+  `resolve::effective_for`. So the same registry gives different answers on
+  different hosts (`ImageMagick/ImageMagick` installs `magick` on linux and eight
+  commands on windows), and a package that names its commands only for platforms
+  you are not on falls back to the package-level `files[]` — or, failing that, to
+  the repo name. A YAML alias (`files: *anchor`) is likewise not resolved by a
+  line scan; the scope inherits instead. Neither case is currently reachable from
+  a `"true"` branch or a base entry. An `envs:`-scoped override (7 lines in the
+  whole registry, one of which declares `files:`) is read as unscoped, so it would
+  apply everywhere — currently unreachable, since that package's `"true"` branch
+  is `no_asset`. (`src/aqua/registry.rs`)
+- **A mirror that declares the same command ties with upstream.** Matching now
+  follows the commands a package is known to INSTALL, so `ubix which rg` lists
+  `BurntSushi/ripgrep` first — but `microsoft/ripgrep-prebuilt` declares `rg` too,
+  and an exact tie is never auto-installed. `ubix add rg` therefore asks; pick
+  with `--pick 1` or name the source. (`src/discover.rs`)
+- **A command a package stopped shipping still surfaces as a weak hit.** Exact
+  matching uses the effective command set, but the SUBSTRING pass still scans the
+  advertised `files[]`, so `ubix which cfs-preload` lists `aqua:cubefs/cubefs`
+  under `name contains` with an honest `installs cfs-cli, …` note. It is offered,
+  never auto-installed. (`src/discover.rs`, `src/aqua/registry.rs`)
 - **Only aqua is searched.** A tool that exists solely on PyPI, npm, or
   conda-forge doesn't resolve from a bare name; use the explicit prefix (or
   `ubix search --pixi`). Probing those registries per query is deferred because

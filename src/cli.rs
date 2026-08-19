@@ -1738,18 +1738,15 @@ fn installable_spec(query: &str, hit: &crate::discover::Hit) -> Result<(String, 
 /// the queried command and there is nothing to warn about.
 ///
 /// Naming the real binary is the fastest way to tell a genuine hit from a
-/// same-named lookalike, and the per-version hedge matters because those
-/// commands are declared only for SOME versions.
+/// same-named lookalike.
 fn commands_note(query: &str, c: &crate::aqua::registry::Candidate) -> String {
-    use crate::aqua::registry::Certainty;
-    let (certainty, cmds) = c.commands();
-    match certainty {
-        // Nothing to say when the package installs exactly what was asked for —
-        // including when only an override declares it (`sharkdp/bat` → `bat`).
-        _ if cmds.len() == 1 && cmds[0].eq_ignore_ascii_case(query) => String::new(),
-        Certainty::PerVersion => format!("installs {} for some versions", cmds.join(", ")),
-        _ => format!("installs {}", cmds.join(", ")),
+    let cmds = c.command_names();
+    // Nothing to say when the package installs exactly what was asked for —
+    // including when only an override declares it (`sharkdp/bat` → `bat`).
+    if cmds.len() == 1 && cmds[0].eq_ignore_ascii_case(query) {
+        return String::new();
     }
+    format!("installs {}", cmds.join(", "))
 }
 
 /// Print ranked discovery candidates, best first, each with the spec it installs
@@ -2926,18 +2923,18 @@ mod tests {
         };
         assert_eq!(note(bottom, "bottom"), "installs btm");
 
-        // Only a version override declares files[] — `rootless` itself is never
-        // a binary, so the note must not promise one.
+        // Only the selected override branch declares files[] — `rootless` itself
+        // is never a binary, so the note must not promise one.
         let rootless = crate::aqua::registry::Candidate {
             name: Some("docker/cli/rootless".into()),
             exes: vec![],
             override_exes: vec!["rootlesskit".into(), "vpnkit".into()],
             ..gh
         };
-        assert_eq!(note(rootless, "rootless"), "installs rootlesskit, vpnkit for some versions");
+        assert_eq!(note(rootless, "rootless"), "installs rootlesskit, vpnkit");
 
-        // …but a per-version declaration OF the query needs no hedge: that is
-        // just how `sharkdp/bat` spells "installs bat".
+        // …and a branch that declares the query itself needs no note at all: that
+        // is just how `sharkdp/bat` spells "installs bat".
         let bat = crate::aqua::registry::Candidate {
             owner: "sharkdp".into(),
             repo: "bat".into(),
