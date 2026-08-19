@@ -29,6 +29,12 @@ pub struct Package {
     /// aqua package type; we only support `github_release` (else degrade).
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
+    /// Explicit package name. Absent means it is implied by
+    /// `repo_owner/repo_name`; present when a repo ships several tools
+    /// (`kubernetes/kubernetes/kubectl`), which is also how aqua files it under
+    /// `pkgs/`. Used to pick the right entry out of a multi-package document.
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub repo_owner: Option<String>,
     #[serde(default)]

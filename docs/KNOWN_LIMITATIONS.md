@@ -43,6 +43,20 @@ case works today; each note records the edge and why it was left.
   Supporting them needs an `aliases` config field + post-install symlinks tracked
   in state (removal is already unlink-by-tracked-file). (`src/aqua/synth.rs`)
 
+## bare-name discovery (`add <name>` / `which`)
+- **Commands declared only inside a `version_overrides` branch are invisible.**
+  The root-index scanner reads name-ish fields at the package level, so
+  `BurntSushi/ripgrep` — whose `files: - name: rg` lives in a version override —
+  contributes no `rg` command name, and `ubix which rg` ranks
+  `microsoft/ripgrep-prebuilt` (a mirror that declares it at the top level) first.
+  Merging override branches during the scan would mean parsing the 3.2 MB index
+  structurally; the planned fix instead falls back to a GitHub repo search ranked
+  by stars. Workaround: `ubix add github:BurntSushi/ripgrep`. (`src/aqua/registry.rs`)
+- **Only aqua is searched.** A tool that exists solely on PyPI, npm, or
+  conda-forge doesn't resolve from a bare name; use the explicit prefix (or
+  `ubix search --pixi`). Probing those registries per query is deferred because
+  each is a separate network round-trip on the `add` hot path. (`src/discover.rs`)
+
 ## `outdated` / version discovery
 - **Go latest-version query uses the install package path, not the module root.**
   `go:golang.org/x/tools/cmd/stringer` installs fine, but the `@latest` query 404s

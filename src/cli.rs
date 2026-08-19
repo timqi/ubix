@@ -90,11 +90,14 @@ pub enum Command {
     Sources,
     /// Search the aqua-registry and print (or add) a generated `github:` config.
     Search(SearchArgs),
+    /// Show which source and repo a bare tool name resolves to (no install).
+    Which(WhichArgs),
 }
 
 #[derive(Debug, Args)]
 pub struct AddArgs {
-    /// `$source:$locator` spec (e.g. github:owner/repo, pypi:ruff).
+    /// A bare tool name (e.g. `bat` — the source and repo are discovered), or an
+    /// explicit `$source:$locator` spec (e.g. github:owner/repo, pypi:ruff).
     pub spec: String,
     /// Explicit tool name (defaults to derived from the locator).
     #[arg(long)]
@@ -135,6 +138,28 @@ pub struct AddArgs {
     /// Block waiting for the state lock instead of failing fast.
     #[arg(long)]
     pub wait: bool,
+    /// (bare name) only consider candidates from this source, e.g. `--from cargo`.
+    #[arg(long, value_name = "SOURCE")]
+    pub from: Option<String>,
+    /// (bare name) install the Nth discovered candidate as listed by `ubix which`.
+    #[arg(long, value_name = "N")]
+    pub pick: Option<usize>,
+    /// (bare name) force a fresh download of the aqua root index, ignoring the
+    /// local cache TTL.
+    #[arg(long)]
+    pub refresh: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WhichArgs {
+    /// Bare tool name to resolve (e.g. `bat`).
+    pub query: String,
+    /// Only show candidates from this source, e.g. `--from cargo`.
+    #[arg(long, value_name = "SOURCE")]
+    pub from: Option<String>,
+    /// Force a fresh download of the aqua root index, ignoring the cache TTL.
+    #[arg(long)]
+    pub refresh: bool,
 }
 
 #[derive(Debug, Args)]
@@ -249,11 +274,22 @@ impl App {
             Command::Bootstrap(a) => self.cmd_bootstrap(a),
             Command::Sources => self.cmd_sources(),
             Command::Search(a) => self.cmd_search(a),
+            Command::Which(a) => self.cmd_which(a),
         }
     }
 
     // ---- add ----
-    fn cmd_add(&self, args: AddArgs) -> Result<()> {
+    fn cmd_add(&self, mut args: AddArgs) -> Result<()> {
+        // A bare name (`bat`) carries no source: discover one from the aqua root
+        // index first, then take the normal add flow with the resolved spec. The
+        // tool is named after what the user typed, so `ubix add gh` yields `gh`
+        // (not `cli`, the repo behind it).
+        if crate::discover::is_bare_name(&args.spec) {
+            let query = args.spec.trim().to_string();
+            args.spec = self.discover_spec(&query, &args)?;
+            step!("resolved `{query}` → {}", args.spec);
+            args.name = args.name.or(Some(query));
+        }
         // aqua: prefix is intercepted BEFORE parse_spec (§8): resolve the aqua
         // package into a synthesized `github:` ToolConfig, then take the normal
         // add flow. `aqua:` never reaches parse_spec/SourceKind.
@@ -283,10 +319,10 @@ impl App {
                     set.join(", ")
                 );
             }
-            let (owner, repo) = split_owner_repo(rest.trim())?;
-            step!("resolving aqua:{owner}/{repo}");
+            let path = aqua_pkg_path(rest)?;
+            step!("resolving aqua:{path}");
             let (name, tool) =
-                crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+                crate::aqua::resolve_package(self.http.as_ref(), &path, args.name.as_deref())?;
             return self.persist_and_install(name, tool, args.force, args.wait);
         }
 
@@ -1195,9 +1231,9 @@ impl App {
         // Explicit `owner/repo` → precise aqua GitHub lookup (full snippet +
         // per-platform matching preview); the combined list can't show that detail.
         if query.contains('/') {
-            let (owner, repo) = split_owner_repo(&query)?;
+            let path = aqua_pkg_path(&query)?;
             let (name, tool) =
-                crate::aqua::resolve_package(self.http.as_ref(), &owner, &repo, args.name.as_deref())?;
+                crate::aqua::resolve_package(self.http.as_ref(), &path, args.name.as_deref())?;
             if args.add {
                 return self.persist_and_install(name, tool, false, args.wait);
             }
@@ -1278,12 +1314,8 @@ impl App {
 
         match &cands[idx] {
             SearchHit::Aqua(c) => {
-                let (name, tool) = crate::aqua::resolve_package(
-                    self.http.as_ref(),
-                    &c.owner,
-                    &c.repo,
-                    name_override,
-                )?;
+                let (name, tool) =
+                    crate::aqua::resolve_package(self.http.as_ref(), &c.pkg_path(), name_override)?;
                 self.persist_and_install(name, tool, false, wait)
             }
             SearchHit::Pixi(h) => {
@@ -1292,6 +1324,107 @@ impl App {
                 self.persist_and_install(name, tool, false, wait)
             }
         }
+    }
+
+    // ---- which / bare-name discovery ----
+
+    /// Resolve a bare tool name (`bat`) to an installable spec.
+    ///
+    /// Only an unambiguous exact match installs itself (see [`discover::pick`]).
+    /// Anything else prints the candidate table and requires a choice: `--pick N`,
+    /// `--from <source>`, `--yes` (take the top-ranked installable candidate), or
+    /// an interactive pick at a TTY.
+    fn discover_spec(&self, query: &str, args: &AddArgs) -> Result<String> {
+        let hits = self.discover_hits(query, args.from.as_deref(), args.refresh)?;
+
+        // --pick N indexes the list `ubix which` prints (1-based).
+        if let Some(n) = args.pick {
+            let idx = n.checked_sub(1).context("--pick is 1-based (use --pick 1 for the top hit)")?;
+            let hit = hits
+                .get(idx)
+                .with_context(|| format!("--pick {n} is out of range ({} candidates)", hits.len()))?;
+            return installable_spec(hit);
+        }
+        if let Some(hit) = crate::discover::pick(&hits) {
+            return installable_spec(hit);
+        }
+
+        print_discovery(query, &hits, DISCOVERY_LIMIT);
+        if self.assume_yes {
+            let hit = hits
+                .iter()
+                .find(|h| h.spec.is_some())
+                .context("no discovered candidate maps to a ubix source")?;
+            step!("--yes: taking the top-ranked candidate");
+            return installable_spec(hit);
+        }
+        if let Some(hit) = prompt_pick(&hits) {
+            return installable_spec(hit);
+        }
+        bail!(
+            "`{query}` did not resolve to a single source; pick one with `--pick N`, \
+             narrow with `--from <source>`, or pass an explicit spec"
+        )
+    }
+
+    /// Rank aqua-registry packages against a bare `query`, optionally narrowed to
+    /// one ubix source. Uses the TTL-cached root index (no network when fresh).
+    fn discover_hits(
+        &self,
+        query: &str,
+        from: Option<&str>,
+        refresh: bool,
+    ) -> Result<Vec<crate::discover::Hit>> {
+        let text = crate::aqua::registry::root_index(self.http.as_ref(), refresh)?;
+        let cands = crate::aqua::registry::parse_index(&text);
+        let mut hits = crate::discover::rank(&cands, query);
+        if hits.is_empty() {
+            bail!(
+                "no aqua-registry package matching `{query}`; try `ubix search {query}` \
+                 (which also searches conda/prefix.dev) or pass an explicit spec such as \
+                 `github:owner/{query}`"
+            );
+        }
+        if let Some(src) = from {
+            let want = src.trim().trim_end_matches(':');
+            hits.retain(|h| {
+                h.spec
+                    .as_deref()
+                    .and_then(|s| s.split_once(':'))
+                    .is_some_and(|(prefix, _)| prefix == want)
+            });
+            if hits.is_empty() {
+                bail!(
+                    "no `{query}` candidate from source `{want}`; the registry maps packages \
+                     to aqua, cargo or go"
+                );
+            }
+        }
+        Ok(hits)
+    }
+
+    fn cmd_which(&self, args: WhichArgs) -> Result<()> {
+        let query = args.query.trim().to_string();
+        if !crate::discover::is_bare_name(&query) {
+            bail!(
+                "`{query}` is already an explicit spec or locator; `which` resolves bare \
+                 tool names (try `ubix search {query}`)"
+            );
+        }
+        let hits = self.discover_hits(&query, args.from.as_deref(), args.refresh)?;
+        print_discovery(&query, &hits, WHICH_LIMIT);
+        match crate::discover::pick(&hits) {
+            Some(h) => println!(
+                "# `ubix add {query}` installs {} (matched on {})",
+                h.spec.as_deref().unwrap_or("-"),
+                h.why.label()
+            ),
+            None => println!(
+                "# ambiguous: `ubix add {query}` stops and asks — choose with `--pick N` \
+                 or `--from <source>`"
+            ),
+        }
+        Ok(())
     }
 
     // ---- install / upgrade dispatch ----
@@ -1540,6 +1673,93 @@ fn print_search_results(query: &str, cands: &[SearchHit]) {
         "# * = exact match. github hits → `ubix search … --aqua` to inspect the synthesized \
          config; pixi hits → `ubix add …`. Or append --add to install the exact match."
     );
+}
+
+/// How many discovery candidates `add` prints before asking, and how many
+/// `which` lists. `add` stays short (the user is mid-install); `which` is the
+/// place to browse.
+const DISCOVERY_LIMIT: usize = 12;
+const WHICH_LIMIT: usize = 25;
+
+/// The spec for a chosen candidate, or an error naming the aqua type ubix has no
+/// source for (`github_content`/`github_archive`: registry file layouts, not
+/// release artifacts).
+fn installable_spec(hit: &crate::discover::Hit) -> Result<String> {
+    hit.spec.clone().with_context(|| {
+        format!(
+            "{}/{} is an aqua `{}` package, which ubix has no source for",
+            hit.candidate.owner, hit.candidate.repo, hit.candidate.kind
+        )
+    })
+}
+
+/// Print ranked discovery candidates, best first, each with the spec it installs
+/// and the evidence it matched on. The `*` row is the one `add` would take
+/// unattended; every other row needs an explicit choice.
+fn print_discovery(query: &str, hits: &[crate::discover::Hit], limit: usize) {
+    let auto = crate::discover::pick(hits).map(|h| h.spec.as_deref().unwrap_or_default().to_string());
+    let shown = &hits[..hits.len().min(limit)];
+    let width = shown
+        .iter()
+        .map(|h| h.spec.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(0)
+        .min(44);
+    println!("# candidates for `{query}` (best first)");
+    for (i, h) in shown.iter().enumerate() {
+        let spec = h.spec.as_deref().unwrap_or("-");
+        let star = if auto.as_deref() == Some(spec) { "*" } else { " " };
+        // Naming what actually lands on PATH is the fastest way to tell a real
+        // hit from a same-named lookalike, so surface it whenever the package
+        // installs something other than the queried command.
+        let cmds = h.candidate.command_names();
+        let mut desc = String::new();
+        if cmds != [query] {
+            desc.push_str(&format!("installs {} · ", cmds.join(", ")));
+        }
+        if let Some(d) = h.candidate.description.as_deref() {
+            desc.push_str(d);
+        }
+        let desc = truncate(desc.trim_end_matches(" · "), 60);
+        println!(
+            "{star}{:>3}  {spec:<width$}  {:<13}  {desc}",
+            i + 1,
+            h.why.label(),
+            width = width
+        );
+    }
+    if hits.len() > shown.len() {
+        println!(
+            "# … {} more; narrow the query or run `ubix which {query}`",
+            hits.len() - shown.len()
+        );
+    }
+}
+
+/// Offer an interactive pick over the printed candidates. Returns `None` when
+/// stdin is not a TTY (so non-interactive callers get the explanatory bail
+/// instead of hanging) or the answer is empty/unparseable.
+fn prompt_pick(hits: &[crate::discover::Hit]) -> Option<&crate::discover::Hit> {
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let max = hits.len().min(DISCOVERY_LIMIT);
+    eprint!("Install which? [1-{max}, Enter to cancel] ");
+    let _ = std::io::stderr().flush();
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok()?;
+    let n: usize = line.trim().parse().ok()?;
+    hits.get(n.checked_sub(1)?)
+}
+
+/// Shorten `s` to `max` chars (char-boundary safe), marking the cut with `…`.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 /// Print the synthesized aqua `github:` snippet plus a one-line platform preview.
@@ -1956,13 +2176,16 @@ fn parse_kv_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String,
     Ok(map)
 }
 
-/// Split an `owner/repo` string into its two non-empty segments.
-pub fn split_owner_repo(s: &str) -> Result<(String, String)> {
-    let segs: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
-    if s.split('/').count() != 2 || segs.len() != 2 {
-        bail!("expected `owner/repo`, got `{s}`");
+/// Validate an aqua package path: `owner/repo`, or a longer nested package name
+/// such as `kubernetes/kubernetes/kubectl` (a repo shipping several tools files
+/// each one under its own name). Returns it trimmed.
+pub fn aqua_pkg_path(s: &str) -> Result<String> {
+    let path = s.trim();
+    let segs: Vec<&str> = path.split('/').collect();
+    if segs.len() < 2 || segs.iter().any(|p| p.is_empty()) {
+        bail!("expected an aqua package path `owner/repo[/tool]`, got `{s}`");
     }
-    Ok((segs[0].to_string(), segs[1].to_string()))
+    Ok(path.to_string())
 }
 
 /// Bare package name for registry homepage links: strip a `@`/`=` version pin.
@@ -2589,10 +2812,16 @@ mod tests {
     }
 
     #[test]
-    fn split_owner_repo_ok_and_errors() {
-        assert_eq!(split_owner_repo("openai/codex").unwrap(), ("openai".into(), "codex".into()));
-        assert!(split_owner_repo("codex").is_err());
-        assert!(split_owner_repo("a/b/c").is_err());
+    fn aqua_pkg_path_ok_and_errors() {
+        assert_eq!(aqua_pkg_path(" openai/codex ").unwrap(), "openai/codex");
+        // A nested package name is a valid path (`pkgs/<name>/registry.yaml`).
+        assert_eq!(
+            aqua_pkg_path("kubernetes/kubernetes/kubectl").unwrap(),
+            "kubernetes/kubernetes/kubectl"
+        );
+        assert!(aqua_pkg_path("codex").is_err());
+        assert!(aqua_pkg_path("a//c").is_err());
+        assert!(aqua_pkg_path("a/b/").is_err());
     }
 
     // ---- bootstrap python/nodejs runtime command construction ----

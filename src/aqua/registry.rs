@@ -19,8 +19,13 @@ const RAW_BASE: &str = "https://raw.githubusercontent.com/aquaproj/aqua-registry
 const ROOT_CACHE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// The raw URL for a single package's registry.yaml.
-pub fn pkg_url(owner: &str, repo: &str) -> String {
-    format!("{RAW_BASE}/pkgs/{owner}/{repo}/registry.yaml")
+///
+/// `path` is the aqua package NAME, not just the repo: plain packages are filed
+/// under `owner/repo`, but a repo that ships several tools files each one under
+/// its full name (`kubernetes/kubernetes/kubectl`, `microsoft/vscode/code`) and
+/// has no `pkgs/owner/repo/registry.yaml` at all.
+pub fn pkg_url(path: &str) -> String {
+    format!("{RAW_BASE}/pkgs/{path}/registry.yaml")
 }
 
 /// The raw URL for the root (all-package) index.
@@ -38,30 +43,41 @@ pub fn root_cache_path() -> PathBuf {
     base.join("ubix").join("aqua-registry.yaml")
 }
 
-/// Fetch and parse a single package's registry.yaml. The document may contain
-/// multiple `packages`; we return the one whose repo matches (case-insensitive),
-/// else the first (aqua puts the primary package first).
-pub fn fetch_package(http: &dyn HttpClient, owner: &str, repo: &str) -> Result<Package> {
-    let url = pkg_url(owner, repo);
+/// Fetch and parse a single aqua package's registry.yaml, addressed by its
+/// package `path` (see [`pkg_url`]).
+///
+/// The document may contain multiple `packages`; we return the one whose `name`
+/// is `path`, else the one whose repo matches `path`'s first/last segment
+/// (case-insensitive — plain packages leave `name` implicit), else the first
+/// (aqua puts the primary package first).
+pub fn fetch_package(http: &dyn HttpClient, path: &str) -> Result<Package> {
+    let url = pkg_url(path);
     let body = http
         .get_text(&url)
-        .with_context(|| format!("fetching aqua registry for {owner}/{repo}"))?;
+        .with_context(|| format!("fetching aqua registry for {path}"))?;
     let reg: Registry = serde_yml::from_str(&body)
-        .with_context(|| format!("parsing aqua registry.yaml for {owner}/{repo}"))?;
+        .with_context(|| format!("parsing aqua registry.yaml for {path}"))?;
     if reg.packages.is_empty() {
-        bail!("aqua registry for {owner}/{repo} has no packages");
+        bail!("aqua registry for {path} has no packages");
     }
-    let chosen = reg
+    let lower = |s: &str| s.to_ascii_lowercase();
+    let segments: Vec<&str> = path.split('/').collect();
+    let owner = lower(segments.first().copied().unwrap_or_default());
+    let repo = lower(segments.last().copied().unwrap_or_default());
+    let by_name = reg
         .packages
         .iter()
-        .find(|p| {
-            p.repo_owner.as_deref().map(str::to_ascii_lowercase) == Some(owner.to_ascii_lowercase())
-                && p.repo_name.as_deref().map(str::to_ascii_lowercase)
-                    == Some(repo.to_ascii_lowercase())
+        .find(|p| p.name.as_deref().map(lower) == Some(lower(path)));
+    let by_repo = || {
+        reg.packages.iter().find(|p| {
+            p.repo_owner.as_deref().map(lower) == Some(owner.clone())
+                && p.repo_name.as_deref().map(lower) == Some(repo.clone())
         })
-        .cloned()
-        .unwrap_or_else(|| reg.packages[0].clone());
-    Ok(chosen)
+    };
+    Ok(by_name
+        .or_else(by_repo)
+        .unwrap_or(&reg.packages[0])
+        .clone())
 }
 
 /// Refresh the root-index cache from upstream into `path`. Returns the bytes
@@ -142,43 +158,189 @@ pub fn read_root_cache(path: &Path) -> Result<Option<String>> {
     ))
 }
 
-/// A search candidate discovered in the root index.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A package discovered in the aqua root index.
+///
+/// The root index inlines every package definition, so it doubles as a
+/// name → (source, repo) map across ecosystems — that's what bare-name
+/// discovery ([`crate::discover`]) scores. Only the fields needed for
+/// discovery/search are modeled; everything else is skipped by the scanner.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Candidate {
     pub owner: String,
     pub repo: String,
+    /// aqua's explicit `name:`, when the package is not simply `owner/repo`
+    /// (nested binaries like `microsoft/vscode/code`, or a cross-ecosystem
+    /// entry like `crates.io/bat`).
+    pub name: Option<String>,
+    /// aqua `type:`. Absent in the registry means `github_release` (aqua's
+    /// default), and we normalize it to that so callers can match on one value.
+    pub kind: String,
+    /// Top-level `files[].name` — the real command names this package installs
+    /// (`cli/cli` → `gh`). Absent in the registry means "same as `repo`".
+    pub exes: Vec<String>,
+    /// Ecosystem locator carried by non-release types: `crate:` (`type: cargo`)
+    /// or `path:` (`type: go_install`).
+    pub locator: Option<String>,
+    pub description: Option<String>,
+    /// `aliases[].name` — former package names, kept so a rename still resolves.
+    pub aliases: Vec<String>,
 }
 
-/// Parse the root index `text` and return owner/repo candidates whose repo name
-/// contains `query` (case-insensitive substring). Deduped, order-preserving.
+impl Candidate {
+    /// The aqua package path — how the package is addressed under `pkgs/` and in
+    /// an `aqua:` spec. That is the explicit `name` when there is one (a repo
+    /// shipping several tools has no `pkgs/owner/repo/registry.yaml`), else
+    /// `owner/repo`.
+    pub fn pkg_path(&self) -> String {
+        match self.name.as_deref() {
+            Some(n) if n.contains('/') => n.to_string(),
+            _ => format!("{}/{}", self.owner, self.repo),
+        }
+    }
+
+    /// The command names this package installs: the declared `files[].name`
+    /// entries, else the last segment of a nested package name (aqua names
+    /// `kubernetes/kubernetes/kubectl` after the command it produces), else the
+    /// repo name.
+    pub fn command_names(&self) -> Vec<&str> {
+        if !self.exes.is_empty() {
+            return self.exes.iter().map(String::as_str).collect();
+        }
+        match self.name.as_deref() {
+            Some(n) if n.contains('/') => vec![n.rsplit('/').next().unwrap_or(n)],
+            _ => vec![self.repo.as_str()],
+        }
+    }
+}
+
+/// Which indent-4 list the scanner is currently inside.
+enum Block {
+    None,
+    Files,
+    Aliases,
+}
+
+/// Parse the root index into one [`Candidate`] per package.
 ///
-/// The root index inlines every package; each carries `repo_owner:`/`repo_name:`
-/// lines. We scan those line-pairs directly (robust to the huge document and to
-/// fields we don't model). A `repo_owner` line is paired with the NEXT
-/// `repo_name` line.
-pub fn search_index(text: &str, query: &str) -> Vec<Candidate> {
-    let q = query.to_ascii_lowercase();
+/// This is a block-aware line scan rather than a `serde_yml` parse: the document
+/// is ~3 MB / ~100k lines and models far more than we need, and a scan over it
+/// costs a few milliseconds (so there is no second index to build and keep
+/// fresh). Structure relied on: a package starts at indent 2 (`  - key: v`),
+/// its own fields sit at indent 4, and `files:`/`aliases:` entries at indent 6.
+/// Anchoring on exact indents is what keeps a `files:` nested under
+/// `version_overrides:` (indent 8) from leaking in as a top-level exe.
+///
+/// Packages without `repo_owner`/`repo_name` are dropped: every ubix spec needs
+/// a repo, so a candidate we could not act on would only be noise.
+pub fn parse_index(text: &str) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
-    let mut pending_owner: Option<String> = None;
+    let mut cur: Option<Candidate> = None;
+    let mut block = Block::None;
     for line in text.lines() {
-        let t = line.trim();
-        if let Some(v) = field(t, "repo_owner:") {
-            pending_owner = Some(v.to_string());
-        } else if let Some(repo) = field(t, "repo_name:") {
-            if let Some(owner) = pending_owner.take() {
-                if repo.to_ascii_lowercase().contains(&q) {
-                    let cand = Candidate {
-                        owner,
-                        repo: repo.to_string(),
-                    };
-                    if !out.contains(&cand) {
-                        out.push(cand);
+        let t = line.trim_start();
+        if t.is_empty() || t.starts_with('#') {
+            continue;
+        }
+        let indent = line.len() - t.len();
+        match indent {
+            2 if t.starts_with("- ") => {
+                push_candidate(&mut out, cur.take());
+                let mut c = Candidate::default();
+                absorb(&mut c, &t[2..]); // the first field rides the dash line
+                cur = Some(c);
+                block = Block::None;
+            }
+            4 => {
+                block = match t {
+                    "files:" => Block::Files,
+                    "aliases:" => Block::Aliases,
+                    _ => Block::None,
+                };
+                if let Some(c) = cur.as_mut() {
+                    absorb(c, t);
+                }
+            }
+            6 => {
+                let entry = t.strip_prefix("- ").unwrap_or(t);
+                if let (Some(c), Some(v)) = (cur.as_mut(), field(entry, "name:")) {
+                    match block {
+                        Block::Files => c.exes.push(v.to_string()),
+                        Block::Aliases => c.aliases.push(v.to_string()),
+                        Block::None => {}
                     }
                 }
             }
+            _ => {}
         }
     }
+    push_candidate(&mut out, cur.take());
     out
+}
+
+/// Finish a scanned package: drop the unusable ones, normalize the default
+/// `type`, and dedupe (the index lists a few packages twice under different
+/// names).
+fn push_candidate(out: &mut Vec<Candidate>, cand: Option<Candidate>) {
+    let Some(mut c) = cand else { return };
+    if c.owner.is_empty() || c.repo.is_empty() {
+        return;
+    }
+    if c.kind.is_empty() {
+        c.kind = "github_release".to_string();
+    }
+    if !out.contains(&c) {
+        out.push(c);
+    }
+}
+
+/// Apply one `key: value` line to the package being scanned.
+fn absorb(c: &mut Candidate, line: &str) {
+    if let Some(v) = field(line, "repo_owner:") {
+        c.owner = v.to_string();
+    } else if let Some(v) = field(line, "repo_name:") {
+        c.repo = v.to_string();
+    } else if let Some(v) = field(line, "type:") {
+        c.kind = v.to_string();
+    } else if let Some(v) = field(line, "name:") {
+        c.name = Some(v.to_string());
+    } else if let Some(v) = field(line, "description:") {
+        c.description = Some(v.to_string());
+    } else if let Some(v) = field(line, "crate:").or_else(|| field(line, "path:")) {
+        c.locator = Some(v.to_string());
+    }
+}
+
+/// Parse the root index `text` and return candidates matching `query`
+/// (case-insensitive substring). Deduped, order-preserving.
+///
+/// Matching is tiered so a short query doesn't drown in prose: repo / package
+/// name / command name / alias hits win, and description hits are returned only
+/// when nothing matched by name at all.
+pub fn search_index(text: &str, query: &str) -> Vec<Candidate> {
+    let q = query.to_ascii_lowercase();
+    let all = parse_index(text);
+    let by_name: Vec<Candidate> = all.iter().filter(|c| matches_name(c, &q)).cloned().collect();
+    if !by_name.is_empty() {
+        return by_name;
+    }
+    all.into_iter()
+        .filter(|c| {
+            c.description
+                .as_deref()
+                .is_some_and(|d| d.to_ascii_lowercase().contains(&q))
+        })
+        .collect()
+}
+
+/// Whether any name-ish field of `c` contains the (already lowercased) `q`.
+fn matches_name(c: &Candidate, q: &str) -> bool {
+    let mut fields: Vec<&str> = vec![c.repo.as_str()];
+    fields.extend(c.name.as_deref());
+    fields.extend(c.exes.iter().map(String::as_str));
+    fields.extend(c.aliases.iter().map(String::as_str));
+    fields
+        .iter()
+        .any(|f| f.to_ascii_lowercase().contains(q))
 }
 
 /// Extract the value of `key` from a trimmed YAML line (`key: value`), stripping
@@ -274,7 +436,7 @@ mod tests {
     #[test]
     fn urls_are_raw_github() {
         assert_eq!(
-            pkg_url("openai", "codex"),
+            pkg_url("openai/codex"),
             "https://raw.githubusercontent.com/aquaproj/aqua-registry/main/pkgs/openai/codex/registry.yaml"
         );
         assert_eq!(
@@ -285,45 +447,179 @@ mod tests {
 
     #[test]
     fn fetch_package_uses_http_seam() {
-        let http = MockHttp::new().with_text(&pkg_url("openai", "codex"), CODEX);
-        let p = fetch_package(&http, "openai", "codex").unwrap();
+        let http = MockHttp::new().with_text(&pkg_url("openai/codex"), CODEX);
+        let p = fetch_package(&http, "openai/codex").unwrap();
         assert_eq!(p.repo_name.as_deref(), Some("codex"));
         assert_eq!(p.type_.as_deref(), Some("github_release"));
+    }
+
+    /// A multi-package document is selected by aqua package `name` first: the
+    /// sibling packages of a nested tool all share one repo, so a repo match
+    /// would return whichever came first.
+    #[test]
+    fn fetch_package_picks_the_named_package_from_a_multi_package_document() {
+        let yaml = r#"
+packages:
+  - name: kubernetes/kubernetes/kubectl-convert
+    type: http
+    repo_owner: kubernetes
+    repo_name: kubernetes
+    url: https://dl.k8s.io/convert
+  - name: kubernetes/kubernetes/kubectl
+    type: http
+    repo_owner: kubernetes
+    repo_name: kubernetes
+    url: https://dl.k8s.io/kubectl
+"#;
+        let path = "kubernetes/kubernetes/kubectl";
+        let http = MockHttp::new().with_text(&pkg_url(path), yaml);
+        let p = fetch_package(&http, path).unwrap();
+        assert_eq!(p.name.as_deref(), Some(path));
+        assert_eq!(p.url.as_deref(), Some("https://dl.k8s.io/kubectl"));
+    }
+
+    #[test]
+    fn pkg_url_takes_the_full_package_path() {
+        // aqua files nested packages under their whole name; `pkgs/kubernetes/
+        // kubernetes/registry.yaml` does not exist.
+        assert!(pkg_url("kubernetes/kubernetes/kubectl")
+            .ends_with("/pkgs/kubernetes/kubernetes/kubectl/registry.yaml"));
+    }
+
+    #[test]
+    fn candidate_path_and_commands_follow_a_nested_name() {
+        let c = Candidate {
+            owner: "kubernetes".into(),
+            repo: "kubernetes".into(),
+            name: Some("kubernetes/kubernetes/kubectl".into()),
+            kind: "http".into(),
+            ..Candidate::default()
+        };
+        assert_eq!(c.pkg_path(), "kubernetes/kubernetes/kubectl");
+        assert_eq!(c.command_names(), vec!["kubectl"]);
+        // A plain package keeps owner/repo, and a declared exe wins over both.
+        let plain = Candidate {
+            owner: "cli".into(),
+            repo: "cli".into(),
+            exes: vec!["gh".into()],
+            ..Candidate::default()
+        };
+        assert_eq!(plain.pkg_path(), "cli/cli");
+        assert_eq!(plain.command_names(), vec!["gh"]);
     }
 
     #[test]
     fn fetch_package_missing_errors() {
         let http = MockHttp::new();
-        assert!(fetch_package(&http, "no", "such").is_err());
+        assert!(fetch_package(&http, "no/such").is_err());
     }
 
-    #[test]
-    fn search_index_substring_match() {
-        // A truncated root-index fixture with a few inlined packages.
-        let root = r#"
+    /// A truncated root-index fixture exercising every shape the scanner cares
+    /// about: a top-level `files:` (real command name), a `files:` nested under
+    /// `version_overrides:` (must NOT leak), aliases, a cross-ecosystem `cargo`
+    /// entry, and a package with no repo (must be dropped).
+    const ROOT: &str = r#"
 packages:
   - type: github_release
     repo_owner: cli
     repo_name: cli
+    description: GitHub's official command line tool
+    files:
+      - name: gh
+        src: gh_{{trimV .Version}}/bin/gh
+    version_overrides:
+      - version_constraint: semver("<= 0.4.0")
+        files:
+          - name: legacy-gh
   - type: github_release
     repo_owner: openai
     repo_name: codex
   - type: github_release
     repo_owner: sharkdp
     repo_name: fd
+    aliases:
+      - name: sharkdp/fd-find
+  - name: crates.io/bat
+    type: cargo
+    repo_owner: sharkdp
+    repo_name: bat
+    description: A cat(1) clone with wings
+    crate: bat
+  - type: http
+    name: no-repo/tool
+    url: https://example.com/tool
 "#;
-        let hits = search_index(root, "cod");
-        assert_eq!(hits, vec![Candidate { owner: "openai".into(), repo: "codex".into() }]);
-        // Substring 'c' matches cli and codex (order preserved).
-        let hits = search_index(root, "c");
-        assert_eq!(
-            hits,
-            vec![
-                Candidate { owner: "cli".into(), repo: "cli".into() },
-                Candidate { owner: "openai".into(), repo: "codex".into() },
-            ]
-        );
+
+    fn find<'a>(cands: &'a [Candidate], repo: &str, kind: &str) -> &'a Candidate {
+        cands
+            .iter()
+            .find(|c| c.repo == repo && c.kind == kind)
+            .unwrap_or_else(|| panic!("no {repo} ({kind}) candidate"))
+    }
+
+    #[test]
+    fn parse_index_reads_fields_block_aware() {
+        let cands = parse_index(ROOT);
+        // The `no-repo/tool` package is dropped (no repo → no actionable spec).
+        assert_eq!(cands.len(), 4, "{cands:#?}");
+
+        let gh = find(&cands, "cli", "github_release");
+        assert_eq!(gh.owner, "cli");
+        // Only the TOP-LEVEL files entry — the version_overrides one is nested
+        // deeper and must not be picked up.
+        assert_eq!(gh.exes, vec!["gh"]);
+        assert_eq!(gh.description.as_deref(), Some("GitHub's official command line tool"));
+
+        let fd = find(&cands, "fd", "github_release");
+        assert_eq!(fd.aliases, vec!["sharkdp/fd-find"]);
+        assert!(fd.exes.is_empty(), "no files: → exes stays empty");
+        assert_eq!(fd.command_names(), vec!["fd"], "exe defaults to the repo name");
+
+        // A cross-ecosystem entry keeps its aqua name, type and crate locator.
+        let bat = find(&cands, "bat", "cargo");
+        assert_eq!(bat.name.as_deref(), Some("crates.io/bat"));
+        assert_eq!(bat.locator.as_deref(), Some("bat"));
+    }
+
+    #[test]
+    fn parse_index_defaults_missing_type_to_github_release() {
+        let cands = parse_index("packages:\n  - repo_owner: a\n    repo_name: b\n");
+        assert_eq!(cands[0].kind, "github_release");
+    }
+
+    #[test]
+    fn search_index_substring_match() {
+        let hits = search_index(ROOT, "cod");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, "codex");
+        // Substring 'c' matches cli, codex and crates.io/bat (order preserved).
+        let repos: Vec<String> = search_index(ROOT, "c").into_iter().map(|c| c.repo).collect();
+        assert_eq!(repos, vec!["cli", "codex", "bat"]);
         // No match.
-        assert!(search_index(root, "zzz").is_empty());
+        assert!(search_index(ROOT, "zzz").is_empty());
+    }
+
+    #[test]
+    fn search_index_matches_command_name_and_alias() {
+        // `gh` lives only in files[].name; `fd-find` only in aliases. Neither is
+        // findable by repo name, which was the old behavior.
+        let hits = search_index(ROOT, "gh");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, "cli");
+        let hits = search_index(ROOT, "fd-find");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, "fd");
+    }
+
+    #[test]
+    fn search_index_falls_back_to_description_only_when_no_name_hit() {
+        // "clone" appears only in bat's description.
+        let hits = search_index(ROOT, "clone");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].repo, "bat");
+        // "cli" matches names, so the description hit for cli is not duplicated
+        // and description-only candidates are excluded entirely.
+        let repos: Vec<String> = search_index(ROOT, "cli").into_iter().map(|c| c.repo).collect();
+        assert_eq!(repos, vec!["cli"]);
     }
 }
