@@ -31,14 +31,21 @@ pub struct Branch {
     pub format: Option<String>,
     pub files: Option<Vec<FileEntry>>,
     pub replacements: BTreeMap<String, String>,
-    pub supported_envs: Vec<String>,
+    /// `supported_envs`: `None` = unrestricted, `Some([])` = supports NOTHING.
+    /// aqua draws exactly that distinction (`CheckSupportedEnvs` short-circuits
+    /// on nil, then lets an empty list fall through `matchEnvs` to false).
+    pub supported_envs: Option<Vec<String>>,
     pub version_prefix: Option<String>,
     /// Platform overrides visible in this branch (branch's own, else base's).
     pub overrides: Vec<PlatformOverride>,
     /// Non-github_release type found on the branch (→ degrade).
     pub type_: Option<String>,
-    /// Branch-level `no_asset`: the whole branch is unavailable (no binary).
+    /// `no_asset`: the whole branch is unavailable (no binary).
     pub no_asset: bool,
+    /// `error_message`: aqua refuses to install a package that has one
+    /// (`validatePackage`), so a non-empty message means unavailable too.
+    /// `golang/tools/gorename` uses it to say the command was deleted.
+    pub error_message: Option<String>,
 }
 
 /// The effective (merged) fields for a single platform.
@@ -127,12 +134,12 @@ fn base_branch(pkg: &Package) -> Branch {
         format: pkg.format.clone(),
         files: pkg.files.clone(),
         replacements: pkg.replacements.clone().unwrap_or_default(),
-        supported_envs: pkg.supported_envs.clone().unwrap_or_default(),
+        supported_envs: pkg.supported_envs.clone(),
         version_prefix: pkg.version_prefix.clone(),
         overrides: pkg.overrides.clone(),
         type_: pkg.type_.clone(),
-        // Base package has no branch-level no_asset (only platform overrides do).
-        no_asset: false,
+        no_asset: pkg.no_asset,
+        error_message: pkg.error_message.clone(),
     }
 }
 
@@ -156,7 +163,7 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
         }
     }
     if let Some(se) = &vo.supported_envs {
-        b.supported_envs = se.clone();
+        b.supported_envs = Some(se.clone());
     }
     if vo.version_prefix.is_some() {
         b.version_prefix = vo.version_prefix.clone();
@@ -168,8 +175,12 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
     if vo.type_.is_some() {
         b.type_ = vo.type_.clone();
     }
-    if vo.no_asset {
-        b.no_asset = true;
+    // Both are pointers in aqua, so a branch may also CLEAR an inherited value.
+    if let Some(n) = vo.no_asset {
+        b.no_asset = n;
+    }
+    if let Some(e) = &vo.error_message {
+        b.error_message = Some(e.clone());
     }
     b
 }
@@ -182,7 +193,11 @@ pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option
     if branch.no_asset {
         return Ok(None);
     }
-    if !env_supported(&branch.supported_envs, goos, goarch) {
+    // aqua logs the message and refuses the install, so there is nothing here.
+    if branch.error_message.as_deref().is_some_and(|m| !m.is_empty()) {
+        return Ok(None);
+    }
+    if !env_supported(branch.supported_envs.as_deref(), goos, goarch) {
         return Ok(None);
     }
 
@@ -233,16 +248,19 @@ fn normalize_format(format: Option<String>) -> String {
     }
 }
 
-/// Whether (goos, goarch) is in `supported_envs`. Empty list ⇒ all supported
-/// (aqua default). Entries: `all` / `<goos>` / `<goarch>` / `<goos>/<goarch>`.
-pub fn env_supported(supported_envs: &[String], goos: &str, goarch: &str) -> bool {
-    if supported_envs.is_empty() {
+/// Whether (goos, goarch) is in an env list. Entries: `all` / `<goos>` /
+/// `<goarch>` / `<goos>/<goarch>`.
+///
+/// ABSENT and EMPTY are opposites, and aqua means it: `CheckSupportedEnvs`
+/// returns true for a nil list, while an explicitly empty one falls through to
+/// `matchEnvs`, whose loop never runs and so returns false. `None` here is
+/// "unrestricted"; `Some([])` is "no platform at all".
+pub fn env_supported(envs: Option<&[String]>, goos: &str, goarch: &str) -> bool {
+    let Some(envs) = envs else {
         return true;
-    }
+    };
     let pair = format!("{goos}/{goarch}");
-    supported_envs.iter().any(|e| {
-        e == "all" || e == goos || e == goarch || e == &pair
-    })
+    envs.iter().any(|e| e == "all" || e == goos || e == goarch || e == &pair)
 }
 
 /// Pick the platform override that applies to `(goos, goarch)`.
@@ -285,8 +303,8 @@ pub fn override_matches(
     if ov_goos.is_some_and(|g| g != goos) || ov_goarch.is_some_and(|a| a != goarch) {
         return false;
     }
-    // An `envs:` list is a filter, not a default: absent ⇒ every platform.
-    ov_envs.is_none_or(|e| env_supported(e, goos, goarch))
+    // Absent ⇒ every platform; present ⇒ only what it lists (`envs: []` ⇒ none).
+    env_supported(ov_envs, goos, goarch)
 }
 
 // ---- version constraint evaluation ----
@@ -583,13 +601,63 @@ packages:
 
     #[test]
     fn supported_envs_gating() {
-        assert!(env_supported(&[], "linux", "amd64")); // empty = all
-        assert!(env_supported(&["all".into()], "linux", "amd64"));
-        assert!(env_supported(&["linux".into()], "linux", "arm64"));
-        assert!(env_supported(&["amd64".into()], "darwin", "amd64"));
-        assert!(env_supported(&["linux/amd64".into()], "linux", "amd64"));
-        assert!(!env_supported(&["linux/amd64".into()], "linux", "arm64"));
-        assert!(!env_supported(&["darwin".into()], "linux", "amd64"));
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // ABSENT means unrestricted; EMPTY means nothing, as in aqua's
+        // `CheckSupportedEnvs` (nil short-circuits, `[]` falls through
+        // `matchEnvs` and its loop never runs).
+        assert!(env_supported(None, "linux", "amd64"));
+        assert!(!env_supported(Some(&[]), "linux", "amd64"));
+        assert!(env_supported(Some(&list(&["all"])), "linux", "amd64"));
+        assert!(env_supported(Some(&list(&["linux"])), "linux", "arm64"));
+        assert!(env_supported(Some(&list(&["amd64"])), "darwin", "amd64"));
+        assert!(env_supported(Some(&list(&["linux/amd64"])), "linux", "amd64"));
+        assert!(!env_supported(Some(&list(&["linux/amd64"])), "linux", "arm64"));
+        assert!(!env_supported(Some(&list(&["darwin"])), "linux", "amd64"));
+    }
+
+    #[test]
+    fn an_explicitly_empty_envs_list_matches_no_platform() {
+        // `envs: []` must not swallow the override after it.
+        let branch = Branch {
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    envs: Some(vec![]),
+                    asset: Some("wrong".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("right".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(effective_for(&branch, "linux", "amd64").unwrap().unwrap().asset, "right");
+        // …and a branch whose own supported_envs are empty supports nothing.
+        let nowhere = Branch {
+            asset: Some("base".into()),
+            supported_envs: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(effective_for(&nowhere, "linux", "amd64").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_branch_error_message_makes_it_unavailable() {
+        // aqua's `validatePackage` logs the message and refuses to install, so a
+        // branch that carries one installs nothing anywhere
+        // (`golang/tools/gorename`: the command was deleted at v0.26.0).
+        let branch = Branch {
+            asset: Some("tools-{{.OS}}".into()),
+            error_message: Some("gorename was deleted".into()),
+            ..Default::default()
+        };
+        assert!(effective_for(&branch, "linux", "amd64").unwrap().is_none());
+        // An empty message is not a message.
+        let ok = Branch { error_message: Some(String::new()), ..branch.clone() };
+        assert!(effective_for(&ok, "linux", "amd64").unwrap().is_some());
     }
 
     #[test]

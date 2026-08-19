@@ -379,7 +379,7 @@ impl FileScope {
     /// declares no `files:`, the inherited list stands even when a later override
     /// declares one, which is what `effective_for` does.
     fn effective_over<'a>(&'a self, base: &'a FileScope, os: &str, arch: &str) -> Outcome<'a> {
-        let envs = self.envs.as_deref().or(base.envs.as_deref()).unwrap_or_default();
+        let envs = self.envs.as_deref().or(base.envs.as_deref());
         if !super::resolve::env_supported(envs, os, arch) {
             return None;
         }
@@ -407,8 +407,14 @@ struct BranchBuf {
     /// `version_constraint: "true"` — the branch
     /// [`select_branch`](super::resolve::select_branch) takes outright.
     is_true: bool,
-    /// `no_asset: true` — this branch installs nothing at all.
-    no_asset: bool,
+    /// `no_asset` / `error_message` as DECLARED by this branch. Both are
+    /// pointers in aqua's `overrideVersion`, so an omitted one inherits the
+    /// package's and an explicit `no_asset: false` clears an inherited true.
+    no_asset: Option<bool>,
+    /// A non-empty `error_message:` — aqua logs it and refuses the install, so
+    /// it is `no_asset` by another name (`golang/tools/gorename` uses it to say
+    /// the command was deleted).
+    errored: Option<bool>,
     scope: FileScope,
 }
 
@@ -422,6 +428,8 @@ struct PkgBuf {
     constraint: Option<String>,
     /// A package-level `no_asset: true`.
     no_asset: bool,
+    /// A package-level non-empty `error_message:`.
+    errored: bool,
 }
 
 impl PkgBuf {
@@ -441,14 +449,16 @@ impl PkgBuf {
     /// installed, and guessing the last-listed one made `dineshba/tf-summarize`
     /// claim `terraform-plan-summarize`, a command it no longer ships.
     fn commands(&self, os: &str, arch: &str) -> Outcome<'_> {
-        if self.no_asset {
-            return None;
-        }
+        let blocked = self.no_asset || self.errored;
         if self.constraint.as_deref() != Some("false") {
-            return self.base.effective(os, arch);
+            return if blocked { None } else { self.base.effective(os, arch) };
         }
         match self.branches.iter().find(|b| b.is_true) {
-            Some(b) if b.no_asset => None,
+            // Each flag the branch declares replaces the package's; each it omits
+            // is inherited.
+            Some(b) if b.no_asset.unwrap_or(self.no_asset) || b.errored.unwrap_or(self.errored) => {
+                None
+            }
             Some(b) => b.scope.effective_over(&self.base, os, arch),
             // Every branch is constrained: which one applies depends on the
             // version, so claim neither commands nor unavailability.
@@ -605,6 +615,7 @@ fn parse_index_on(text: &str, os: &str, arch: &str) -> Vec<Candidate> {
                     pkg.constraint = Some(v.to_string());
                 }
                 pkg.no_asset |= field(t, "no_asset:") == Some("true");
+                pkg.errored |= field(t, "error_message:").is_some_and(|m| !m.is_empty());
                 block = match t {
                     "aliases:" => Block::Aliases,
                     _ if is_block_description(t) => Block::Description,
@@ -742,9 +753,15 @@ fn absorb_scope_field(
         if let Some(b) = pkg.branches.last_mut() {
             b.is_true = true;
         }
-    } else if field(t, "no_asset:") == Some("true") {
+    } else if let Some(v) = field(t, "no_asset:") {
         if let Some(b) = pkg.branches.last_mut() {
-            b.no_asset = true;
+            b.no_asset = Some(v == "true");
+        }
+    } else if let Some(m) = field(t, "error_message:") {
+        if let Some(b) = pkg.branches.last_mut() {
+            // A block scalar (`error_message: |`) leaves `|` as the value here —
+            // still non-empty, which is all that matters.
+            b.errored = Some(!m.is_empty());
         }
     }
 }
@@ -1417,6 +1434,43 @@ packages:
         assert_eq!(c.commands(), (Certainty::Declared, vec!["b-linux"]));
         // …and narrowed them away from the package's own darwin.
         assert!(parse_index_on(yaml, "darwin", "arm64")[0].unavailable);
+    }
+
+    /// A non-empty `error_message` is `no_asset` by another name: aqua refuses
+    /// the install. `golang/tools/gorename` uses it to say the command is gone,
+    /// and without this the scanner offered `go:github.com/golang/tools`, a
+    /// module root that does not install `gorename` at all.
+    #[test]
+    fn parse_index_treats_a_branch_error_message_as_unavailable() {
+        let yaml = "packages:\n  - type: go_install\n    repo_owner: golang\n    repo_name: tools\n    name: golang/tools/gorename\n    version_constraint: \"false\"\n    version_overrides:\n      - version_constraint: \"true\"\n        error_message: gorename was deleted at v0.26.0\n";
+        assert!(parse_index_on(yaml, "linux", "amd64")[0].unavailable);
+        // A block scalar still counts as a message.
+        let block = yaml.replace("gorename was deleted at v0.26.0", "|");
+        assert!(parse_index_on(&block, "linux", "amd64")[0].unavailable);
+    }
+
+    /// An explicitly EMPTY env list is the opposite of an absent one — aqua's
+    /// `matchEnvs` loop never runs and returns false.
+    #[test]
+    fn parse_index_reads_an_empty_env_list_as_no_platform() {
+        let pkg = "packages:\n  - repo_owner: a\n    repo_name: b\n    supported_envs: []\n";
+        assert!(parse_index_on(pkg, "linux", "amd64")[0].unavailable);
+
+        // …and an `envs: []` override must not swallow the one after it.
+        let ov = "packages:\n  - repo_owner: a\n    repo_name: b\n    overrides:\n      - envs: []\n        files:\n          - name: wrong\n      - goos: linux\n        files:\n          - name: right\n";
+        let c = &parse_index_on(ov, "linux", "amd64")[0];
+        assert!(!c.unavailable);
+        assert_eq!(c.command_names(), vec!["right"]);
+    }
+
+    /// `no_asset` is a pointer in aqua, so the branch we install from can CLEAR
+    /// one the package set.
+    #[test]
+    fn parse_index_lets_a_branch_clear_a_package_level_no_asset() {
+        let yaml = "packages:\n  - repo_owner: a\n    repo_name: b\n    no_asset: true\n    version_constraint: \"false\"\n    version_overrides:\n      - version_constraint: \"true\"\n        no_asset: false\n        files:\n          - name: b-again\n";
+        let c = &parse_index_on(yaml, "linux", "amd64")[0];
+        assert!(!c.unavailable);
+        assert_eq!(c.command_names(), vec!["b-again"]);
     }
 
     /// A branch marked `no_asset` installs nothing anywhere — `apache/tomcat`'s

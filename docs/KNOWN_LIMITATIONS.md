@@ -93,12 +93,15 @@ case works today; each note records the edge and why it was left.
   inherits instead — currently unreachable from a `"true"` branch or a base entry.
   `variants:` are not evaluated here either (see above). (`src/aqua/registry.rs`)
 - **A package with no build for this host is reported, not hidden.** When
-  `supported_envs` exclude the host or the entry ubix would install from is
-  `no_asset`, the candidate is marked unavailable: it still appears in
+  `supported_envs` exclude the host, or the entry ubix would install from is
+  `no_asset` or carries an `error_message` (aqua's way of retiring a package —
+  `xremap/xremap/hypr`, `golang/tools/gorename`), the candidate is marked
+  unavailable: it still appears in
   `ubix which` (so a linux `ubix which xcodes` explains itself rather than saying
   "not found"), ranks below anything installable, and never auto-picks — `add`
-  fails with `no linux/amd64 build`. 37 of 2277 packages are in that state on
-  linux/amd64. What it can NOT see is a package that is unavailable only because
+  fails with `no linux/amd64 build`. ~40 of 2277 packages are in that state on
+  linux/amd64. Note that an absent env list and an EMPTY one are opposites in
+  aqua: `supported_envs: []` supports nothing. What it can NOT see is a package that is unavailable only because
   no asset template resolves for the host; that needs the full synthesis path.
   (`src/aqua/registry.rs`, `src/discover.rs`)
 - **A mirror that declares the same command ties with upstream.** Matching now

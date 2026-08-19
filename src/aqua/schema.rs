@@ -57,6 +57,14 @@ pub struct Package {
     pub supported_envs: Option<Vec<String>>,
     #[serde(default)]
     pub version_prefix: Option<String>,
+    /// `no_asset: true` — the package ships no binary at all.
+    #[serde(default)]
+    pub no_asset: bool,
+    /// `error_message` — aqua logs it and REFUSES to install
+    /// (`installpackage.validatePackage`), so a non-empty one means the package
+    /// is unavailable, exactly like `no_asset`.
+    #[serde(default)]
+    pub error_message: Option<String>,
     /// Where aqua discovers the version (e.g. `github_tag`, `github_release`).
     /// Used by the http `template:` hint to fill `--version-source`.
     #[serde(default)]
@@ -104,7 +112,11 @@ pub struct VersionOverride {
     /// `no_asset: true` → this whole version branch has no downloadable asset
     /// (source-only / unavailable), so it must not inherit the base asset.
     #[serde(default)]
-    pub no_asset: bool,
+    pub no_asset: Option<bool>,
+    /// See [`Package::error_message`]. A pointer in aqua, so a branch may also
+    /// CLEAR an inherited message with `error_message: ""`.
+    #[serde(default)]
+    pub error_message: Option<String>,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
     /// `Option` because DECLARING `overrides: []` clears the package's, while
