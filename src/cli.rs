@@ -1304,7 +1304,7 @@ impl App {
         let exact: Vec<usize> = cands
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.name() == query)
+            .filter(|(_, c)| c.matches_exactly(query))
             .map(|(i, _)| i)
             .collect();
         let idx = if exact.len() == 1 {
@@ -1321,6 +1321,17 @@ impl App {
         };
 
         match &cands[idx] {
+            // A cargo/go registry entry can't be synthesized as an aqua config
+            // (and may carry no repo at all); its locator is already a spec.
+            SearchHit::Aqua(c) if matches!(crate::discover::spec_for(c).as_deref(), Some(s) if !s.starts_with("aqua:")) =>
+            {
+                let spec = crate::discover::spec_for(c).unwrap_or_default();
+                let name = name_override
+                    .or_else(|| c.command_names().first().copied())
+                    .unwrap_or(query)
+                    .to_string();
+                self.persist_and_install(name, ToolConfig::from_spec(spec), false, wait)
+            }
             SearchHit::Aqua(c) => {
                 let (name, tool) =
                     crate::aqua::resolve_package(self.http.as_ref(), &c.pkg_path(), name_override)?;
@@ -1600,11 +1611,20 @@ enum SearchHit {
 }
 
 impl SearchHit {
-    /// The bare name used for exact-match selection (repo / package name).
-    fn name(&self) -> &str {
+    /// Whether this hit IS the thing the user asked for (used to star a row and
+    /// to select the one `--add` installs).
+    ///
+    /// For an aqua hit that means the command it installs or its repo name — the
+    /// command because that is the user-facing identity (`cli/cli` → `gh`), the
+    /// repo because plenty of packages are known by it (`bottom` installs `btm`).
+    /// A `_go/…` package has no repo at all, so repo alone can't be the test.
+    fn matches_exactly(&self, query: &str) -> bool {
         match self {
-            SearchHit::Aqua(c) => &c.repo,
-            SearchHit::Pixi(h) => &h.name,
+            SearchHit::Aqua(c) => {
+                c.repo.eq_ignore_ascii_case(query)
+                    || c.command_names().iter().any(|n| n.eq_ignore_ascii_case(query))
+            }
+            SearchHit::Pixi(h) => h.name == query,
         }
     }
 
@@ -1615,9 +1635,17 @@ impl SearchHit {
     ///   generated config first. NOT `ubix add owner/repo` — that installs via the
     ///   plain github source and SKIPS the aqua synthesis, which is misleading.
     /// * pixi → `ubix add pixi:<locator>`: the spec installs exactly this package.
+    ///
+    /// A `cargo`/`go_install` registry entry has no synthesizable aqua config, so
+    /// it suggests its own spec instead — the locator IS the install instruction.
     fn suggest_cmd(&self) -> String {
         match self {
-            SearchHit::Aqua(c) => format!("ubix search {}/{} --aqua", c.owner, c.repo),
+            SearchHit::Aqua(c) => match crate::discover::spec_for(c) {
+                Some(spec) if !spec.starts_with("aqua:") => format!("ubix add {spec}"),
+                // The aqua PATH (not owner/repo) is what addresses the package:
+                // a repo shipping several tools has no `pkgs/owner/repo/`.
+                _ => format!("ubix search {} --aqua", c.pkg_path()),
+            },
             SearchHit::Pixi(h) => format!("ubix add pixi:{}", pixi_locator(h)),
         }
     }
@@ -1625,7 +1653,7 @@ impl SearchHit {
     /// A left-hand descriptor for the results table.
     fn descriptor(&self) -> String {
         match self {
-            SearchHit::Aqua(c) => format!("{}/{}", c.owner, c.repo),
+            SearchHit::Aqua(c) => c.pkg_path(),
             SearchHit::Pixi(h) => format!("{}::{} ({})", h.channel, h.name, h.version),
         }
     }
@@ -1671,7 +1699,7 @@ fn print_search_results(query: &str, cands: &[SearchHit]) {
             }
             _ => {}
         }
-        let star = if c.name() == query { " *" } else { "  " };
+        let star = if c.matches_exactly(query) { " *" } else { "  " };
         println!("{star}{:<width$}   {}", c.descriptor(), c.suggest_cmd(), width = width);
     }
     println!(
@@ -2848,6 +2876,60 @@ mod tests {
         assert!(aqua_pkg_path("owner/repo?x=1").is_err());
         assert!(aqua_pkg_path("owner/re po").is_err());
         assert!(aqua_pkg_path(r"owner\repo/x").is_err());
+    }
+
+    // ---- search hit rendering ----
+
+    fn aqua_hit(name: Option<&str>, owner: &str, repo: &str, kind: &str, exes: &[&str]) -> SearchHit {
+        SearchHit::Aqua(crate::aqua::registry::Candidate {
+            name: name.map(str::to_string),
+            owner: owner.into(),
+            repo: repo.into(),
+            kind: kind.into(),
+            exes: exes.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        })
+    }
+
+    /// A search row must address the package the way `--aqua` needs it: by aqua
+    /// PATH (there is no `pkgs/kubernetes/kubernetes/`), and by its own spec when
+    /// the entry is a cargo/go package that aqua synthesis can't handle at all.
+    #[test]
+    fn search_rows_address_packages_by_aqua_path_and_own_spec() {
+        let nested = aqua_hit(
+            Some("kubernetes/kubernetes/kubectl"),
+            "kubernetes",
+            "kubernetes",
+            "github_release",
+            &["kubectl"],
+        );
+        assert_eq!(nested.descriptor(), "kubernetes/kubernetes/kubectl");
+        assert_eq!(nested.suggest_cmd(), "ubix search kubernetes/kubernetes/kubectl --aqua");
+        // Matched by the command it installs, not by the repo (`kubernetes`).
+        assert!(nested.matches_exactly("kubectl"));
+
+        let plain = aqua_hit(None, "sharkdp", "bat", "github_release", &[]);
+        assert_eq!(plain.descriptor(), "sharkdp/bat");
+        assert_eq!(plain.suggest_cmd(), "ubix search sharkdp/bat --aqua");
+
+        // A repo-less `_go/…` entry: no `pkgs/` path to inspect, but a whole spec.
+        let go = SearchHit::Aqua(crate::aqua::registry::Candidate {
+            name: Some("_go/sigsum.org/sigsum-go#cmd/sigsum-submit".into()),
+            kind: "go_install".into(),
+            locator: Some("sigsum.org/sigsum-go/cmd/sigsum-submit".into()),
+            ..Default::default()
+        });
+        assert_eq!(go.suggest_cmd(), "ubix add go:sigsum.org/sigsum-go/cmd/sigsum-submit");
+        assert!(go.matches_exactly("sigsum-submit"), "no repo → match on the command");
+        let cargo = SearchHit::Aqua(crate::aqua::registry::Candidate {
+            name: Some("crates.io/bat".into()),
+            owner: "sharkdp".into(),
+            repo: "bat".into(),
+            kind: "cargo".into(),
+            locator: Some("bat".into()),
+            ..Default::default()
+        });
+        assert_eq!(cargo.suggest_cmd(), "ubix add cargo:bat");
     }
 
     // ---- bootstrap python/nodejs runtime command construction ----
