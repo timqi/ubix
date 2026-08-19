@@ -34,6 +34,12 @@ pub fn global_remove_args(pkg: &str) -> Vec<String> {
     fnm_exec_npm(&["rm", "-g", pkg])
 }
 
+/// `fnm exec --using=default -- npm ls -g --json --long --depth=0 <pkg>` — reads
+/// the installed package's manifest so we can learn its real `bin` names.
+pub fn list_manifest_args(pkg: &str) -> Vec<String> {
+    fnm_exec_npm(&["ls", "-g", "--json", "--long", "--depth=0", pkg])
+}
+
 /// Wrap an `npm` argument list so it runs on the fnm default node:
 /// `fnm exec --using=default -- npm <args…>`.
 fn fnm_exec_npm(npm_args: &[&str]) -> Vec<String> {
@@ -107,6 +113,73 @@ fn unquote(s: &str) -> String {
 /// Compute the stable alias bin dir given the fnm base: `<base>/aliases/default/bin`.
 pub fn alias_bin_dir(fnm_base: &str) -> PathBuf {
     PathBuf::from(fnm_base).join("aliases").join("default").join("bin")
+}
+
+/// The package name with any `@scope/` prefix stripped. npm's default bin name
+/// for a package that declares `"bin": "./cli.js"` (string form) is this, NOT the
+/// full locator — `@openai/codex` links a bin called `codex`.
+fn unscoped_name(locator: &str) -> &str {
+    locator.rsplit('/').next().unwrap_or(locator)
+}
+
+/// Extract the executable names npm links for `pkg`, from the JSON of
+/// `npm ls -g --json --long --depth=0 <pkg>`.
+///
+/// The global bin name comes from the package manifest's `bin` map KEYS, which
+/// need not match the package name: `@deepseek-ai/dsh` links `dsh`, and
+/// `wrangler` links both `wrangler` and `wrangler2`. `bin` may also be a plain
+/// string (`"bin": "./cli.js"`), in which case the name is the unscoped package
+/// name. Returns empty when the package or its `bin` field is absent, so callers
+/// can fall back rather than record a guess.
+pub fn installed_bins(json: &str, pkg: &str) -> Vec<String> {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(entry) = v.get("dependencies").and_then(|d| d.get(pkg)) else {
+        return Vec::new();
+    };
+    match entry.get("bin") {
+        // `"bin": {"dsh": "lib/bin.js"}` → the keys are the linked names.
+        Some(serde_json::Value::Object(map)) => map.keys().cloned().collect(),
+        // `"bin": "./cli.js"` → npm names the link after the unscoped package.
+        Some(serde_json::Value::String(_)) => vec![unscoped_name(pkg).to_string()],
+        _ => Vec::new(),
+    }
+}
+
+/// Ask npm which executables it linked for `pkg`. Best-effort: any failure
+/// (fnm/npm error, unparsable JSON) yields an empty vec so the caller falls back.
+fn query_installed_bins(runner: &dyn CommandRunner, pkg: &str) -> Vec<String> {
+    let args = list_manifest_args(pkg);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // `npm ls` exits non-zero for peer-dep/extraneous complaints while still
+    // printing valid JSON, so parse stdout regardless of exit status.
+    match runner.run("fnm", &refs, &[]) {
+        Ok(out) => installed_bins(&out.stdout, pkg),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Decide which entry-point paths to record. Ground truth is what npm reported it
+/// linked (`discovered`); otherwise fall back to explicitly declared `exes`, and
+/// only as a last resort to the unscoped package name.
+fn tracked_paths(
+    discovered: Vec<String>,
+    tool: &ToolConfig,
+    locator: &str,
+    bin_dir: &std::path::Path,
+) -> Vec<PathBuf> {
+    let mut exes = if !discovered.is_empty() {
+        discovered
+    } else if let Some(declared) = tool.exes.as_ref().filter(|e| !e.is_empty()) {
+        declared.clone()
+    } else {
+        vec![unscoped_name(locator).to_string()]
+    };
+    // Stable ordering: the state file is diffed by humans, and `npm ls` map order
+    // is not guaranteed across npm versions.
+    exes.sort();
+    exes.iter().map(|e| bin_dir.join(e)).collect()
 }
 
 /// Detect the fnm base at runtime: try `fnm env`, then `$FNM_DIR`, then the
@@ -203,9 +276,17 @@ pub fn install(tool: &ToolConfig, runner: &dyn CommandRunner) -> Result<InstallO
         bail!("npm install failed: {}", out.stderr.trim());
     }
     // Global npm entry points live on the default node bin; the stable PATH entry
-    // is the alias bin dir. We track the alias-bin path for the package binary.
+    // is the alias bin dir. The link name comes from the manifest's `bin` keys,
+    // which differ from the locator for scoped packages (`@openai/codex` → `codex`)
+    // and for packages shipping several/renamed executables — so ask npm rather
+    // than joining the locator, which would record a path that never exists.
     let install_paths = match detect_fnm_base(runner) {
-        Some(base) => vec![alias_bin_dir(&base).join(&parsed.locator)],
+        Some(base) => tracked_paths(
+            query_installed_bins(runner, &parsed.locator),
+            tool,
+            &parsed.locator,
+            &alias_bin_dir(&base),
+        ),
         None => Vec::new(),
     };
     Ok(InstallOutcome {
@@ -352,6 +433,14 @@ mod tests {
                 CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
             )
             .expect(
+                "fnm exec --using=default -- npm ls -g --json --long --depth=0 pnpm",
+                CommandOutput {
+                    status: 0,
+                    stdout: r#"{"dependencies":{"pnpm":{"bin":{"pnpm":"bin/pnpm.cjs"}}}}"#.into(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
                 "fnm env",
                 CommandOutput {
                     status: 0,
@@ -361,7 +450,7 @@ mod tests {
             );
         let t = ToolConfig::from_spec("npm:pnpm");
         let out = install(&t, &runner).unwrap();
-        // Recorded install path is the fnm alias-bin dir + package name (unchanged).
+        // Recorded install path is the fnm alias-bin dir + linked bin name.
         assert_eq!(
             out.install_paths,
             vec![PathBuf::from("/home/u/.local/share/fnm/aliases/default/bin/pnpm")]
@@ -371,6 +460,134 @@ mod tests {
         assert!(calls.iter().any(|c| c.program == "fnm"
             && c.args == ["exec", "--using=default", "--", "npm", "i", "-g", "pnpm"]));
         assert!(!calls.iter().any(|c| c.program == "npm"), "must not invoke bare npm");
+    }
+
+    #[test]
+    fn unscoped_name_strips_scope() {
+        assert_eq!(unscoped_name("@openai/codex"), "codex");
+        assert_eq!(unscoped_name("@deepseek-ai/dsh"), "dsh");
+        assert_eq!(unscoped_name("pnpm"), "pnpm");
+    }
+
+    #[test]
+    fn installed_bins_reads_manifest_bin_keys() {
+        // A scoped package links a bin named after the `bin` KEY, not the locator.
+        let json = r#"{"dependencies":{"@deepseek-ai/dsh":{"bin":{"dsh":"lib/bin.js"}}}}"#;
+        assert_eq!(installed_bins(json, "@deepseek-ai/dsh"), vec!["dsh"]);
+    }
+
+    #[test]
+    fn installed_bins_handles_multiple_and_string_forms() {
+        // Several executables from one package.
+        let multi = r#"{"dependencies":{"wrangler":{"bin":{"wrangler":"b.js","wrangler2":"b.js"}}}}"#;
+        let mut got = installed_bins(multi, "wrangler");
+        got.sort();
+        assert_eq!(got, vec!["wrangler", "wrangler2"]);
+        // `"bin": "./cli.js"` → named after the unscoped package.
+        let s = r#"{"dependencies":{"@scope/thing":{"bin":"./cli.js"}}}"#;
+        assert_eq!(installed_bins(s, "@scope/thing"), vec!["thing"]);
+    }
+
+    #[test]
+    fn installed_bins_empty_on_junk_or_missing() {
+        assert!(installed_bins("not json", "pnpm").is_empty());
+        assert!(installed_bins(r#"{"dependencies":{}}"#, "pnpm").is_empty());
+        // Present but no `bin` field (a library, not a CLI).
+        assert!(installed_bins(r#"{"dependencies":{"lodash":{}}}"#, "lodash").is_empty());
+    }
+
+    #[test]
+    fn tracked_paths_fallback_chain() {
+        let dir = std::path::Path::new("/b");
+        let plain = ToolConfig::from_spec("npm:@openai/codex");
+        // Discovered wins.
+        assert_eq!(
+            tracked_paths(vec!["codex".into()], &plain, "@openai/codex", dir),
+            vec![PathBuf::from("/b/codex")]
+        );
+        // No discovery → declared `exes`.
+        let mut declared = ToolConfig::from_spec("npm:@openai/codex");
+        declared.exes = Some(vec!["codex".into(), "codex-alt".into()]);
+        assert_eq!(
+            tracked_paths(Vec::new(), &declared, "@openai/codex", dir),
+            vec![PathBuf::from("/b/codex"), PathBuf::from("/b/codex-alt")]
+        );
+        // Neither → unscoped name, NOT the raw locator (the old bug produced
+        // `/b/@openai/codex`, a path that never exists).
+        assert_eq!(
+            tracked_paths(Vec::new(), &plain, "@openai/codex", dir),
+            vec![PathBuf::from("/b/codex")]
+        );
+    }
+
+    #[test]
+    fn install_records_real_bin_name_for_scoped_package() {
+        // Regression: `npm:@deepseek-ai/dsh` used to record
+        // `…/bin/@deepseek-ai/dsh`, which does not exist, so `remove` silently
+        // unlinked nothing. It must record `…/bin/dsh`.
+        let runner = MockRunner::new()
+            .with_present("fnm")
+            .expect(
+                "fnm exec --using=default -- node --version",
+                CommandOutput { status: 0, stdout: "v22.14.0\n".into(), stderr: String::new() },
+            )
+            .expect(
+                "fnm exec --using=default -- npm i -g @deepseek-ai/dsh",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "fnm exec --using=default -- npm ls -g --json --long --depth=0 @deepseek-ai/dsh",
+                CommandOutput {
+                    status: 0,
+                    stdout: r#"{"dependencies":{"@deepseek-ai/dsh":{"bin":{"dsh":"lib/bin.js"}}}}"#
+                        .into(),
+                    stderr: String::new(),
+                },
+            )
+            .expect(
+                "fnm env",
+                CommandOutput {
+                    status: 0,
+                    stdout: "export FNM_DIR=\"/home/u/.local/share/fnm\"\n".into(),
+                    stderr: String::new(),
+                },
+            );
+        let t = ToolConfig::from_spec("npm:@deepseek-ai/dsh");
+        let out = install(&t, &runner).unwrap();
+        assert_eq!(
+            out.install_paths,
+            vec![PathBuf::from("/home/u/.local/share/fnm/aliases/default/bin/dsh")]
+        );
+    }
+
+    #[test]
+    fn install_falls_back_to_unscoped_name_when_query_fails() {
+        // `npm ls` unavailable (no canned response → runner errors) must still
+        // produce a plausible path, never the scoped locator.
+        let runner = MockRunner::new()
+            .with_present("fnm")
+            .expect(
+                "fnm exec --using=default -- node --version",
+                CommandOutput { status: 0, stdout: "v22.14.0\n".into(), stderr: String::new() },
+            )
+            .expect(
+                "fnm exec --using=default -- npm i -g @openai/codex",
+                CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+            )
+            .expect(
+                "fnm env",
+                CommandOutput {
+                    status: 0,
+                    stdout: "export FNM_DIR=\"/home/u/.local/share/fnm\"\n".into(),
+                    stderr: String::new(),
+                },
+            );
+        let t = ToolConfig::from_spec("npm:@openai/codex");
+        let out = install(&t, &runner).unwrap();
+        assert_eq!(
+            out.install_paths,
+            vec![PathBuf::from("/home/u/.local/share/fnm/aliases/default/bin/codex")]
+        );
     }
 
     #[test]
