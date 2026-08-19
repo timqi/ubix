@@ -13,7 +13,6 @@ mod archive;
 mod bootstrap;
 mod checksum;
 mod cli;
-mod discover;
 mod config;
 mod engine;
 mod http;

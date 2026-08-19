@@ -31,28 +31,13 @@ pub use registry::search_index;
 ///
 /// Any unsupported construct degrades to a `bail!` that names the registry.yaml
 /// URL (plan §9).
-///
-/// `path` is the aqua package path (`owner/repo`, or a longer nested name like
-/// `kubernetes/kubernetes/kubectl`). The repo drives version discovery and asset
-/// synthesis, and is read back from the package itself rather than the path, so
-/// nested names and non-canonical casing resolve to the real repo.
 pub fn resolve_package(
     http: &dyn HttpClient,
-    path: &str,
+    owner: &str,
+    repo: &str,
     name_override: Option<&str>,
 ) -> Result<(String, ToolConfig)> {
-    let pkg = registry::fetch_package(http, path)?;
-    let (owner, repo) = match (pkg.repo_owner.as_deref(), pkg.repo_name.as_deref()) {
-        (Some(o), Some(r)) if !o.is_empty() && !r.is_empty() => (o.to_string(), r.to_string()),
-        _ => bail!("aqua package {path} declares no repo_owner/repo_name"),
-    };
-    let (owner, repo) = (owner.as_str(), repo.as_str());
-
-    // A nested package name IS aqua's name for the command it produces
-    // (`kubernetes/kubernetes/kubectl`), so it beats the repo name as the default
-    // tool name — otherwise that package would be added as `kubernetes`.
-    let nested = path.split('/').count() > 2;
-    let name_override = name_override.or_else(|| nested.then(|| path.rsplit('/').next()).flatten());
+    let pkg = registry::fetch_package(http, owner, repo)?;
 
     // Only github_release is supported at the top level (plan §2/§9). `type:
     // http` packages (templated URL, e.g. claude-code) can't be synthesized as
@@ -198,7 +183,7 @@ mod tests {
 
     fn mock_codex() -> MockHttp {
         MockHttp::new()
-            .with_text(&registry::pkg_url("openai/codex"), CODEX)
+            .with_text(&registry::pkg_url("openai", "codex"), CODEX)
             .with_text(
                 "https://api.github.com/repos/openai/codex/releases/latest",
                 r#"{"tag_name":"rust-v0.20.0"}"#,
@@ -208,7 +193,7 @@ mod tests {
     #[test]
     fn resolve_package_codex_end_to_end() {
         let http = mock_codex();
-        let (name, tool) = resolve_package(&http, "openai/codex", None).unwrap();
+        let (name, tool) = resolve_package(&http, "openai", "codex", None).unwrap();
         assert_eq!(name, "codex");
         assert_eq!(tool.spec, "github:openai/codex");
         match tool.matching.unwrap() {
@@ -223,12 +208,12 @@ mod tests {
     #[test]
     fn resolve_package_gh_end_to_end() {
         let http = MockHttp::new()
-            .with_text(&registry::pkg_url("cli/cli"), GH)
+            .with_text(&registry::pkg_url("cli", "cli"), GH)
             .with_text(
                 "https://api.github.com/repos/cli/cli/releases/latest",
                 r#"{"tag_name":"v2.65.0"}"#,
             );
-        let (name, tool) = resolve_package(&http, "cli/cli", None).unwrap();
+        let (name, tool) = resolve_package(&http, "cli", "cli", None).unwrap();
         assert_eq!(name, "gh");
         match tool.matching.unwrap() {
             PlatformString::PerPlatform(m) => {
@@ -239,37 +224,10 @@ mod tests {
         }
     }
 
-    /// A repo shipping several tools files each package under its full name, and
-    /// aqua names it after the command it produces. Resolving that path must use
-    /// the repo from the package body (not the path) and default the tool name to
-    /// the last segment — `kubectl`, not `kubernetes`.
-    #[test]
-    fn resolve_package_nested_name_uses_the_command_as_the_tool_name() {
-        let yaml = r#"
-packages:
-  - name: kubernetes/kubernetes/kubectl
-    type: http
-    repo_owner: kubernetes
-    repo_name: kubernetes
-    url: https://dl.k8s.io/{{.Version}}/bin/{{.OS}}/{{.Arch}}/kubectl
-"#;
-        let http = MockHttp::new().with_text(&registry::pkg_url("kubernetes/kubernetes/kubectl"), yaml);
-        let (name, tool) = resolve_package(&http, "kubernetes/kubernetes/kubectl", None).unwrap();
-        assert_eq!(name, "kubectl");
-        assert_eq!(
-            tool.spec,
-            "url:https://dl.k8s.io/{version}/bin/{os}/{arch}/kubectl"
-        );
-        // An explicit --name still wins over the derived one.
-        let (name, _) =
-            resolve_package(&http, "kubernetes/kubernetes/kubectl", Some("k")).unwrap();
-        assert_eq!(name, "k");
-    }
-
     #[test]
     fn generate_snippet_contains_key_fields() {
         let http = mock_codex();
-        let (name, tool) = resolve_package(&http, "openai/codex", None).unwrap();
+        let (name, tool) = resolve_package(&http, "openai", "codex", None).unwrap();
         let snippet = generate_snippet(&name, &tool);
         assert!(snippet.contains("[tools.codex]"));
         assert!(snippet.contains("spec = \"github:openai/codex\""));
@@ -287,8 +245,8 @@ packages:
     repo_owner: x
     repo_name: y
 "#;
-        let http = MockHttp::new().with_text(&registry::pkg_url("x/y"), yaml);
-        let err = resolve_package(&http, "x/y", None).unwrap_err();
+        let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
+        let err = resolve_package(&http, "x", "y", None).unwrap_err();
         assert!(err.to_string().contains("unsupported aqua construct"), "{err}");
         assert!(err.to_string().contains("registry.yaml"), "{err}");
     }
@@ -309,8 +267,8 @@ packages:
 "#;
         // No latest-version fetch is canned: the http arm must NOT hit the github
         // release API (it returns before version discovery).
-        let http = MockHttp::new().with_text(&registry::pkg_url("x/y"), yaml);
-        let (name, tool) = resolve_package(&http, "x/y", None).unwrap();
+        let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
+        let (name, tool) = resolve_package(&http, "x", "y", None).unwrap();
         assert_eq!(name, "y");
         assert_eq!(tool.spec, "url:https://example.com/{version}/{os}-{arch}/y");
         assert_eq!(tool.exe.as_deref(), Some("y"));
@@ -333,8 +291,8 @@ packages:
       - version_constraint: 'semver("< 2.0.0")'
         url: https://example.com/{{.Version}}/{{.OS}}-{{.Arch}}/y
 "#;
-        let http = MockHttp::new().with_text(&registry::pkg_url("x/y"), yaml);
-        let err = resolve_package(&http, "x/y", None).unwrap_err();
+        let http = MockHttp::new().with_text(&registry::pkg_url("x", "y"), yaml);
+        let err = resolve_package(&http, "x", "y", None).unwrap_err();
         let msg = err.to_string();
         // Degrades to the manual `ubix add 'url:…'` hint (not an auto-install).
         assert!(msg.contains("ubix add 'url:"), "{msg}");

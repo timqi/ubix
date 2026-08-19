@@ -29,12 +29,6 @@ pub struct Package {
     /// aqua package type; we only support `github_release` (else degrade).
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
-    /// Explicit package name. Absent means it is implied by
-    /// `repo_owner/repo_name`; present when a repo ships several tools
-    /// (`kubernetes/kubernetes/kubectl`), which is also how aqua files it under
-    /// `pkgs/`. Used to pick the right entry out of a multi-package document.
-    #[serde(default)]
-    pub name: Option<String>,
     #[serde(default)]
     pub repo_owner: Option<String>,
     #[serde(default)]
@@ -57,14 +51,6 @@ pub struct Package {
     pub supported_envs: Option<Vec<String>>,
     #[serde(default)]
     pub version_prefix: Option<String>,
-    /// `no_asset: true` — the package ships no binary at all.
-    #[serde(default)]
-    pub no_asset: bool,
-    /// `error_message` — aqua logs it and REFUSES to install
-    /// (`installpackage.validatePackage`), so a non-empty one means the package
-    /// is unavailable, exactly like `no_asset`.
-    #[serde(default)]
-    pub error_message: Option<String>,
     /// Where aqua discovers the version (e.g. `github_tag`, `github_release`).
     /// Used by the http `template:` hint to fill `--version-source`.
     #[serde(default)]
@@ -112,23 +98,15 @@ pub struct VersionOverride {
     /// `no_asset: true` → this whole version branch has no downloadable asset
     /// (source-only / unavailable), so it must not inherit the base asset.
     #[serde(default)]
-    pub no_asset: Option<bool>,
-    /// See [`Package::error_message`]. A pointer in aqua, so a branch may also
-    /// CLEAR an inherited message with `error_message: ""`.
-    #[serde(default)]
-    pub error_message: Option<String>,
+    pub no_asset: bool,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
-    /// `Option` because DECLARING `overrides: []` clears the package's, while
-    /// omitting the key inherits them — aqua distinguishes the two with a nil
-    /// check (`overrideVersion`, `if child.Overrides != nil`).
     #[serde(default)]
-    pub overrides: Option<Vec<PlatformOverride>>,
+    pub overrides: Vec<PlatformOverride>,
 }
 
 /// An `overrides[]` entry: platform-scoped field tweaks. `goos`/`goarch`
-/// select which platforms it applies to. aqua applies the FIRST entry that
-/// matches, in declaration order — see [`pick_override`](super::resolve).
+/// select which platforms it applies to (specificity-first match, plan §7).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct PlatformOverride {
@@ -146,10 +124,9 @@ pub struct PlatformOverride {
     pub files: Option<Vec<FileEntry>>,
     #[serde(default)]
     pub replacements: Option<BTreeMap<String, String>>,
-    /// `envs:` — an extra platform filter on top of `goos`/`goarch`, with the
-    /// same entry syntax as `supported_envs` (aqua's `Override.Envs`).
+    /// `no_asset: true` → this platform has no downloadable asset (unavailable).
     #[serde(default)]
-    pub envs: Option<Vec<String>>,
+    pub no_asset: bool,
     #[serde(rename = "type", default)]
     pub type_: Option<String>,
 }
@@ -190,8 +167,7 @@ mod tests {
         // The `"true"` branch carries a linux→tar.gz override and darwin replacement.
         let last = p.version_overrides.last().unwrap();
         assert_eq!(last.version_constraint.as_deref(), Some("true"));
-        assert!(last.overrides.as_ref().unwrap().iter().any(|o| o.goos.as_deref()
-            == Some("linux")
+        assert!(last.overrides.iter().any(|o| o.goos.as_deref() == Some("linux")
             && o.format.as_deref() == Some("tar.gz")));
         assert_eq!(last.replacements.as_ref().unwrap()["darwin"], "macOS");
     }

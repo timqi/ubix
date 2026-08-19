@@ -45,13 +45,6 @@ lto, strip, panic=abort).
 - `aqua/` — aqua-registry integration as a **config generator** (NOT a runtime
   source): fetch registry.yaml → resolve branch/platform → synthesize a
   `github:` `ToolConfig`. `prune.rs` simulates ubi's asset picker.
-  `registry.rs` also owns the root-index line scanner (`parse_index` →
-  `Candidate`, `search_index`) that backs `search`/discovery. aqua packages are
-  addressed by their full path, which may be nested
-  (`kubernetes/kubernetes/kubectl`) — `pkgs/<path>/registry.yaml`.
-- `discover.rs` — bare-name → spec resolution (`ubix add bat`, `ubix which`):
-  pure scoring over root-index `Candidate`s (`rank`/`pick`/`spec_for`). Only an
-  exact, installable, strictly-best hit is auto-installed.
 - `outdated.rs` — latest-version queries (pure parsers + `HttpClient` dispatch).
 - `prefix_dev.rs` — prefix.dev GraphQL client (conda latest-version + package
   search) for the `pixi` source; pure query builders/parsers + POST dispatch.
