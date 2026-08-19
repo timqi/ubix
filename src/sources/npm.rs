@@ -160,23 +160,6 @@ fn query_installed_bins(runner: &dyn CommandRunner, pkg: &str) -> Vec<String> {
     }
 }
 
-/// Order discovered bin names: `primary` first, then the rest sorted.
-///
-/// The head of `install_paths` is load-bearing — version backfill probes ONLY
-/// `install_paths[0]` (`cli.rs`), and an auxiliary alias need not answer
-/// `--version` at all. `wrangler` ships `cf-wrangler`, `wrangler`, `wrangler2`;
-/// sorting alone would elect `cf-wrangler`, which rejects every probe flag, so
-/// the record would stay at the `latest` sentinel and `decide_action` would
-/// reinstall the package on every upgrade. The rest is sorted because `npm ls`
-/// map order is not stable across npm versions and state files get diffed.
-fn order_bins(mut bins: Vec<String>, primary: &str) -> Vec<String> {
-    bins.sort();
-    if let Some(pos) = bins.iter().position(|b| b == primary) {
-        bins[..=pos].rotate_right(1);
-    }
-    bins
-}
-
 /// Decide which entry-point paths to record. Ground truth is what npm reported it
 /// linked (`discovered`); otherwise fall back to explicitly declared `exes`, and
 /// only as a last resort to the unscoped package name.
@@ -187,7 +170,7 @@ fn tracked_paths(
     bin_dir: &std::path::Path,
 ) -> Vec<PathBuf> {
     let exes = if !discovered.is_empty() {
-        order_bins(discovered, unscoped_name(locator))
+        crate::sources::order_exes(discovered, unscoped_name(locator))
     } else if let Some(declared) = tool.exes.as_ref().filter(|e| !e.is_empty()) {
         // An explicit `exes` order is the user's choice — don't reorder it.
         declared.clone()
@@ -509,28 +492,6 @@ mod tests {
         assert!(installed_bins(r#"{"dependencies":{}}"#, "pnpm").is_empty());
         // Present but no `bin` field (a library, not a CLI).
         assert!(installed_bins(r#"{"dependencies":{"lodash":{}}}"#, "lodash").is_empty());
-    }
-
-    #[test]
-    fn order_bins_puts_primary_first() {
-        // Regression: `wrangler` ships cf-wrangler/wrangler/wrangler2. Plain
-        // sorting elects `cf-wrangler`, which answers none of the probe flags, so
-        // version backfill (which reads install_paths[0]) would silently fail and
-        // the tool would be reinstalled on every upgrade.
-        assert_eq!(
-            order_bins(
-                vec!["wrangler2".into(), "cf-wrangler".into(), "wrangler".into()],
-                "wrangler"
-            ),
-            vec!["wrangler", "cf-wrangler", "wrangler2"]
-        );
-        // No bin matches the package name → sorted, nothing promoted.
-        assert_eq!(
-            order_bins(vec!["b".into(), "a".into()], "pkg"),
-            vec!["a", "b"]
-        );
-        // Single bin is unaffected.
-        assert_eq!(order_bins(vec!["dsh".into()], "dsh"), vec!["dsh"]);
     }
 
     #[test]
