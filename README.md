@@ -51,6 +51,11 @@ Make sure `~/.local/bin` is on your `PATH` (`ubix doctor` checks this).
 | `go` | `GOBIN=~/.local/bin go install` | `go:example.com/cmd/tool@latest` |
 | `pixi` | `pixi global install` (conda; prefix.dev) | `pixi:ripgrep` · `pixi:bioconda::samtools` |
 
+A bare **name** with no `/` (`ubix add bat`) is resolved against the
+aqua-registry index: an exact, installable, unambiguous match is installed
+outright, anything fuzzy lists candidates instead. `ubix which <name>` shows the
+resolution without installing; `--from <source>` restricts it, `--pick <N>`
+selects a listed candidate.
 A bare `owner/repo` uses `settings.default_source` (default `github`).
 The legacy `template:` and `http:` prefixes are kept-for-compat aliases for
 `url:` (a plain URL is just a template with no placeholders).
@@ -59,8 +64,12 @@ Run `ubix sources` for the live list.
 ## Commands
 
 ```
-ubix add <spec> [--name N] [--matching S] [--exe E] [--exes A,B] [--tag T]
+ubix add <name | spec> [--name N] [--matching S] [--exe E] [--exes A,B] [--tag T]
                 [--host U] [--version V] [--rename R] [--force]
+                [--from SOURCE] [--pick N] [--refresh]
+                                # a BARE name (`ubix add bat`) is resolved to a spec first
+ubix which <query> [--from SOURCE] [--refresh]
+                                # show what a bare name resolves to, and the runners-up
 ubix upgrade [names…] [--all] [--force] [--dry-run] [--prune]
 ubix remove <name> [--force]
 ubix list
@@ -79,6 +88,9 @@ Global: `-q/--quiet`, `-v/--verbose`.
 ### Examples
 
 ```sh
+ubix add bat                     # bare name → resolved to `aqua:sharkdp/bat`, then installed
+ubix which kubectl               # → `aqua:kubernetes/kubernetes/kubectl` (+ runners-up)
+ubix add rg --pick 2             # ambiguous: pick a numbered candidate from `ubix which`
 ubix add github:eza-community/eza
 ubix add pypi:ruff --version 0.6.9
 ubix add github:astral-sh/uv --name uv --exes uv,uvx

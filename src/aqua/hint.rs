@@ -115,8 +115,8 @@ fn extract(pkg: &Package) -> HttpFields {
                 replacements.insert(k.clone(), v.clone());
             }
         }
-        if !vo.overrides.is_empty() {
-            overrides = vo.overrides.clone();
+        if let Some(ov) = &vo.overrides {
+            overrides = ov.clone();
         }
     }
 

@@ -31,14 +31,21 @@ pub struct Branch {
     pub format: Option<String>,
     pub files: Option<Vec<FileEntry>>,
     pub replacements: BTreeMap<String, String>,
-    pub supported_envs: Vec<String>,
+    /// `supported_envs`: `None` = unrestricted, `Some([])` = supports NOTHING.
+    /// aqua draws exactly that distinction (`CheckSupportedEnvs` short-circuits
+    /// on nil, then lets an empty list fall through `matchEnvs` to false).
+    pub supported_envs: Option<Vec<String>>,
     pub version_prefix: Option<String>,
     /// Platform overrides visible in this branch (branch's own, else base's).
     pub overrides: Vec<PlatformOverride>,
     /// Non-github_release type found on the branch (→ degrade).
     pub type_: Option<String>,
-    /// Branch-level `no_asset`: the whole branch is unavailable (no binary).
+    /// `no_asset`: the whole branch is unavailable (no binary).
     pub no_asset: bool,
+    /// `error_message`: aqua refuses to install a package that has one
+    /// (`validatePackage`), so a non-empty message means unavailable too.
+    /// `golang/tools/gorename` uses it to say the command was deleted.
+    pub error_message: Option<String>,
 }
 
 /// The effective (merged) fields for a single platform.
@@ -54,10 +61,16 @@ pub struct Effective {
 /// Select the winning `version_override` branch for `latest_version`, merged
 /// onto the package base (plan §7 steps 1–3).
 ///
-/// * If any branch has `version_constraint == "true"`, take it.
+/// * If the PACKAGE-level `version_constraint` is absent or holds, the base entry
+///   applies and the branches are not consulted at all.
+/// * Else if any branch has `version_constraint == "true"`, take it.
 /// * Else evaluate each branch's constraint against `latest_version`; take the
 ///   first match (list order).
 /// * Else bail with the registry.yaml link.
+///
+/// Two deliberate divergences from aqua are recorded in
+/// `docs/KNOWN_LIMITATIONS.md`: the `"true"` hoist, and bailing where aqua would
+/// silently fall back to a base entry it just ruled out.
 ///
 /// `latest_version` is the resolved latest tag (may carry a `v`/prefix — we
 /// only compare the semver core).
@@ -65,6 +78,27 @@ pub fn select_branch(pkg: &Package, latest_version: &str, owner: &str, repo: &st
     // No version_overrides at all: the base itself is the branch (simple pkgs).
     if pkg.version_overrides.is_empty() {
         return Ok(base_branch(pkg));
+    }
+
+    // 0) The package-level `version_constraint` says WHEN THE BASE APPLIES; aqua
+    // reads `version_overrides` only when it does not hold
+    // (`PackageInfo.SetVersion`, aqua/pkg/config/registry/version_override.go).
+    // NO constraint means the base always applies and the branches are dead
+    // history; `"false"` is how a package says "always use a branch" (1693 of
+    // them, e.g. `sharkdp/bat`); anything else is a `>= <old version>` guard whose
+    // whole point is that current releases use the base. Skipping this step took
+    // the oldest fallback branch instead: `ubix add func` installed
+    // knative-v1.23.1 as `faas`, and `ajeetdsouza/zoxide` picked a branch whose
+    // asset template still carries the `v` prefix the base trims. An expression we
+    // cannot evaluate is read as HOLDING, since that is what it means for every
+    // current release.
+    match pkg.version_constraint.as_deref() {
+        None => return Ok(base_branch(pkg)),
+        Some("false") => {}
+        Some(c) if eval_constraint(c, latest_version).unwrap_or(true) => {
+            return Ok(base_branch(pkg));
+        }
+        Some(_) => {}
     }
 
     // 1) `version_constraint == "true"` wins outright.
@@ -100,12 +134,12 @@ fn base_branch(pkg: &Package) -> Branch {
         format: pkg.format.clone(),
         files: pkg.files.clone(),
         replacements: pkg.replacements.clone().unwrap_or_default(),
-        supported_envs: pkg.supported_envs.clone().unwrap_or_default(),
+        supported_envs: pkg.supported_envs.clone(),
         version_prefix: pkg.version_prefix.clone(),
         overrides: pkg.overrides.clone(),
         type_: pkg.type_.clone(),
-        // Base package has no branch-level no_asset (only platform overrides do).
-        no_asset: false,
+        no_asset: pkg.no_asset,
+        error_message: pkg.error_message.clone(),
     }
 }
 
@@ -129,32 +163,41 @@ fn merge_branch(pkg: &Package, vo: &VersionOverride) -> Branch {
         }
     }
     if let Some(se) = &vo.supported_envs {
-        b.supported_envs = se.clone();
+        b.supported_envs = Some(se.clone());
     }
     if vo.version_prefix.is_some() {
         b.version_prefix = vo.version_prefix.clone();
     }
-    if !vo.overrides.is_empty() {
-        b.overrides = vo.overrides.clone();
+    // Declared, even as `overrides: []`, replaces the package's; omitted inherits.
+    if let Some(ov) = &vo.overrides {
+        b.overrides = ov.clone();
     }
     if vo.type_.is_some() {
         b.type_ = vo.type_.clone();
     }
-    if vo.no_asset {
-        b.no_asset = true;
+    // Both are pointers in aqua, so a branch may also CLEAR an inherited value.
+    if let Some(n) = vo.no_asset {
+        b.no_asset = n;
+    }
+    if let Some(e) = &vo.error_message {
+        b.error_message = Some(e.clone());
     }
     b
 }
 
-/// Resolve the effective fields for a single (goos, goarch), applying the
-/// matching platform override (specificity-first). Returns `Ok(None)` when the
-/// platform is unavailable (unsupported env or `no_asset`).
+/// Resolve the effective fields for a single (goos, goarch), applying the one
+/// matching platform override. Returns `Ok(None)` when the platform is
+/// unavailable (unsupported env, `no_asset`, or no asset template at all).
 pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option<Effective>> {
     // A branch marked `no_asset` has no binary for any platform → unavailable.
     if branch.no_asset {
         return Ok(None);
     }
-    if !env_supported(&branch.supported_envs, goos, goarch) {
+    // aqua logs the message and refuses the install, so there is nothing here.
+    if branch.error_message.as_deref().is_some_and(|m| !m.is_empty()) {
+        return Ok(None);
+    }
+    if !env_supported(branch.supported_envs.as_deref(), goos, goarch) {
         return Ok(None);
     }
 
@@ -164,9 +207,6 @@ pub fn effective_for(branch: &Branch, goos: &str, goarch: &str) -> Result<Option
     let mut replacements = branch.replacements.clone();
 
     if let Some(ov) = pick_override(&branch.overrides, goos, goarch) {
-        if ov.no_asset {
-            return Ok(None);
-        }
         if ov.asset.is_some() {
             asset = ov.asset.clone();
         }
@@ -208,54 +248,63 @@ fn normalize_format(format: Option<String>) -> String {
     }
 }
 
-/// Whether (goos, goarch) is in `supported_envs`. Empty list ⇒ all supported
-/// (aqua default). Entries: `all` / `<goos>` / `<goarch>` / `<goos>/<goarch>`.
-pub fn env_supported(supported_envs: &[String], goos: &str, goarch: &str) -> bool {
-    if supported_envs.is_empty() {
+/// Whether (goos, goarch) is in an env list. Entries: `all` / `<goos>` /
+/// `<goarch>` / `<goos>/<goarch>`.
+///
+/// ABSENT and EMPTY are opposites, and aqua means it: `CheckSupportedEnvs`
+/// returns true for a nil list, while an explicitly empty one falls through to
+/// `matchEnvs`, whose loop never runs and so returns false. `None` here is
+/// "unrestricted"; `Some([])` is "no platform at all".
+pub fn env_supported(envs: Option<&[String]>, goos: &str, goarch: &str) -> bool {
+    let Some(envs) = envs else {
         return true;
-    }
+    };
     let pair = format!("{goos}/{goarch}");
-    supported_envs.iter().any(|e| {
-        e == "all" || e == goos || e == goarch || e == &pair
-    })
+    envs.iter().any(|e| e == "all" || e == goos || e == goarch || e == &pair)
 }
 
-/// Pick the matching platform override with **specificity-first** priority
-/// (plan §7): `goos+goarch` > `goos`-only > (goarch-only) > unconstrained;
-/// list order only as a tiebreaker within the same specificity.
+/// Pick the platform override that applies to `(goos, goarch)`.
+///
+/// aqua takes the FIRST match in declaration order (`PackageInfo.getOverride`
+/// → `Override.Match`); there is no specificity ranking, so a registry that
+/// lists a broad entry before a narrower one gets the broad one. Only one
+/// override is ever applied.
 fn pick_override<'a>(
     overrides: &'a [PlatformOverride],
     goos: &str,
     goarch: &str,
 ) -> Option<&'a PlatformOverride> {
-    // Score: higher = more specific. -1 = does not apply.
-    fn score(ov: &PlatformOverride, goos: &str, goarch: &str) -> i32 {
-        let os_ok = ov.goos.as_deref().map(|g| g == goos);
-        let arch_ok = ov.goarch.as_deref().map(|a| a == goarch);
-        match (os_ok, arch_ok) {
-            // both specified and match → most specific
-            (Some(true), Some(true)) => 3,
-            (Some(true), None) => 2,       // goos-only
-            (None, Some(true)) => 1,       // goarch-only
-            (None, None) => 0,             // unconstrained
-            // any explicit mismatch → does not apply
-            (Some(false), _) | (_, Some(false)) => -1,
-        }
-    }
+    overrides.iter().find(|ov| {
+        override_matches(
+            ov.goos.as_deref(),
+            ov.goarch.as_deref(),
+            ov.envs.as_deref(),
+            goos,
+            goarch,
+        )
+    })
+}
 
-    let mut best: Option<(&PlatformOverride, i32)> = None;
-    for ov in overrides {
-        let s = score(ov, goos, goarch);
-        if s < 0 {
-            continue;
-        }
-        match best {
-            // strictly greater specificity wins; equal keeps the earlier (list order)
-            Some((_, bs)) if s <= bs => {}
-            _ => best = Some((ov, s)),
-        }
+/// Whether a platform override applies to `(goos, goarch)`: a declared
+/// `goos`/`goarch` must equal it, and a declared `envs:` must list it.
+///
+/// Shared with the root-index scanner ([`crate::aqua::registry`]) so discovery
+/// reports the commands from the same override the installer will apply.
+///
+/// aqua also gates on `variants:` (currently only `libc`), which ubix does not
+/// model — see `docs/KNOWN_LIMITATIONS.md`.
+pub fn override_matches(
+    ov_goos: Option<&str>,
+    ov_goarch: Option<&str>,
+    ov_envs: Option<&[String]>,
+    goos: &str,
+    goarch: &str,
+) -> bool {
+    if ov_goos.is_some_and(|g| g != goos) || ov_goarch.is_some_and(|a| a != goarch) {
+        return false;
     }
-    best.map(|(ov, _)| ov)
+    // Absent ⇒ every platform; present ⇒ only what it lists (`envs: []` ⇒ none).
+    env_supported(ov_envs, goos, goarch)
 }
 
 // ---- version constraint evaluation ----
@@ -398,14 +447,83 @@ mod tests {
         assert!(branch.replacements.contains_key("linux"));
     }
 
+    /// The package-level `version_constraint` gates the BASE entry: while it holds,
+    /// aqua never reads `version_overrides`. Ignoring it took the oldest fallback
+    /// branch — `ubix add func` installed knative-v1.23.1 as `faas`, and
+    /// `ajeetdsouza/zoxide` picked a branch whose asset keeps the `v` the base
+    /// trims.
+    #[test]
+    fn package_constraint_keeps_the_base_entry_over_a_true_branch() {
+        let yaml = r#"
+packages:
+  - type: github_release
+    repo_owner: ajeetdsouza
+    repo_name: zoxide
+    asset: zoxide-{{trimV .Version}}-{{.Arch}}.{{.Format}}
+    files:
+      - name: zoxide
+    version_constraint: semver(">= 0.8.2")
+    version_overrides:
+      - version_constraint: "true"
+        asset: zoxide-{{.Version}}-{{.Arch}}.{{.Format}}
+        files:
+          - name: legacy-zoxide
+"#;
+        let pkg = parse(yaml);
+        let now = select_branch(&pkg, "0.9.8", "ajeetdsouza", "zoxide").unwrap();
+        assert_eq!(now.asset.as_deref(), Some("zoxide-{{trimV .Version}}-{{.Arch}}.{{.Format}}"));
+        assert_eq!(now.files.unwrap()[0].name.as_deref(), Some("zoxide"));
+
+        // Below the constraint the branch takes over again.
+        let old = select_branch(&pkg, "0.5.0", "ajeetdsouza", "zoxide").unwrap();
+        assert_eq!(old.files.unwrap()[0].name.as_deref(), Some("legacy-zoxide"));
+
+        // An expression we cannot evaluate (`knative/func`'s `semverWithVersion(…)
+        // or …`) means the same thing for a current release: the base applies.
+        let unparseable = yaml.replace(r#"semver(">= 0.8.2")"#, r#"semverWithVersion(">= 1.7.0")"#);
+        let branch = select_branch(&parse(&unparseable), "1.23.1", "knative", "func").unwrap();
+        assert_eq!(branch.files.unwrap()[0].name.as_deref(), Some("zoxide"));
+
+        // `"false"` is the opposite instruction: always use a branch.
+        let never = yaml.replace(r#"semver(">= 0.8.2")"#, r#""false""#);
+        let branch = select_branch(&parse(&never), "0.9.8", "x", "y").unwrap();
+        assert_eq!(branch.files.unwrap()[0].name.as_deref(), Some("legacy-zoxide"));
+    }
+
+    #[test]
+    fn no_package_constraint_never_consults_the_branches() {
+        // `PackageInfo.SetVersion` returns the base entry outright when the
+        // package declares no `version_constraint`, however the branches are
+        // constrained — `RobotsAndPencils/xcodes` is the one such package, and its
+        // only branch is a `no_asset` hole for a single broken release.
+        let yaml = r#"
+packages:
+  - type: github_release
+    repo_owner: RobotsAndPencils
+    repo_name: xcodes
+    asset: xcodes.zip
+    version_overrides:
+      - version_constraint: Version == "1.4.0"
+        no_asset: true
+"#;
+        let pkg = parse(yaml);
+        for v in ["1.4.0", "1.6.2"] {
+            let branch = select_branch(&pkg, v, "RobotsAndPencils", "xcodes").unwrap();
+            assert!(!branch.no_asset, "{v}");
+            assert_eq!(branch.asset.as_deref(), Some("xcodes.zip"), "{v}");
+        }
+    }
+
     #[test]
     fn select_semver_fallback_when_no_true() {
-        // Synthesize a package with only comparison branches.
+        // Synthesize a package with only comparison branches. `"false"` is what
+        // hands the package over to them (an absent constraint keeps the base).
         let yaml = r#"
 packages:
   - type: github_release
     repo_owner: x
     repo_name: y
+    version_constraint: "false"
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         asset: old-{{.OS}}
@@ -427,6 +545,7 @@ packages:
   - type: github_release
     repo_owner: x
     repo_name: y
+    version_constraint: "false"
     version_overrides:
       - version_constraint: semver("<= 1.0.0")
         asset: old
@@ -439,8 +558,9 @@ packages:
     }
 
     #[test]
-    fn merge_specificity_goos_arch_beats_goos_only_regardless_of_order() {
-        // goos-only listed BEFORE goos+goarch → the more specific one must win.
+    fn pick_override_takes_the_first_match_in_declaration_order() {
+        // goos-only listed BEFORE goos+goarch → the broader one still wins,
+        // because aqua stops at the first `Override.Match`.
         let overrides = vec![
             PlatformOverride {
                 goos: Some("linux".into()),
@@ -455,10 +575,15 @@ packages:
             },
         ];
         let picked = pick_override(&overrides, "linux", "arm64").unwrap();
-        assert_eq!(picked.format.as_deref(), Some("tar.xz"));
-        // linux/amd64 has no goos+goarch match → falls to goos-only.
-        let picked2 = pick_override(&overrides, "linux", "amd64").unwrap();
-        assert_eq!(picked2.format.as_deref(), Some("tar.gz"));
+        assert_eq!(picked.format.as_deref(), Some("tar.gz"));
+        // A declared goos/goarch that mismatches rules an entry out entirely.
+        assert!(pick_override(&overrides, "darwin", "arm64").is_none());
+        // Reversed, the narrower entry is reached first.
+        let reversed: Vec<_> = overrides.into_iter().rev().collect();
+        assert_eq!(
+            pick_override(&reversed, "linux", "arm64").unwrap().format.as_deref(),
+            Some("tar.xz")
+        );
     }
 
     #[test]
@@ -476,30 +601,119 @@ packages:
 
     #[test]
     fn supported_envs_gating() {
-        assert!(env_supported(&[], "linux", "amd64")); // empty = all
-        assert!(env_supported(&["all".into()], "linux", "amd64"));
-        assert!(env_supported(&["linux".into()], "linux", "arm64"));
-        assert!(env_supported(&["amd64".into()], "darwin", "amd64"));
-        assert!(env_supported(&["linux/amd64".into()], "linux", "amd64"));
-        assert!(!env_supported(&["linux/amd64".into()], "linux", "arm64"));
-        assert!(!env_supported(&["darwin".into()], "linux", "amd64"));
+        let list = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // ABSENT means unrestricted; EMPTY means nothing, as in aqua's
+        // `CheckSupportedEnvs` (nil short-circuits, `[]` falls through
+        // `matchEnvs` and its loop never runs).
+        assert!(env_supported(None, "linux", "amd64"));
+        assert!(!env_supported(Some(&[]), "linux", "amd64"));
+        assert!(env_supported(Some(&list(&["all"])), "linux", "amd64"));
+        assert!(env_supported(Some(&list(&["linux"])), "linux", "arm64"));
+        assert!(env_supported(Some(&list(&["amd64"])), "darwin", "amd64"));
+        assert!(env_supported(Some(&list(&["linux/amd64"])), "linux", "amd64"));
+        assert!(!env_supported(Some(&list(&["linux/amd64"])), "linux", "arm64"));
+        assert!(!env_supported(Some(&list(&["darwin"])), "linux", "amd64"));
     }
 
     #[test]
-    fn no_asset_makes_platform_unavailable() {
+    fn an_explicitly_empty_envs_list_matches_no_platform() {
+        // `envs: []` must not swallow the override after it.
         let branch = Branch {
-            asset: Some("x-{{.OS}}".into()),
-            format: Some("raw".into()),
-            overrides: vec![PlatformOverride {
-                goos: Some("linux".into()),
-                no_asset: true,
-                ..Default::default()
-            }],
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    envs: Some(vec![]),
+                    asset: Some("wrong".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("right".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(effective_for(&branch, "linux", "amd64").unwrap().unwrap().asset, "right");
+        // …and a branch whose own supported_envs are empty supports nothing.
+        let nowhere = Branch {
+            asset: Some("base".into()),
+            supported_envs: Some(vec![]),
+            ..Default::default()
+        };
+        assert!(effective_for(&nowhere, "linux", "amd64").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_branch_error_message_makes_it_unavailable() {
+        // aqua's `validatePackage` logs the message and refuses to install, so a
+        // branch that carries one installs nothing anywhere
+        // (`golang/tools/gorename`: the command was deleted at v0.26.0).
+        let branch = Branch {
+            asset: Some("tools-{{.OS}}".into()),
+            error_message: Some("gorename was deleted".into()),
             ..Default::default()
         };
         assert!(effective_for(&branch, "linux", "amd64").unwrap().is_none());
-        // darwin unaffected.
-        assert!(effective_for(&branch, "darwin", "amd64").unwrap().is_some());
+        // An empty message is not a message.
+        let ok = Branch { error_message: Some(String::new()), ..branch.clone() };
+        assert!(effective_for(&ok, "linux", "amd64").unwrap().is_some());
+    }
+
+    #[test]
+    fn the_first_matching_override_wins_not_the_most_specific() {
+        // aqua's `getOverride` returns the first match in declaration order, so a
+        // broad entry listed first shadows a narrower one after it.
+        let branch = Branch {
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("broad".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    goarch: Some("amd64".into()),
+                    asset: Some("narrow".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let eff = effective_for(&branch, "linux", "amd64").unwrap().unwrap();
+        assert_eq!(eff.asset, "broad");
+    }
+
+    #[test]
+    fn an_override_envs_list_gates_it_like_supported_envs() {
+        // `eza-community/eza` leads with an `envs:`-only override that must not
+        // apply on linux, letting the goos-scoped one after it win.
+        let branch = Branch {
+            asset: Some("base".into()),
+            overrides: vec![
+                PlatformOverride {
+                    envs: Some(vec!["darwin".into(), "windows/arm64".into()]),
+                    asset: Some("mac-or-winarm".into()),
+                    ..Default::default()
+                },
+                PlatformOverride {
+                    goos: Some("linux".into()),
+                    asset: Some("linux".into()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(effective_for(&branch, "linux", "amd64").unwrap().unwrap().asset, "linux");
+        assert_eq!(
+            effective_for(&branch, "darwin", "arm64").unwrap().unwrap().asset,
+            "mac-or-winarm"
+        );
+        assert_eq!(
+            effective_for(&branch, "windows", "amd64").unwrap().unwrap().asset,
+            "base"
+        );
     }
 
     #[test]
@@ -513,6 +727,7 @@ packages:
     repo_name: y
     asset: base-{{.OS}}
     format: raw
+    version_constraint: "false"
     version_overrides:
       - version_constraint: "true"
         no_asset: true
