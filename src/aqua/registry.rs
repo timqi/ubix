@@ -164,7 +164,7 @@ pub fn read_root_cache(path: &Path) -> Result<Option<String>> {
 /// name → (source, repo) map across ecosystems — that's what bare-name
 /// discovery ([`crate::discover`]) scores. Only the fields needed for
 /// discovery/search are modeled; everything else is skipped by the scanner.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
 pub struct Candidate {
     pub owner: String,
     pub repo: String,
@@ -213,11 +213,15 @@ impl Candidate {
     }
 }
 
-/// Which indent-4 list the scanner is currently inside.
+/// Which indent-4 block the scanner is currently inside.
+#[derive(PartialEq, Eq)]
 enum Block {
     None,
     Files,
     Aliases,
+    /// A `description:` block scalar (`|`, `|-`, `>-`, …), whose text lives on
+    /// the following, more-indented lines.
+    Description,
 }
 
 /// Parse the root index into one [`Candidate`] per package.
@@ -230,21 +234,22 @@ enum Block {
 /// Anchoring on exact indents is what keeps a `files:` nested under
 /// `version_overrides:` (indent 8) from leaking in as a top-level exe.
 ///
-/// Packages without `repo_owner`/`repo_name` are dropped: every ubix spec needs
-/// a repo, so a candidate we could not act on would only be noise.
+/// Packages we could not act on are dropped (see [`actionable`]) — a candidate
+/// with no installable spec would only be noise.
 pub fn parse_index(text: &str) -> Vec<Candidate> {
     let mut out: Vec<Candidate> = Vec::new();
+    let mut seen: std::collections::HashSet<Candidate> = std::collections::HashSet::new();
     let mut cur: Option<Candidate> = None;
     let mut block = Block::None;
     for line in text.lines() {
-        let t = line.trim_start();
+        let t = line.trim_start().trim_end_matches('\r');
         if t.is_empty() || t.starts_with('#') {
             continue;
         }
-        let indent = line.len() - t.len();
+        let indent = line.len() - line.trim_start().len();
         match indent {
             2 if t.starts_with("- ") => {
-                push_candidate(&mut out, cur.take());
+                push_candidate(&mut out, &mut seen, cur.take());
                 let mut c = Candidate::default();
                 absorb(&mut c, &t[2..]); // the first field rides the dash line
                 cur = Some(c);
@@ -254,43 +259,87 @@ pub fn parse_index(text: &str) -> Vec<Candidate> {
                 block = match t {
                     "files:" => Block::Files,
                     "aliases:" => Block::Aliases,
+                    _ if is_block_description(t) => Block::Description,
                     _ => Block::None,
                 };
                 if let Some(c) = cur.as_mut() {
-                    absorb(c, t);
+                    if block == Block::Description {
+                        // The `|`/`>` marker is not the text; the following lines are.
+                        c.description = Some(String::new());
+                    } else {
+                        absorb(c, t);
+                    }
                 }
             }
             6 => {
-                let entry = t.strip_prefix("- ").unwrap_or(t);
-                if let (Some(c), Some(v)) = (cur.as_mut(), field(entry, "name:")) {
-                    match block {
-                        Block::Files => c.exes.push(v.to_string()),
-                        Block::Aliases => c.aliases.push(v.to_string()),
-                        Block::None => {}
+                let Some(c) = cur.as_mut() else { continue };
+                match block {
+                    Block::Description => {
+                        let d = c.description.get_or_insert_with(String::new);
+                        if !d.is_empty() {
+                            d.push(' ');
+                        }
+                        d.push_str(t);
                     }
+                    Block::Files | Block::Aliases => {
+                        let entry = t.strip_prefix("- ").unwrap_or(t);
+                        if let Some(v) = field(entry, "name:") {
+                            if block == Block::Files {
+                                c.exes.push(v.to_string());
+                            } else {
+                                c.aliases.push(v.to_string());
+                            }
+                        }
+                    }
+                    Block::None => {}
                 }
             }
             _ => {}
         }
     }
-    push_candidate(&mut out, cur.take());
+    push_candidate(&mut out, &mut seen, cur.take());
     out
 }
 
-/// Finish a scanned package: drop the unusable ones, normalize the default
-/// `type`, and dedupe (the index lists a few packages twice under different
-/// names).
-fn push_candidate(out: &mut Vec<Candidate>, cand: Option<Candidate>) {
+/// Whether a `description:` line opens a YAML block scalar (`|`, `|-`, `>`, `>-`)
+/// instead of carrying its text inline.
+fn is_block_description(line: &str) -> bool {
+    field(line, "description:").is_some_and(|v| v.starts_with('|') || v.starts_with('>'))
+}
+
+/// Finish a scanned package: normalize the default `type`, drop the unusable
+/// ones, and dedupe (the index lists a few packages twice under different
+/// names). Dedupe is a `HashSet` rather than a linear scan so the 2277-package
+/// index stays O(n).
+fn push_candidate(
+    out: &mut Vec<Candidate>,
+    seen: &mut std::collections::HashSet<Candidate>,
+    cand: Option<Candidate>,
+) {
     let Some(mut c) = cand else { return };
-    if c.owner.is_empty() || c.repo.is_empty() {
-        return;
-    }
     if c.kind.is_empty() {
         c.kind = "github_release".to_string();
     }
-    if !out.contains(&c) {
+    if !actionable(&c) {
+        return;
+    }
+    if seen.insert(c.clone()) {
         out.push(c);
     }
+}
+
+/// Whether a scanned package can yield an installable spec.
+///
+/// Release/http packages are addressed by their repo (aqua synthesis reads
+/// `repo_owner`/`repo_name` and bails without them), but ecosystem packages
+/// carry a self-contained locator: `crates.io/…` and `_go/…` entries may omit
+/// the GitHub repo entirely, and `cargo:<crate>` / `go:<path>` is already a
+/// complete spec.
+fn actionable(c: &Candidate) -> bool {
+    if !c.owner.is_empty() && !c.repo.is_empty() {
+        return true;
+    }
+    matches!(c.kind.as_str(), "cargo" | "go_install" | "go_build") && c.locator.is_some()
 }
 
 /// Apply one `key: value` line to the package being scanned.
@@ -545,6 +594,13 @@ packages:
     repo_name: bat
     description: A cat(1) clone with wings
     crate: bat
+  - name: _go/sigsum.org/sigsum-go#cmd/sigsum-submit
+    type: go_install
+    description: |
+      One of Sigsum command line tools.
+      Creates and submits add-leaf requests
+    path: sigsum.org/sigsum-go/cmd/sigsum-submit
+    go_version_path: sigsum.org/sigsum-go
   - type: http
     name: no-repo/tool
     url: https://example.com/tool
@@ -560,8 +616,9 @@ packages:
     #[test]
     fn parse_index_reads_fields_block_aware() {
         let cands = parse_index(ROOT);
-        // The `no-repo/tool` package is dropped (no repo → no actionable spec).
-        assert_eq!(cands.len(), 4, "{cands:#?}");
+        // The repo-less `http` package is dropped (aqua synthesis needs a repo);
+        // the repo-less `go_install` one is kept (its `path:` is a whole spec).
+        assert_eq!(cands.len(), 5, "{cands:#?}");
 
         let gh = find(&cands, "cli", "github_release");
         assert_eq!(gh.owner, "cli");
@@ -581,6 +638,41 @@ packages:
         assert_eq!(bat.locator.as_deref(), Some("bat"));
     }
 
+    /// A package may carry a locator and NO GitHub repo (`_go/…`, some
+    /// `crates.io/…`). Dropping those for lack of a repo lost installable tools.
+    #[test]
+    fn parse_index_keeps_a_repoless_package_that_has_a_locator() {
+        let cands = parse_index(ROOT);
+        let go = cands
+            .iter()
+            .find(|c| c.kind == "go_install")
+            .expect("repo-less go package kept");
+        assert!(go.owner.is_empty() && go.repo.is_empty());
+        assert_eq!(go.locator.as_deref(), Some("sigsum.org/sigsum-go/cmd/sigsum-submit"));
+        // The command comes from the last segment of the nested aqua name.
+        assert_eq!(go.command_names(), vec!["sigsum-submit"]);
+        // …while a repo-less `http` package has no way to be installed at all.
+        assert!(!cands.iter().any(|c| c.kind == "http"), "{cands:#?}");
+    }
+
+    /// `description: |` puts the text on the FOLLOWING lines; recording the `|`
+    /// marker itself made those descriptions unsearchable.
+    #[test]
+    fn parse_index_folds_a_block_scalar_description() {
+        let cands = parse_index(ROOT);
+        let go = cands.iter().find(|c| c.kind == "go_install").unwrap();
+        assert_eq!(
+            go.description.as_deref(),
+            Some("One of Sigsum command line tools. Creates and submits add-leaf requests")
+        );
+        // A word that exists only inside the folded block is findable.
+        let hits = search_index(ROOT, "add-leaf");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].kind, "go_install");
+        // The continuation lines must not be mistaken for fields of the package.
+        assert!(go.exes.is_empty() && go.aliases.is_empty());
+    }
+
     #[test]
     fn parse_index_defaults_missing_type_to_github_release() {
         let cands = parse_index("packages:\n  - repo_owner: a\n    repo_name: b\n");
@@ -592,9 +684,18 @@ packages:
         let hits = search_index(ROOT, "cod");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].repo, "codex");
-        // Substring 'c' matches cli, codex and crates.io/bat (order preserved).
-        let repos: Vec<String> = search_index(ROOT, "c").into_iter().map(|c| c.repo).collect();
-        assert_eq!(repos, vec!["cli", "codex", "bat"]);
+        // Substring 'c' matches cli, codex, crates.io/bat and the `#cmd/` go
+        // package (order preserved).
+        let paths: Vec<String> = search_index(ROOT, "c").into_iter().map(|c| c.pkg_path()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "cli/cli",
+                "openai/codex",
+                "crates.io/bat",
+                "_go/sigsum.org/sigsum-go#cmd/sigsum-submit"
+            ]
+        );
         // No match.
         assert!(search_index(ROOT, "zzz").is_empty());
     }

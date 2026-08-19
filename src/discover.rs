@@ -75,6 +75,10 @@ pub struct Hit {
     /// source for this aqua package type.
     pub spec: Option<String>,
     pub score: u32,
+    /// Whether this package actually installs a command named like the query.
+    /// A package whose declared `files[]` prove otherwise (`bottom` installs
+    /// `btm`) must not out-pick one that does — see [`pick`].
+    pub provides: bool,
 }
 
 /// The spec ubix would install a candidate from, or `None` when its aqua type
@@ -90,13 +94,17 @@ pub fn spec_for(c: &Candidate) -> Option<String> {
         // The package PATH (not owner/repo) is what addresses it in the registry.
         "github_release" | "http" => Some(format!("aqua:{}", c.pkg_path())),
         "cargo" => c.locator.as_ref().map(|k| format!("cargo:{k}")),
-        // aqua defaults a go module path to the repo path when `path:` is absent.
-        "go_install" | "go_build" => Some(format!(
-            "go:{}",
-            c.locator
-                .clone()
-                .unwrap_or_else(|| format!("github.com/{}/{}", c.owner, c.repo))
-        )),
+        // aqua defaults a go module path to the repo path when `path:` is absent
+        // — but a `_go/…` package may carry the path and no repo at all, so
+        // neither half may be assumed present.
+        "go_install" | "go_build" => c
+            .locator
+            .clone()
+            .or_else(|| {
+                (!c.owner.is_empty() && !c.repo.is_empty())
+                    .then(|| format!("github.com/{}/{}", c.owner, c.repo))
+            })
+            .map(|path| format!("go:{path}")),
         _ => None,
     }
 }
@@ -132,6 +140,7 @@ pub fn rank(cands: &[Candidate], query: &str) -> Vec<Hit> {
                 score: why.base() + kind_bonus(&c.kind),
                 why,
                 spec: spec_for(c),
+                provides: c.command_names().iter().any(|n| n.to_ascii_lowercase() == q),
                 candidate: c.clone(),
             })
         })
@@ -179,13 +188,21 @@ fn why_matched(c: &Candidate, q: &str) -> Option<Why> {
 
 /// The unambiguous winner among ranked `hits`, if there is one.
 ///
-/// Three conditions, all required, so `add` never silently installs a guess:
-/// the top hit matched EXACTLY, ubix can install it, and no other candidate
-/// scored as high.
+/// Four conditions, all required, so `add` never silently installs a guess:
+/// the top hit matched EXACTLY, ubix can install it, no other candidate scored
+/// as high, and it is not SHADOWED — i.e. its own `files[]` don't prove it
+/// installs some other command while a rival exact match does install the one
+/// that was asked for.
+///
+/// Shadowing is what separates a real conflict from the benign case: `bottom`
+/// installs `btm` and nothing else claims `bottom`, so it still auto-picks (the
+/// caller names the real command); but a repo literally named `foo` that ships
+/// only `bar` must not beat the package that ships `foo`.
 pub fn pick(hits: &[Hit]) -> Option<&Hit> {
     let top = hits.first()?;
     let unique = hits.get(1).is_none_or(|next| next.score < top.score);
-    (top.why.is_exact() && top.spec.is_some() && unique).then_some(top)
+    let shadowed = !top.provides && hits[1..].iter().any(|h| h.provides && h.why.is_exact());
+    (top.why.is_exact() && top.spec.is_some() && unique && !shadowed).then_some(top)
 }
 
 #[cfg(test)]
@@ -281,6 +298,59 @@ mod tests {
         assert_eq!(hits[0].why, Why::Repo);
         assert!(hits[0].spec.is_none());
         assert!(pick(&hits).is_none());
+    }
+
+    /// A repo literally named `foo` that ships only `bar` must not out-pick the
+    /// package that actually ships `foo` — that is a real conflict, not the
+    /// benign rename case below.
+    #[test]
+    fn a_repo_name_match_that_ships_another_command_is_shadowed() {
+        let namesake =
+            Candidate { exes: vec!["bar".into()], ..cand("alice", "foo", "github_release") };
+        let provider =
+            Candidate { exes: vec!["foo".into()], ..cand("bob", "tool", "github_release") };
+        let hits = rank(&[namesake, provider], "foo");
+        assert_eq!(hits[0].candidate.owner, "alice", "repo name still ranks first");
+        assert!(!hits[0].provides);
+        assert!(hits[1].provides);
+        assert!(pick(&hits).is_none(), "a shadowed top hit must ask the user");
+    }
+
+    /// `ClementTsang/bottom` installs `btm` and nothing else claims `bottom`, so
+    /// it is still the right unattended answer (the caller names the real
+    /// command in its resolution note).
+    #[test]
+    fn a_renamed_binary_still_auto_picks_when_nothing_rivals_it() {
+        let bottom =
+            Candidate { exes: vec!["btm".into()], ..cand("ClementTsang", "bottom", "github_release") };
+        let hits = rank(&[bottom], "bottom");
+        assert!(!hits[0].provides);
+        assert_eq!(
+            pick(&hits).map(|h| h.candidate.command_names()),
+            Some(vec!["btm"]),
+            "no rival installs `bottom`, so this is unambiguous"
+        );
+    }
+
+    /// `_go/…` packages carry a module path and no GitHub repo at all.
+    #[test]
+    fn a_repoless_go_package_resolves_from_its_locator_alone() {
+        let c = Candidate {
+            name: Some("_go/sigsum.org/sigsum-go#cmd/sigsum-submit".into()),
+            kind: "go_install".into(),
+            locator: Some("sigsum.org/sigsum-go/cmd/sigsum-submit".into()),
+            ..Candidate::default()
+        };
+        let hits = rank(&[c], "sigsum-submit");
+        assert_eq!(hits[0].why, Why::Name);
+        assert!(hits[0].provides);
+        assert_eq!(
+            pick(&hits).and_then(|h| h.spec.clone()),
+            Some("go:sigsum.org/sigsum-go/cmd/sigsum-submit".into())
+        );
+        // With neither locator nor repo there is nothing to install.
+        let bare = Candidate { kind: "go_install".into(), ..Candidate::default() };
+        assert_eq!(spec_for(&bare), None);
     }
 
     #[test]

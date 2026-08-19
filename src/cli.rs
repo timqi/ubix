@@ -286,8 +286,16 @@ impl App {
         // (not `cli`, the repo behind it).
         if crate::discover::is_bare_name(&args.spec) {
             let query = args.spec.trim().to_string();
-            args.spec = self.discover_spec(&query, &args)?;
-            step!("resolved `{query}` → {}", args.spec);
+            let (spec, cmds) = self.discover_spec(&query, &args)?;
+            // Name what will actually land on PATH whenever it differs from what
+            // was typed (`bottom` installs `btm`), so a resolution can never
+            // silently hand back a differently-named command.
+            if cmds.iter().any(|c| !c.eq_ignore_ascii_case(&query)) {
+                step!("resolved `{query}` → {spec} (installs {})", cmds.join(", "));
+            } else {
+                step!("resolved `{query}` → {spec}");
+            }
+            args.spec = spec;
             args.name = args.name.or(Some(query));
         }
         // aqua: prefix is intercepted BEFORE parse_spec (§8): resolve the aqua
@@ -1330,11 +1338,16 @@ impl App {
 
     /// Resolve a bare tool name (`bat`) to an installable spec.
     ///
+    /// Returns the spec plus the command names it installs (for the caller's
+    /// resolution note).
+    ///
     /// Only an unambiguous exact match installs itself (see [`discover::pick`]).
     /// Anything else prints the candidate table and requires a choice: `--pick N`,
-    /// `--from <source>`, `--yes` (take the top-ranked installable candidate), or
-    /// an interactive pick at a TTY.
-    fn discover_spec(&self, query: &str, args: &AddArgs) -> Result<String> {
+    /// `--from <source>`, or an interactive pick at a TTY. `--yes` deliberately
+    /// does NOT resolve ambiguity — it suppresses prompts, and letting it also
+    /// take "whatever ranked first" would install an arbitrary lookalike (`ubix
+    /// add cli --yes` has hundreds of equally-scored candidates).
+    fn discover_spec(&self, query: &str, args: &AddArgs) -> Result<(String, Vec<String>)> {
         let hits = self.discover_hits(query, args.from.as_deref(), args.refresh)?;
 
         // --pick N indexes the list `ubix which` prints (1-based).
@@ -1350,14 +1363,6 @@ impl App {
         }
 
         print_discovery(query, &hits, DISCOVERY_LIMIT);
-        if self.assume_yes {
-            let hit = hits
-                .iter()
-                .find(|h| h.spec.is_some())
-                .context("no discovered candidate maps to a ubix source")?;
-            step!("--yes: taking the top-ranked candidate");
-            return installable_spec(hit);
-        }
         if let Some(hit) = prompt_pick(&hits) {
             return installable_spec(hit);
         }
@@ -1684,13 +1689,16 @@ const WHICH_LIMIT: usize = 25;
 /// The spec for a chosen candidate, or an error naming the aqua type ubix has no
 /// source for (`github_content`/`github_archive`: registry file layouts, not
 /// release artifacts).
-fn installable_spec(hit: &crate::discover::Hit) -> Result<String> {
-    hit.spec.clone().with_context(|| {
+fn installable_spec(hit: &crate::discover::Hit) -> Result<(String, Vec<String>)> {
+    let spec = hit.spec.clone().with_context(|| {
         format!(
-            "{}/{} is an aqua `{}` package, which ubix has no source for",
-            hit.candidate.owner, hit.candidate.repo, hit.candidate.kind
+            "{} is an aqua `{}` package, which ubix has no source for",
+            hit.candidate.pkg_path(),
+            hit.candidate.kind
         )
-    })
+    })?;
+    let cmds = hit.candidate.command_names().iter().map(|s| s.to_string()).collect();
+    Ok((spec, cmds))
 }
 
 /// Print ranked discovery candidates, best first, each with the spec it installs
@@ -2179,10 +2187,19 @@ fn parse_kv_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String,
 /// Validate an aqua package path: `owner/repo`, or a longer nested package name
 /// such as `kubernetes/kubernetes/kubectl` (a repo shipping several tools files
 /// each one under its own name). Returns it trimmed.
+///
+/// Segments are validated because the path is interpolated straight into the
+/// `pkgs/<path>/registry.yaml` raw URL: `.`/`..` would resolve out of `pkgs/`,
+/// and `#`/`?`/whitespace/backslash would cut the URL short or split it.
 pub fn aqua_pkg_path(s: &str) -> Result<String> {
     let path = s.trim();
     let segs: Vec<&str> = path.split('/').collect();
-    if segs.len() < 2 || segs.iter().any(|p| p.is_empty()) {
+    let bad = |p: &&str| {
+        p.is_empty()
+            || matches!(*p, "." | "..")
+            || p.chars().any(|c| c.is_whitespace() || matches!(c, '#' | '?' | '\\' | '%'))
+    };
+    if segs.len() < 2 || segs.iter().any(bad) {
         bail!("expected an aqua package path `owner/repo[/tool]`, got `{s}`");
     }
     Ok(path.to_string())
@@ -2822,6 +2839,15 @@ mod tests {
         assert!(aqua_pkg_path("codex").is_err());
         assert!(aqua_pkg_path("a//c").is_err());
         assert!(aqua_pkg_path("a/b/").is_err());
+        // The path is interpolated into `pkgs/<path>/registry.yaml`: traversal
+        // and URL-splitting characters must never reach it.
+        assert!(aqua_pkg_path("../registry").is_err());
+        assert!(aqua_pkg_path("owner/../../etc/passwd").is_err());
+        assert!(aqua_pkg_path("owner/./repo").is_err());
+        assert!(aqua_pkg_path("owner/repo#frag").is_err());
+        assert!(aqua_pkg_path("owner/repo?x=1").is_err());
+        assert!(aqua_pkg_path("owner/re po").is_err());
+        assert!(aqua_pkg_path(r"owner\repo/x").is_err());
     }
 
     // ---- bootstrap python/nodejs runtime command construction ----
