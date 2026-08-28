@@ -62,7 +62,7 @@ Run `ubix sources` for the live list.
 ubix add <spec> [--name N] [--matching S] [--exe E] [--exes A,B] [--tag T]
                 [--host U] [--version V] [--rename R] [--force]
 ubix upgrade [names…] [--all] [--force] [--dry-run] [--prune] [--json]
-ubix remove <name> [--force]
+ubix remove <names…> [--force]   # several at once; one bad name does not abort the rest
 ubix list [--json]
 ubix info <name | spec>        # declared tool → local info; a spec (github:…/pixi:…) → remote metadata to vet it
 ubix edit                       # open config.toml in $EDITOR

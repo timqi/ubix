@@ -323,7 +323,10 @@ arch_replace   = { amd64 = "x64" }
 ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--version V] [--force]
       # spec 语法同 §4.2；写入 config 并立即安装
       # 同名工具已存在时默认报错（提示用 upgrade 或 --force）；--force 才覆盖参数并重装（§8.10）
-ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
+ubix remove <name...> [--force] [--wait]
+      # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
+      # 多名变参（至少一个，自动去重保序）；共用一把锁，逐个删除，每成功一个就落盘
+      # 单个失败不中断其余；末尾汇总失败名单并非零退出（单名时错误原样抛出）
 ubix upgrade [name... | --all] [--force] [--dry-run] [--prune] [--wait] [--json]
       # 统一收敛/升级/报告/清孤儿：装缺失、升到最新、收敛 pin、（--prune）清孤儿
       # 多名变参；无 name 且无 --all → 报错；pin tag/version 默认收敛后跳过（--force 才重装，D11）

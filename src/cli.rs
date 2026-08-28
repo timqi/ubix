@@ -76,7 +76,8 @@ impl Cli {
 pub enum Command {
     /// Add a tool (writes config and installs immediately). Spec syntax per PRD §4.2.
     Add(AddArgs),
-    /// Uninstall a tool and remove it from config (only removes state-tracked files).
+    /// Uninstall one or more tools and remove them from config (only removes
+    /// state-tracked files).
     Remove(RemoveArgs),
     #[command(
         about = "Install missing, upgrade to latest, and converge pinned tools.",
@@ -168,7 +169,10 @@ pub struct AddArgs {
 
 #[derive(Debug, Args)]
 pub struct RemoveArgs {
-    pub name: String,
+    /// Tool names to uninstall; at least one. Each is removed independently — a
+    /// failure on one does not abort the others.
+    #[arg(required = true)]
+    pub names: Vec<String>,
     /// Adopt an untracked file into state and then remove it (§8.5).
     #[arg(long)]
     pub force: bool,
@@ -430,18 +434,46 @@ impl App {
         let mut locked = LockedState::acquire(&self.paths.state_file(), args.wait)?;
         let mut cfg = Config::load_or_default(&cfg_path)?;
 
-        remove::remove_tool(
-            &mut cfg,
-            &mut locked.state,
-            self.runner.as_ref(),
-            &args.name,
-            args.force,
-        )?;
+        // One lock for the whole batch. Names are de-duplicated: the second pass
+        // over a name would fail with a confusing "not tracked" error.
+        let names = dedup_names(&args.names);
+        let mut failures: Vec<(String, anyhow::Error)> = Vec::new();
+        for name in &names {
+            match remove::remove_tool(
+                &mut cfg,
+                &mut locked.state,
+                self.runner.as_ref(),
+                name,
+                args.force,
+            ) {
+                Ok(()) => {
+                    // Persist after each success so a later failure never undoes
+                    // (or hides) the removals that already happened.
+                    locked.save()?;
+                    cfg.save(&cfg_path)?;
+                    println!("removed `{name}`");
+                }
+                // A bad name must not sink the rest of the batch.
+                Err(e) => failures.push((name.clone(), e)),
+            }
+        }
 
-        locked.save()?;
-        cfg.save(&cfg_path)?;
-        println!("removed `{}`", args.name);
-        Ok(())
+        match failures.len() {
+            0 => Ok(()),
+            // Single target: surface its error verbatim (unchanged behavior).
+            _ if names.len() == 1 => Err(failures.remove(0).1),
+            n => {
+                for (name, e) in &failures {
+                    eprintln!("error: removing `{name}`: {e:#}");
+                }
+                let failed: Vec<&str> = failures.iter().map(|(n, _)| n.as_str()).collect();
+                bail!(
+                    "failed to remove {n} of {} tool(s): {}",
+                    names.len(),
+                    failed.join(", ")
+                )
+            }
+        }
     }
 
     // ---- upgrade (unified converge / upgrade / report / prune) ----
@@ -2223,6 +2255,17 @@ fn parse_kv_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String,
     Ok(map)
 }
 
+/// De-duplicate names, preserving first-seen order (like [`select_targets`]).
+fn dedup_names(names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::with_capacity(names.len());
+    for n in names {
+        if !out.iter().any(|k| k == n) {
+            out.push(n.clone());
+        }
+    }
+    out
+}
+
 /// Split an `owner/repo` string into its two non-empty segments.
 pub fn split_owner_repo(s: &str) -> Result<(String, String)> {
     let segs: Vec<&str> = s.split('/').filter(|p| !p.is_empty()).collect();
@@ -2351,6 +2394,38 @@ mod tests {
             Command::Add(a) => assert_eq!(a.exes, Some(vec!["uv".into(), "uvx".into()])),
             _ => panic!("expected add"),
         }
+    }
+
+    #[test]
+    fn cli_parses_remove_multi_names() {
+        // `remove a b c` → variadic names (regression: it used to take one).
+        match Cli::try_parse_from(["ubix", "remove", "pier", "opencode", "herdr"])
+            .unwrap()
+            .command
+        {
+            Command::Remove(a) => {
+                assert_eq!(a.names, vec!["pier", "opencode", "herdr"]);
+                assert!(!a.force);
+            }
+            _ => panic!("expected remove"),
+        }
+        // Flags still bind after the names.
+        match Cli::try_parse_from(["ubix", "remove", "pier", "--force"]).unwrap().command {
+            Command::Remove(a) => {
+                assert_eq!(a.names, vec!["pier"]);
+                assert!(a.force);
+            }
+            _ => panic!("expected remove"),
+        }
+        // At least one name is required.
+        assert!(Cli::try_parse_from(["ubix", "remove"]).is_err());
+    }
+
+    #[test]
+    fn dedup_names_preserves_first_seen_order() {
+        let names = ["b".to_string(), "a".to_string(), "b".to_string()];
+        assert_eq!(dedup_names(&names), vec!["b".to_string(), "a".to_string()]);
+        assert!(dedup_names(&[]).is_empty());
     }
 
     #[test]
