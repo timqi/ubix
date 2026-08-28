@@ -10,6 +10,7 @@ use crate::http::{HttpClient, ReqwestClient};
 use crate::outdated::{self, Latest};
 use crate::paths::Paths;
 use crate::remove;
+use crate::report::{self, Action, UpgradeEntry};
 use crate::runner::{CommandRunner, SystemRunner};
 use crate::sources::github::GithubSource;
 use crate::sources::template as template_source;
@@ -45,6 +46,12 @@ pub struct Cli {
     /// `ubix bootstrap`). Required to bootstrap in non-interactive contexts.
     #[arg(short = 'y', long, global = true)]
     pub yes: bool,
+
+    /// Emit one machine-readable JSON document on stdout instead of the human
+    /// report (progress still goes to stderr). Supported by `list` and
+    /// `upgrade`; any other command errors out.
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 impl Cli {
@@ -90,6 +97,28 @@ pub enum Command {
     Sources,
     /// Search the aqua-registry and print (or add) a generated `github:` config.
     Search(SearchArgs),
+}
+
+/// The subcommand name as typed, for error messages.
+fn command_name(cmd: &Command) -> &'static str {
+    match cmd {
+        Command::Add(_) => "add",
+        Command::Remove(_) => "remove",
+        Command::Upgrade(_) => "upgrade",
+        Command::List => "list",
+        Command::Info(_) => "info",
+        Command::Edit => "edit",
+        Command::Doctor => "doctor",
+        Command::Bootstrap(_) => "bootstrap",
+        Command::Sources => "sources",
+        Command::Search(_) => "search",
+    }
+}
+
+/// Whether a command has a `--json` document form (§7.2). Everything else must
+/// reject `--json` instead of silently ignoring it.
+fn json_supported(cmd: &Command) -> bool {
+    matches!(cmd, Command::List | Command::Upgrade(_))
 }
 
 #[derive(Debug, Args)]
@@ -222,10 +251,17 @@ pub struct App {
     pub verbosity: crate::progress::Verbosity,
     /// Skip interactive confirmation (from `--yes`); auto-runs bootstrap prompts.
     pub assume_yes: bool,
+    /// `--json`: stdout belongs to a single JSON document, so no human line may
+    /// be printed there (see [`App::say`]).
+    pub json: bool,
 }
 
 impl App {
-    pub fn new(verbosity: crate::progress::Verbosity, assume_yes: bool) -> Result<Self> {
+    pub fn new(
+        verbosity: crate::progress::Verbosity,
+        assume_yes: bool,
+        json: bool,
+    ) -> Result<Self> {
         // Keep the global (consulted by the step!/detail! macros) in sync.
         crate::progress::set_verbosity(verbosity);
         Ok(Self {
@@ -234,10 +270,27 @@ impl App {
             http: Box::new(ReqwestClient::new()),
             verbosity,
             assume_yes,
+            json,
         })
     }
 
+    /// Print a human-facing result line on stdout — suppressed under `--json`,
+    /// which reserves stdout for exactly one JSON document.
+    fn say(&self, line: impl AsRef<str>) {
+        if !self.json {
+            println!("{}", line.as_ref());
+        }
+    }
+
     pub fn run(&self, cli: Cli) -> Result<()> {
+        // Fail loudly rather than silently ignoring `--json` on a command that
+        // has no machine-readable form.
+        if self.json && !json_supported(&cli.command) {
+            bail!(
+                "`--json` is not supported by `ubix {}`; only `list` and `upgrade` emit JSON",
+                command_name(&cli.command)
+            );
+        }
         match cli.command {
             Command::Add(a) => self.cmd_add(a),
             Command::Remove(a) => self.cmd_remove(a),
@@ -458,11 +511,11 @@ impl App {
             let live_node = npm::current_default_node(self.runner.as_ref());
             let lts_jumped = npm::lts_jump(recorded_node.as_deref(), live_node.as_deref());
             if lts_jumped && live_node.is_some() {
-                println!(
+                self.say(format!(
                     "node default changed {} -> {} (npm tools will be reinstalled)",
                     recorded_node.as_deref().unwrap_or("none"),
                     live_node.as_deref().unwrap_or("?")
-                );
+                ));
             }
             (live_node, lts_jumped)
         } else {
@@ -491,7 +544,7 @@ impl App {
                 continue;
             }
             if dry_run {
-                println!("would backfill `{name}` version: {ver}");
+                self.say(format!("would backfill `{name}` version: {ver}"));
                 // Reflect the backfill in the in-memory state so the action
                 // decision below matches what a real run would decide (a real
                 // run backfills first, which can turn an "upgrade" into a "skip").
@@ -512,31 +565,58 @@ impl App {
             step!("backfilled `{name}` version: {ver}");
         }
 
+        // The `--json` document is built alongside the human output; it is only
+        // emitted (once, at the very end) when `--json` is set.
+        let mut rep = report::UpgradeReport::new(dry_run);
+
         // 4) Orphans: in state but not config (§8.3), filtered to scope. Emitted
         //    BEFORE the declared installs.
         for name in &selection.orphans {
+            // Captured before the prune drops the record.
+            let from = state!().tool(name).map(|r| r.installed_version.clone());
             if args.prune {
                 if dry_run {
-                    println!("would prune orphan `{name}`");
+                    self.say(format!("would prune orphan `{name}`"));
+                    rep.push(UpgradeEntry::new(name, Action::WouldPrune).versions(from, None));
                 } else if let Some(locked) = locked_opt.as_mut() {
                     // Prune uses a throwaway config so remove_tool can still find
                     // the source from the state record.
                     let mut throwaway = cfg.clone();
-                    remove::remove_tool(
+                    let pruned = remove::remove_tool(
                         &mut throwaway,
                         &mut locked.state,
                         self.runner.as_ref(),
                         name,
                         false,
                     )
-                    .with_context(|| format!("pruning orphan `{name}`"))?;
+                    .with_context(|| format!("pruning orphan `{name}`"));
+                    match pruned {
+                        Ok(()) => {}
+                        // Under --json a failure is recorded per tool and the run
+                        // continues; the process still exits non-zero at the end.
+                        Err(e) if self.json => {
+                            rep.push(
+                                UpgradeEntry::new(name, Action::Failed)
+                                    .versions(from, None)
+                                    .error(format!("{e:#}")),
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    }
                     locked.save()?;
                     step!("pruning orphan `{name}`");
-                    println!("pruned orphan `{name}`");
+                    self.say(format!("pruned orphan `{name}`"));
+                    rep.push(UpgradeEntry::new(name, Action::Pruned).versions(from, None));
                 }
             } else {
-                println!(
+                self.say(format!(
                     "orphan `{name}`: in state but not config (use `upgrade --prune` to remove)"
+                ));
+                rep.push(
+                    UpgradeEntry::new(name, Action::Orphan)
+                        .versions(from, None)
+                        .reason("in state but not config (use `upgrade --prune` to remove)"),
                 );
             }
         }
@@ -545,34 +625,70 @@ impl App {
         let mut changed = 0usize;
         for name in &selection.declared {
             let tool = &cfg.tools[name];
-            let parsed = cfg.parsed_spec(tool)?;
             let installed = state!().tool(name).cloned();
+            let from = installed.as_ref().map(|r| r.installed_version.clone());
 
-            let action = self.decide_action(
-                &cfg,
-                &parsed,
-                tool,
-                installed.as_ref(),
-                lts_jumped,
-                args.force,
-            )?;
+            let decided = cfg.parsed_spec(tool).and_then(|parsed| {
+                self.decide_action(
+                    &cfg,
+                    &parsed,
+                    tool,
+                    installed.as_ref(),
+                    lts_jumped,
+                    args.force,
+                )
+            });
+            let action = match decided {
+                Ok(a) => a,
+                Err(e) if self.json => {
+                    rep.push(
+                        UpgradeEntry::new(name, Action::Failed)
+                            .versions(from, None)
+                            .error(format!("{e:#}")),
+                    );
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
 
             match action {
-                UpgradeAction::Skip { reason } => {
+                UpgradeAction::Skip { reason, pinned, target } => {
+                    rep.push(
+                        UpgradeEntry::new(
+                            name,
+                            if pinned { Action::PinnedSkip } else { Action::Skipped },
+                        )
+                        .versions(from, target)
+                        .reason(reason.as_str()),
+                    );
                     if dry_run {
-                        println!("{name:20} {:16} action: skip ({reason})", installed_ver(&installed));
+                        self.say(format!(
+                            "{name:20} {:16} action: skip ({reason})",
+                            installed_ver(&installed)
+                        ));
                     } else {
-                        println!("skip `{name}`: {reason}");
+                        self.say(format!("skip `{name}`: {reason}"));
                     }
                 }
                 UpgradeAction::Install { latest } | UpgradeAction::Upgrade { latest } => {
                     let is_install = installed.is_none();
                     let verb = if is_install { "install" } else { "upgrade" };
                     if dry_run {
-                        println!(
+                        self.say(format!(
                             "{name:20} {:16} -> {} action: {verb}",
                             installed_ver(&installed),
                             latest.as_deref().unwrap_or("latest"),
+                        ));
+                        rep.push(
+                            UpgradeEntry::new(
+                                name,
+                                if is_install {
+                                    Action::WouldInstall
+                                } else {
+                                    Action::WouldUpgrade
+                                },
+                            )
+                            .versions(from, latest),
                         );
                         continue;
                     }
@@ -583,17 +699,37 @@ impl App {
                     // A missing tool is a fresh INSTALL (e.g. `uv tool install`),
                     // not an upgrade — routing it through upgrade_tool would run
                     // `uv tool upgrade` on a not-yet-installed package and fail.
-                    let record = if is_install {
-                        self.install_tool(&cfg, name, tool, false)?
+                    let done = if is_install {
+                        self.install_tool(&cfg, name, tool, false)
                     } else {
-                        self.upgrade_tool(&cfg, name, tool)?
+                        self.upgrade_tool(&cfg, name, tool)
                     };
+                    let record = match done {
+                        Ok(r) => r,
+                        Err(e) if self.json => {
+                            rep.push(
+                                UpgradeEntry::new(name, Action::Failed)
+                                    .versions(from, latest)
+                                    .error(format!("{e:#}")),
+                            );
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    let to = Some(record.installed_version.clone());
                     if let Some(locked) = locked_opt.as_mut() {
                         locked.state.tools.insert(name.clone(), record);
                         locked.save()?;
                     }
                     changed += 1;
-                    println!("{}d `{name}`", verb);
+                    rep.push(
+                        UpgradeEntry::new(
+                            name,
+                            if is_install { Action::Installed } else { Action::Upgraded },
+                        )
+                        .versions(from, to),
+                    );
+                    self.say(format!("{}d `{name}`", verb));
                 }
             }
         }
@@ -613,9 +749,23 @@ impl App {
         }
 
         if dry_run {
-            println!("dry-run complete");
+            self.say("dry-run complete");
         } else {
-            println!("upgrade complete: {changed} tool(s) changed");
+            self.say(format!("upgrade complete: {changed} tool(s) changed"));
+        }
+
+        if self.json {
+            rep.finalize();
+            report::emit(&rep)?;
+            // Exit codes keep their meaning: any per-tool failure is still a
+            // failed run. The JSON document is already on stdout; the error text
+            // goes to stderr (and is repeated per tool inside the document).
+            if rep.summary.failed > 0 {
+                bail!(
+                    "{} tool(s) failed (see the JSON report on stdout)",
+                    rep.summary.failed
+                );
+            }
         }
         Ok(())
     }
@@ -653,6 +803,8 @@ impl App {
             if same_version(&rec.installed_version, tag) {
                 return Ok(UpgradeAction::Skip {
                     reason: format!("pinned to tag `{tag}` (use --force)"),
+                    pinned: true,
+                    target: Some(tag.clone()),
                 });
             }
             return Ok(UpgradeAction::Upgrade { latest: Some(tag.clone()) });
@@ -669,6 +821,8 @@ impl App {
                 if same_version(&rec.installed_version, ver) {
                     return Ok(UpgradeAction::Skip {
                         reason: format!("pinned to version `{ver}` (use --force)"),
+                        pinned: true,
+                        target: Some(ver.clone()),
                     });
                 }
                 return Ok(UpgradeAction::Upgrade { latest: Some(ver.clone()) });
@@ -700,6 +854,8 @@ impl App {
                 // No latest concept for this source → nothing to compare.
                 return Ok(UpgradeAction::Skip {
                     reason: "no latest version available (use --force to reinstall)".to_string(),
+                    pinned: false,
+                    target: None,
                 });
             }
             Err(e) => {
@@ -707,6 +863,8 @@ impl App {
                 // --force, already handled). Report the reason.
                 return Ok(UpgradeAction::Skip {
                     reason: format!("latest query failed ({e})"),
+                    pinned: false,
+                    target: None,
                 });
             }
         };
@@ -720,6 +878,8 @@ impl App {
         if same_version(&rec.installed_version, &latest) {
             Ok(UpgradeAction::Skip {
                 reason: format!("already at latest `{latest}`"),
+                pinned: false,
+                target: Some(latest),
             })
         } else {
             Ok(UpgradeAction::Upgrade { latest: Some(latest) })
@@ -731,6 +891,9 @@ impl App {
         let cfg = Config::load_or_default(&self.paths.config_file())?;
         let state = read_state_no_lock(&self.paths.state_file())?;
 
+        if self.json {
+            return self.list_json(&cfg, &state);
+        }
         if cfg.tools.is_empty() {
             println!("no tools declared");
             return Ok(());
@@ -753,6 +916,12 @@ impl App {
             println!("{line}");
         }
         Ok(())
+    }
+
+    /// `ubix list --json`: one [`report::ListReport`] on stdout, probing the
+    /// real filesystem for `exists`.
+    fn list_json(&self, cfg: &Config, state: &crate::state::State) -> Result<()> {
+        report::emit(&list_report(cfg, state, &|p| p.exists()))
     }
 
     // ---- info ----
@@ -1454,6 +1623,33 @@ impl App {
     }
 }
 
+/// Build the `list --json` document from config + state. An empty config is a
+/// valid document with `tools: []` (never the human "no tools declared").
+/// `path_exists` is a seam so tests need no filesystem.
+fn list_report(
+    cfg: &Config,
+    state: &crate::state::State,
+    path_exists: &dyn Fn(&std::path::Path) -> bool,
+) -> report::ListReport {
+    let tools: Vec<report::ListEntry> = cfg
+        .tools
+        .iter()
+        .map(|(name, tool)| {
+            let record = state.tool(name);
+            // The spec is the source of truth; fall back to the recorded source
+            // (then `unknown`) if it no longer parses.
+            let source = cfg
+                .parsed_spec(tool)
+                .map(|p| p.source.to_string())
+                .unwrap_or_else(|_| {
+                    record.map(|r| r.source.clone()).unwrap_or_else(|| "unknown".into())
+                });
+            report::ListEntry::build(name, tool, &source, record, path_exists)
+        })
+        .collect();
+    report::ListReport::new(cfg.settings.install_dir_path(), tools)
+}
+
 /// Read state without taking the write lock (for read-only commands, §8.6).
 fn read_state_no_lock(path: &std::path::Path) -> Result<crate::state::State> {
     if !path.exists() {
@@ -1801,7 +1997,16 @@ pub enum UpgradeAction {
     /// Installed but out of date / forced → (re)install to the target.
     Upgrade { latest: Option<String> },
     /// Already at the target (or nothing to compare) → do nothing.
-    Skip { reason: String },
+    Skip {
+        /// Human explanation, also carried into the `--json` report.
+        reason: String,
+        /// True when the skip is because the tool sits on its `tag`/`version`
+        /// pin (→ `pinned-skip` in `--json`), false for any other skip.
+        pinned: bool,
+        /// The version this skip settled on (the pin, or the queried latest);
+        /// `None` when there was nothing to compare against.
+        target: Option<String>,
+    },
 }
 
 /// Which tools an `upgrade` invocation should act on.
@@ -2139,6 +2344,100 @@ mod tests {
         }
     }
 
+    // ---- --json (§7.2) ----
+
+    #[test]
+    fn cli_parses_global_json_flag() {
+        // Global flag: accepted both before and after the subcommand.
+        assert!(Cli::try_parse_from(["ubix", "list", "--json"]).unwrap().json);
+        assert!(Cli::try_parse_from(["ubix", "--json", "upgrade", "--all"]).unwrap().json);
+        assert!(!Cli::try_parse_from(["ubix", "list"]).unwrap().json);
+    }
+
+    #[test]
+    fn json_is_supported_only_by_list_and_upgrade() {
+        let supported = [
+            Cli::try_parse_from(["ubix", "list"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "upgrade", "--all"]).unwrap().command,
+        ];
+        for c in &supported {
+            assert!(json_supported(c), "{} should support --json", command_name(c));
+        }
+        let unsupported = [
+            Cli::try_parse_from(["ubix", "sources"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "doctor"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "info", "eza"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "add", "github:o/r"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "remove", "eza"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "edit"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "bootstrap", "rust"]).unwrap().command,
+            Cli::try_parse_from(["ubix", "search", "eza"]).unwrap().command,
+        ];
+        for c in &unsupported {
+            assert!(!json_supported(c), "{} must reject --json", command_name(c));
+        }
+    }
+
+    #[test]
+    fn json_on_unsupported_command_errors_loudly() {
+        // `sources` has no JSON form: must fail (→ non-zero exit), never be a
+        // silently-ignored flag. Nothing is dispatched, so no FS/network is hit.
+        let mut app = test_app(MockHttp::new());
+        app.json = true;
+        let cli = Cli::try_parse_from(["ubix", "sources", "--json"]).unwrap();
+        let err = app.run(cli).unwrap_err();
+        assert!(
+            err.to_string().contains("`--json` is not supported by `ubix sources`"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn list_report_carries_config_state_and_disk_truth() {
+        let mut cfg = Config::default();
+        cfg.settings.install_dir = "/opt/bin".into();
+        let mut pinned = ToolConfig::from_spec("github:eza-community/eza");
+        pinned.tag = Some("v0.23.4".into());
+        cfg.tools.insert("eza".into(), pinned);
+        cfg.tools.insert("ruff".into(), ToolConfig::from_spec("pypi:ruff"));
+
+        let mut state = crate::state::State::default();
+        let mut r = rec("v0.23.4");
+        r.install_paths = vec![std::path::PathBuf::from("/opt/bin/eza")];
+        r.installed_at = Some("2026-07-02T08:45:00Z".into());
+        state.tools.insert("eza".into(), r);
+
+        // Pretend the tracked binary was deleted behind our back.
+        let doc = list_report(&cfg, &state, &|_| false);
+        assert_eq!(doc.schema_version, crate::report::REPORT_SCHEMA_VERSION);
+        assert_eq!(doc.install_dir, std::path::PathBuf::from("/opt/bin"));
+        assert_eq!(doc.tools.len(), 2);
+
+        let eza = &doc.tools[0];
+        assert_eq!(eza.name, "eza");
+        assert_eq!(eza.source, "github");
+        assert_eq!(eza.spec, "github:eza-community/eza");
+        assert_eq!(eza.tag.as_deref(), Some("v0.23.4"));
+        assert_eq!(eza.installed_version.as_deref(), Some("v0.23.4"));
+        assert!(eza.installed, "state record present");
+        assert!(!eza.exists, "binary is gone from disk");
+        assert_eq!(eza.missing_paths, vec![std::path::PathBuf::from("/opt/bin/eza")]);
+        assert_eq!(eza.installed_at.as_deref(), Some("2026-07-02T08:45:00Z"));
+
+        // Declared but never installed.
+        let ruff = &doc.tools[1];
+        assert_eq!(ruff.source, "pypi");
+        assert!(!ruff.installed && !ruff.exists);
+        assert!(ruff.installed_version.is_none());
+    }
+
+    #[test]
+    fn list_report_empty_config_is_still_a_document() {
+        let doc = list_report(&Config::default(), &crate::state::State::default(), &|_| true);
+        assert!(doc.tools.is_empty());
+        assert_eq!(doc.schema_version, crate::report::REPORT_SCHEMA_VERSION);
+    }
+
     #[test]
     fn select_targets_all_is_config_plus_orphans() {
         let cfg = vec!["eza".to_string(), "ruff".to_string()];
@@ -2298,6 +2597,7 @@ mod tests {
             http: Box::new(http),
             verbosity: crate::progress::Verbosity::Quiet,
             assume_yes: false,
+            json: false,
         }
     }
 
@@ -2335,7 +2635,35 @@ mod tests {
         // Installed bare `1.0.0` vs tag `v1.0.0` → same_version → skip.
         tool.tag = Some("v1.0.0".into());
         match decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, false) {
-            UpgradeAction::Skip { .. } => {}
+            // `pinned` drives the `pinned-skip` action in the --json report, and
+            // `target` carries the pin the tool settled on.
+            UpgradeAction::Skip { pinned, target, .. } => {
+                assert!(pinned);
+                assert_eq!(target.as_deref(), Some("v1.0.0"));
+            }
+            other => panic!("expected skip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn action_already_at_latest_skip_is_not_pinned() {
+        // A plain "already at latest" skip must NOT be reported as pinned-skip,
+        // but still carries the version it settled on.
+        let http = MockHttp::new().with_text(
+            "https://api.github.com/repos/eza-community/eza/releases/latest",
+            r#"{"tag_name":"v0.23.4"}"#,
+        );
+        let app = test_app(http);
+        let parsed = ParsedSpec {
+            source: SourceKind::Github,
+            locator: "eza-community/eza".into(),
+        };
+        let tool = ToolConfig::from_spec("github:eza-community/eza");
+        match decide(&app, &parsed, &tool, Some(&rec("v0.23.4")), false, false) {
+            UpgradeAction::Skip { pinned, target, .. } => {
+                assert!(!pinned);
+                assert_eq!(target.as_deref(), Some("v0.23.4"));
+            }
             other => panic!("expected skip, got {other:?}"),
         }
     }
@@ -2645,6 +2973,7 @@ mod tests {
             http: Box::new(MockHttp::new()),
             verbosity: crate::progress::Verbosity::Quiet,
             assume_yes: false,
+            json: false,
         }
     }
 

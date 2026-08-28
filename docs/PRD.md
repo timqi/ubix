@@ -324,12 +324,12 @@ ubix add <spec> [--matching S] [--exe E] [--exes A,B] [--tag T] [--host U] [--ve
       # spec 语法同 §4.2；写入 config 并立即安装
       # 同名工具已存在时默认报错（提示用 upgrade 或 --force）；--force 才覆盖参数并重装（§8.10）
 ubix remove <name>              # 卸载（按来源选路径）+ 从 config 删除；仅删 state 记录文件（D14）
-ubix upgrade [name... | --all] [--force] [--dry-run] [--prune] [--wait]
+ubix upgrade [name... | --all] [--force] [--dry-run] [--prune] [--wait] [--json]
       # 统一收敛/升级/报告/清孤儿：装缺失、升到最新、收敛 pin、（--prune）清孤儿
       # 多名变参；无 name 且无 --all → 报错；pin tag/version 默认收敛后跳过（--force 才重装，D11）
       # --dry-run：只读报告 installed vs latest + 动作（= 旧 outdated，查询见 §7.1），不写不装
       # --prune：清 scope 内孤儿（state 有、config 无，§8.3）
-ubix list                       # 已声明工具：名称 / spec / 已装版本
+ubix list [--json]              # 已声明工具：名称 / spec / 已装版本
 ubix info <name>                # 来源、asset/module、路径、参数
 ubix edit                       # 打开 config.toml
 ubix doctor                     # 检查 uv/fnm/rustup/go、各 PATH 段、~/.local/bin 就绪
@@ -347,6 +347,29 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 | go | `https://proxy.golang.org/<module>/@latest` 的 `Version` |
 | url | 无 latest 概念 → 标记 `n/a` |
 | template | 若设 `version_source`（github）→ 查其最新；否则 `n/a` |
+
+全局开关：`-q/--quiet`、`-v/--verbose`、`-y/--yes`、`--json`。
+
+### 7.2 `--json`（机器可读输出）
+面向“ubix 被其它程序当子进程驱动”的场景：消费方解析结构化结果，而不是刮人类文本。
+- 支持：`list` / `upgrade`。**其它子命令带 `--json` 必须报错并非零退出**，不得静默忽略。
+- stdout 只有**一个** JSON 文档：进度/日志/错误全部走 stderr，不做部分写入。
+- 退出码含义不变（失败 → 非零）。文档带 `schema_version`（当前 `1`）。
+- 字段名沿用 `ToolRecord`/`ToolConfig` 词汇，不另造一套。实现在 `src/report.rs`。
+
+`list --json` → `{schema_version, install_dir, tools[]}`；每项：`name`、`spec`、
+`source`、`locator`、`installed`、`installed_version`、`install_paths`（绝对路径）、
+`exists`（当下磁盘上是否真存在）、`missing_paths`、pin（`tag`/`version`）、
+`installed_at`/`updated_at`。
+
+`upgrade --json` → `{schema_version, dry_run, tools[], summary}`；每项：`name`、
+`action`、`from_version`、`to_version`、`reason`、`error`。`action` 取值：
+`installed` / `upgraded` / `skipped` / `pinned-skip` / `failed` / `pruned` /
+`orphan`（未带 `--prune` 时的孤儿），以及 `--dry-run` 变体 `would-install` /
+`would-upgrade` / `would-prune`。`summary = {total, changed, failed, by_action}`，
+`by_action` 包含全部 action 键（未命中为 0）。
+**`--json` 下单个工具失败不再中断整轮**：记为 `failed` 并保留 `error` 全文，
+其余工具继续，最后仍以非零退出（人类模式保持原有的“遇错即停”）。
 
 ---
 

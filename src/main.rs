@@ -21,6 +21,7 @@ mod paths;
 mod platform;
 mod prefix_dev;
 mod remove;
+mod report;
 mod runner;
 mod sources;
 mod state;
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
     progress::set_verbosity(verbosity);
     init_logger(verbosity);
 
-    let app = cli::App::new(verbosity, cli.yes)?;
+    let app = cli::App::new(verbosity, cli.yes, cli.json)?;
     if let Err(e) = app.run(cli) {
         // Print the full error chain with context.
         eprintln!("error: {e:#}");

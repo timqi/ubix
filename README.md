@@ -61,9 +61,9 @@ Run `ubix sources` for the live list.
 ```
 ubix add <spec> [--name N] [--matching S] [--exe E] [--exes A,B] [--tag T]
                 [--host U] [--version V] [--rename R] [--force]
-ubix upgrade [names…] [--all] [--force] [--dry-run] [--prune]
+ubix upgrade [names…] [--all] [--force] [--dry-run] [--prune] [--json]
 ubix remove <name> [--force]
-ubix list
+ubix list [--json]
 ubix info <name | spec>        # declared tool → local info; a spec (github:…/pixi:…) → remote metadata to vet it
 ubix edit                       # open config.toml in $EDITOR
 ubix doctor                     # check tools + PATH readiness
@@ -74,7 +74,34 @@ ubix search <query> [--add] [--name N] [--aqua|--pixi] [--channel C]
                                 # prints each hit's ready-to-run `ubix add` command
 ```
 
-Global: `-q/--quiet`, `-v/--verbose`.
+Global: `-q/--quiet`, `-v/--verbose`, `-y/--yes`, `--json`.
+
+### Machine-readable output (`--json`)
+
+`ubix list --json` and `ubix upgrade --json` write **exactly one JSON document**
+to stdout and nothing else — progress and errors go to stderr, exit codes keep
+their meaning (non-zero on failure). Every other command **rejects** `--json`
+with an error instead of ignoring it. Both documents carry `schema_version`
+(currently `1`) so consumers can detect a shape change.
+
+```sh
+ubix list --json | jq '.tools[] | select(.exists | not) | .name'   # tracked but gone from disk
+ubix upgrade --all --json | jq '.summary'
+```
+
+`list --json` → `{schema_version, install_dir, tools[]}`; each tool carries
+`name`, `spec`, `source`, `locator`, `installed`, `installed_version`,
+`install_paths` (absolute), `exists` (all tracked paths present right now),
+`missing_paths`, the pins `tag`/`version`, and `installed_at`/`updated_at`.
+
+`upgrade --json` → `{schema_version, dry_run, tools[], summary}`; each tool
+carries `name`, `action`, `from_version`, `to_version`, `reason` and `error`.
+Actions: `installed`, `upgraded`, `skipped`, `pinned-skip`, `failed`, `pruned`,
+`orphan` (reported without `--prune`), plus the `--dry-run` variants
+`would-install`, `would-upgrade`, `would-prune`. `summary` is
+`{total, changed, failed, by_action}` with every action name present.
+Under `--json` a failing tool no longer aborts the run: it is recorded with its
+`error` text, the remaining tools still run, and the process exits non-zero.
 
 ### Examples
 

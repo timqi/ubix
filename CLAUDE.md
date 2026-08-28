@@ -30,6 +30,8 @@ lto, strip, panic=abort).
 - `cli.rs` — clap definitions + `App` command dispatch (the orchestration layer;
   by far the largest file). Owns install/upgrade/remove/list/info/edit/doctor/
   bootstrap/sources/search flows and `decide_action` (the upgrade state machine).
+- `paths.rs` — config/state location. Precedence: `UBIX_CONFIG_DIR`/
+  `UBIX_DATA_DIR` (hold the file directly, no `/ubix` suffix) > `XDG_*` > default.
 - `config.rs` / `state.rs` — `config.toml` / `state.toml` models. `state` holds
   the `LockedState` flock guard.
 - `sources/` — one module per source. `mod.rs` defines `SourceKind`, spec
@@ -45,11 +47,13 @@ lto, strip, panic=abort).
 - `aqua/` — aqua-registry integration as a **config generator** (NOT a runtime
   source): fetch registry.yaml → resolve branch/platform → synthesize a
   `github:` `ToolConfig`. `prune.rs` simulates ubi's asset picker.
+- `report.rs` — `--json` document models (`ListReport`/`UpgradeReport`) + the
+  single-document emitter. Only `list` and `upgrade` accept `--json`.
 - `outdated.rs` — latest-version queries (pure parsers + `HttpClient` dispatch).
 - `prefix_dev.rs` — prefix.dev GraphQL client (conda latest-version + package
   search) for the `pixi` source; pure query builders/parsers + POST dispatch.
 - `bootstrap.rs` — rust/go toolchain fetches (python/nodejs handled in `cli.rs`).
-- `archive.rs`, `checksum.rs`, `paths.rs`, `platform.rs`, `progress.rs`,
+- `archive.rs`, `checksum.rs`, `platform.rs`, `progress.rs`,
   `runner.rs`, `http.rs` — utilities/seams.
 
 ## Seams (test without network/subprocess)
@@ -77,6 +81,9 @@ fixture-based test. All tests are offline.
   synthesized per-platform maps use `""` as the "no filter → let ubi decide"
   sentinel (`PlatformString::resolve` maps `""`→`None`). Never DROP a platform
   key from a partial matching map — `resolve` errors on a missing key.
+- **`--json` owns stdout.** Under `--json`, stdout carries exactly ONE JSON
+  document; every human line must go through `App::say` (suppressed) or `step!`
+  (stderr). Never add a bare `println!` to a json-capable command path.
 - **npm goes through `fnm exec --using=default -- npm …`** — never bare `npm`.
 - **uv/cargo/npm/pixi removal is tool-managed** (`uv tool uninstall`,
   `pixi global uninstall`, etc.); only github/gitlab/url/go removal unlinks
