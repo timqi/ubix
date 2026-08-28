@@ -415,6 +415,12 @@ state 有、config 无的工具：`upgrade` 默认**仅列出警告**；`upgrade
 
 ## 9. 平台支持
 - 首期：Linux x86_64 / aarch64。后续：macOS（arm64/x86_64）。非目标：Windows。
+- 发布产物（`.github/workflows/release.yml`，每个 tar.gz 一个，共用 `checksums.txt`）：
+  | artifact | target | runner |
+  |---|---|---|
+  | `ubix-linux-amd64` | `x86_64-unknown-linux-musl` | `ubuntu-latest` |
+  | `ubix-linux-arm64` | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm`（原生构建，不交叉编译） |
+  | `ubix-darwin-arm64` | `aarch64-apple-darwin` | `macos-latest` |
 
 ---
 

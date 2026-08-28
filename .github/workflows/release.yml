@@ -19,6 +19,10 @@ jobs:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             artifact: ubix-linux-amd64
+          # Built natively on a GitHub-hosted ARM runner (no cross toolchain).
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            artifact: ubix-linux-arm64
 
     env:
       VERSION: ${{ github.ref_name }}
@@ -36,8 +40,10 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      # Covers every Linux entry (amd64 + arm64); keying on a single `os` value
+      # would silently skip musl-gcc on the other one.
       - name: Install musl tools (Linux)
-        if: matrix.os == 'ubuntu-latest'
+        if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       - name: Build
