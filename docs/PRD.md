@@ -382,6 +382,13 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 `upgrade --all` 可反复执行；已是目标版本则跳过；npm LTS 跃迁触发重装（§5.4）。
 未装工具（含 pin 的 tag/version）→ 安装；未 pin 工具查 latest，与已装比较（`same_version`）后决定升级或跳过。所有版本/tag 比较都用 `same_version`（忽略一个前导 `v`），不做字面 `!=`。
 - **版本回填**：早期安装的记录可能是 `installed_version = "latest"` 哨兵。`upgrade` 在**版本比较之前**对处于该哨兵、且 `install_paths` 非空的工具运行已装二进制的 `--version`（依次尝试 `--version`/`-V`/`version`，从 stdout+stderr 里扫首个 `v?MAJOR.MINOR.PATCH[后缀]`，保留前导 `v`）回填真实版本——**不重装、不联网**；扫不到（或 `install_paths` 为空 probe 无法运行）则保持 `latest`，此时视版本为“未知”走 allow-upgrade 兜底（npm/go 哨兵同理，绝不与字面 `"latest"` 比较）。`--dry-run` 只提示不写。全量 `--all` 与限定 `upgrade <name...>` 都适用。
+- **安装时即时解哨兵**：npm/cargo（以及 `go:…@latest`）的 CLI 不告知它刚装了哪个版本，
+  回来的就是 `latest` 哨兵。因此 `install_tool` 在 `resolve_record_version` 之后、写 state
+  之前，对仍为哨兵的记录直接 probe 刚装好的二进制（同上机制，不联网），把真实版本
+  当场落入 state 和结果行（`installed \`shfmt\` v3.13.1`）；probe 失败则保留哨兵，由下
+  一轮的“版本回填”兵底。
+- **结果行带版本**：完成后的 stdout 行为 `installed \`x\` <ver>` / `upgraded \`x\` <old> -> <new>`
+  （`--force` 同版重装时两边相等）。
 - 过期判定**忽略一个前导 `v`**（`same_version`），使回填出的裸 `14.1.1` 不会被误判为落后于 tag `v14.1.1`。
 
 ### 8.3 孤儿处理（D10）

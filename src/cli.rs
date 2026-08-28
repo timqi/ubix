@@ -1602,6 +1602,16 @@ impl App {
             tool.host.as_deref(),
             &outcome.installed_version,
         );
+        // npm/cargo (and `go:…@latest`) have no way to report which version their
+        // CLI just resolved, so they hand back the `latest` sentinel. Probe the
+        // binary we just installed — the same mechanism `upgrade` uses to backfill
+        // on the NEXT run, one run earlier, so state and the result line carry a
+        // real version immediately. No network.
+        let installed_version = resolve_sentinel_by_probe(
+            self.runner.as_ref(),
+            installed_version,
+            &outcome.install_paths,
+        );
         detail!("resolved version = {installed_version}");
         if let Some(asset) = &outcome.resolved_asset {
             detail!("resolved asset = {asset}");
@@ -1985,6 +1995,27 @@ pub fn same_version(a: &str, b: &str) -> bool {
         s.strip_prefix('v').or_else(|| s.strip_prefix('V')).unwrap_or(s)
     }
     strip_v(a) == strip_v(b)
+}
+
+/// Replace a leftover `"latest"` sentinel with the version the freshly-installed
+/// binary reports (`<bin> --version`, see [`probe_binary_version`]). Any other
+/// version string, an empty path list, or a failed/uninformative probe leaves
+/// the input untouched — an unresolved sentinel still means "allow upgrade".
+fn resolve_sentinel_by_probe(
+    runner: &dyn CommandRunner,
+    version: String,
+    install_paths: &[std::path::PathBuf],
+) -> String {
+    if version != "latest" {
+        return version;
+    }
+    let Some(bin) = install_paths.first() else {
+        return version;
+    };
+    match probe_binary_version(runner, bin) {
+        Some(v) if v != "latest" => v,
+        _ => version,
+    }
 }
 
 /// The stdout line for a completed install/upgrade: `installed `x` v1.2.3` or
@@ -2860,6 +2891,49 @@ mod tests {
         assert_eq!(
             decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, true),
             UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn probe_resolves_the_latest_sentinel_at_install_time() {
+        // npm/cargo report `latest`; the freshly installed binary knows better.
+        let bin = std::path::PathBuf::from("/home/u/.local/bin/wrangler");
+        let runner = MockRunner::new().expect(
+            "/home/u/.local/bin/wrangler --version",
+            crate::runner::CommandOutput {
+                status: 0,
+                stdout: "4.126.0\n".into(),
+                stderr: String::new(),
+            },
+        );
+        assert_eq!(
+            resolve_sentinel_by_probe(&runner, "latest".into(), &[bin]),
+            "4.126.0"
+        );
+    }
+
+    #[test]
+    fn probe_leaves_a_real_version_and_a_failed_probe_alone() {
+        let bin = std::path::PathBuf::from("/home/u/.local/bin/eza");
+        // A real version is never re-probed (MockRunner would error if it were).
+        assert_eq!(
+            resolve_sentinel_by_probe(
+                &MockRunner::new(),
+                "v0.23.5".into(),
+                std::slice::from_ref(&bin)
+            ),
+            "v0.23.5"
+        );
+        // Probe fails (no canned response) → the sentinel survives, so
+        // decide_action still treats the tool as upgradable.
+        assert_eq!(
+            resolve_sentinel_by_probe(&MockRunner::new(), "latest".into(), &[bin]),
+            "latest"
+        );
+        // Nothing tracked → nothing to probe.
+        assert_eq!(
+            resolve_sentinel_by_probe(&MockRunner::new(), "latest".into(), &[]),
+            "latest"
         );
     }
 
