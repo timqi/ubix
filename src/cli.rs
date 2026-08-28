@@ -971,8 +971,21 @@ impl App {
         let install_dir = cfg.settings.install_dir_path();
         detail!("verbosity = {:?}", self.verbosity);
         println!("ubix doctor");
-        println!("  config: {}", self.paths.config_file().display());
-        println!("  state:  {}", self.paths.state_file().display());
+        // Effective locations, so a misconfigured UBIX_CONFIG_DIR/UBIX_DATA_DIR
+        // (or XDG_*) is visible rather than silently pointing elsewhere.
+        println!("  config:      {}", self.paths.config_file().display());
+        println!("  state:       {}", self.paths.state_file().display());
+        println!("  install_dir: {}", install_dir.display());
+        for (var, val) in [
+            ("UBIX_CONFIG_DIR", std::env::var_os("UBIX_CONFIG_DIR")),
+            ("UBIX_DATA_DIR", std::env::var_os("UBIX_DATA_DIR")),
+            ("XDG_CONFIG_HOME", std::env::var_os("XDG_CONFIG_HOME")),
+            ("XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+        ] {
+            if let Some(v) = val.filter(|v| !v.is_empty()) {
+                println!("  {var}={}", v.to_string_lossy());
+            }
+        }
 
         // PATH segments to verify (§8.9).
         let home = crate::paths::home_dir();

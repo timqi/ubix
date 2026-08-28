@@ -116,9 +116,23 @@ ubix search ripgrep --add        # exact match ambiguous across backends → lis
 
 ## Files & environment
 
-- Config: `~/.config/ubix/config.toml` (honors `$XDG_CONFIG_HOME`)
-- State:  `~/.local/share/ubix/state.toml` (honors `$XDG_DATA_HOME`)
+- Config: `~/.config/ubix/config.toml`
+- State:  `~/.local/share/ubix/state.toml`
 - Tokens: `UBIX_GITHUB_TOKEN`, `UBIX_GITLAB_TOKEN` (private / rate-limited repos)
+
+Location overrides, highest precedence first:
+
+| Variable | Effect |
+|---|---|
+| `UBIX_CONFIG_DIR` | directory that **directly** holds `config.toml` (no `/ubix` appended) |
+| `UBIX_DATA_DIR` | directory that **directly** holds `state.toml` (no `/ubix` appended) |
+| `XDG_CONFIG_HOME` / `XDG_DATA_HOME` | `$XDG_CONFIG_HOME/ubix/config.toml`, `$XDG_DATA_HOME/ubix/state.toml` |
+| (none) | `~/.config/ubix/`, `~/.local/share/ubix/` |
+
+An empty value counts as unset, and `~`/`$HOME` are expanded. Use `UBIX_*` when
+you want to relocate only ubix's own files: `XDG_*` is also read by the child
+processes ubix drives (uv, fnm, cargo, go, pixi), `UBIX_*` is not.
+`ubix doctor` prints the effective config/state/install paths.
 
 State access is guarded by an exclusive advisory lock; installs stage into a
 tempdir and atomically replace the target, so a failed install never corrupts

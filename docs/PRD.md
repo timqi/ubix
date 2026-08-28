@@ -91,9 +91,17 @@
 
 ## 4. 配置与状态
 
-### 4.1 位置（XDG）
+### 4.1 位置（XDG + `UBIX_*` 覆盖）
 - 配置：`~/.config/ubix/config.toml`（尊重 `$XDG_CONFIG_HOME`）——**整个目录进 dotfiles**。
 - 状态：`~/.local/share/ubix/state.toml`（尊重 `$XDG_DATA_HOME`）——机器写入，**不进 dotfiles**。
+- 覆盖优先级：`$UBIX_CONFIG_DIR` > `$XDG_CONFIG_HOME/ubix` > `~/.config/ubix`；
+  `$UBIX_DATA_DIR` > `$XDG_DATA_HOME/ubix` > `~/.local/share/ubix`。
+- `UBIX_CONFIG_DIR` / `UBIX_DATA_DIR` **直接**指向存放 `config.toml` / `state.toml`
+  的目录（**不追加** `/ubix` 段，与 `XDG_*` 不同）；空值 = 未设置；支持 `~`/`$HOME`
+  展开（复用 `paths::expand`）。用途：ubix 被当作子进程驱动时（如自带一套私有
+  install_dir 的宿主程序），只想搬 ubix 自己的文件，而不想改动 `XDG_*` —— 后者会
+  被 ubix 派生的 uv/fnm/cargo/go/pixi 一并读取。
+- `ubix doctor` 打印生效的 config / state / install_dir 路径。
 
 ### 4.2 `spec` 紧凑语法（D5）
 统一格式：`spec = "$source:$locator"`。config 与 CLI `add` 共用。
