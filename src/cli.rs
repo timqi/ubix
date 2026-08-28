@@ -716,20 +716,28 @@ impl App {
                         }
                         Err(e) => return Err(e),
                     };
-                    let to = Some(record.installed_version.clone());
+                    let to = record.installed_version.clone();
                     if let Some(locked) = locked_opt.as_mut() {
                         locked.state.tools.insert(name.clone(), record);
                         locked.save()?;
                     }
                     changed += 1;
+                    // Report what actually changed, not just that something did:
+                    // an install shows the landed version, an upgrade shows
+                    // `old -> new` (equal on a --force reinstall).
+                    self.say(format_change(
+                        if is_install { "installed" } else { "upgraded" },
+                        name,
+                        from.as_deref(),
+                        &to,
+                    ));
                     rep.push(
                         UpgradeEntry::new(
                             name,
                             if is_install { Action::Installed } else { Action::Upgraded },
                         )
-                        .versions(from, to),
+                        .versions(from, Some(to)),
                     );
-                    self.say(format!("{}d `{name}`", verb));
                 }
             }
         }
@@ -1979,6 +1987,16 @@ pub fn same_version(a: &str, b: &str) -> bool {
     strip_v(a) == strip_v(b)
 }
 
+/// The stdout line for a completed install/upgrade: `installed `x` v1.2.3` or
+/// `upgraded `x` v1.0.0 -> v1.2.3`. `from` is `None` for a fresh install, which
+/// has no previous version to show. `done` is the past-tense verb.
+fn format_change(done: &str, name: &str, from: Option<&str>, to: &str) -> String {
+    match from {
+        Some(prev) => format!("{done} `{name}` {prev} -> {to}"),
+        None => format!("{done} `{name}` {to}"),
+    }
+}
+
 /// Render an installed version for the dry-run report, or `(none)` when unset.
 fn installed_ver(installed: &Option<ToolRecord>) -> String {
     installed
@@ -2842,6 +2860,26 @@ mod tests {
         assert_eq!(
             decide(&app, &parsed, &tool, Some(&rec("1.0.0")), false, true),
             UpgradeAction::Upgrade { latest: None }
+        );
+    }
+
+    #[test]
+    fn format_change_shows_old_and_new_version() {
+        // Upgrade: both versions, so the log says what actually moved.
+        assert_eq!(
+            format_change("upgraded", "eza", Some("v0.20.0"), "v0.23.5"),
+            "upgraded `eza` v0.20.0 -> v0.23.5"
+        );
+        // Fresh install: no previous version to show (and it reads `installed`,
+        // not the old `installd`).
+        assert_eq!(
+            format_change("installed", "ruff", None, "0.6.9"),
+            "installed `ruff` 0.6.9"
+        );
+        // --force reinstall at the same version is shown honestly.
+        assert_eq!(
+            format_change("upgraded", "eza", Some("v0.23.5"), "v0.23.5"),
+            "upgraded `eza` v0.23.5 -> v0.23.5"
         );
     }
 
