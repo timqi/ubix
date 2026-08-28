@@ -20,9 +20,38 @@ pub fn split_module(locator: &str) -> (String, String) {
     }
 }
 
-/// The installed binary name is the last path segment of the module path.
+/// The installed binary name: the last path segment — except that a trailing
+/// **major-version element** (`/v2`, `/v3`, …) is skipped in favour of the one
+/// before it, because `go install github.com/mikefarah/yq/v4@latest` produces
+/// `yq`, not `v4`.
+///
+/// Mirrors cmd/go's `load.DefaultExecName` (golang/go#24667): the element counts
+/// as a version only for `v2`+ (`v0`, `v1`, `v01`, `v2x` do not).
 pub fn binary_name(module: &str) -> String {
-    module.rsplit('/').next().unwrap_or(module).to_string()
+    let mut segs = module.rsplit('/');
+    let last = segs.next().unwrap_or(module);
+    if is_version_element(last) {
+        if let Some(prev) = segs.next() {
+            if !prev.is_empty() {
+                return prev.to_string();
+            }
+        }
+    }
+    last.to_string()
+}
+
+/// Whether a path element is a module major-version suffix (`v2`, `v3`, … `v10`).
+/// Also used by the proxy query in `outdated.rs` to know where a module path can
+/// no longer be shortened.
+pub fn is_version_element(s: &str) -> bool {
+    let Some(digits) = s.strip_prefix('v') else {
+        return false;
+    };
+    // `v0`/`v1` are never module suffixes, and no leading zero is allowed.
+    if digits.is_empty() || digits == "1" || digits.starts_with('0') {
+        return false;
+    }
+    digits.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// `go install <module>@<version>`.
@@ -85,6 +114,34 @@ mod tests {
     #[test]
     fn binary_is_last_segment() {
         assert_eq!(binary_name("example.com/cmd/gotool"), "gotool");
+    }
+
+    #[test]
+    fn binary_skips_a_major_version_element() {
+        // `go install github.com/mikefarah/yq/v4@latest` produces `yq`, not `v4`
+        // — recording `v4` made probe/remove/list point at a file that never exists.
+        assert_eq!(binary_name("github.com/mikefarah/yq/v4"), "yq");
+        assert_eq!(binary_name("example.com/tool/v10"), "tool");
+        // A version element only *inside* the path is not the last segment.
+        assert_eq!(binary_name("mvdan.cc/sh/v3/cmd/shfmt"), "shfmt");
+    }
+
+    #[test]
+    fn binary_keeps_lookalike_last_segments() {
+        // v0/v1 are never module suffixes; neither is a leading zero or a
+        // non-numeric tail. These are real package names.
+        for module in [
+            "example.com/x/v1",
+            "example.com/x/v0",
+            "example.com/x/v01",
+            "example.com/x/v2x",
+            "example.com/x/v",
+        ] {
+            let last = module.rsplit('/').next().unwrap();
+            assert_eq!(binary_name(module), last, "module {module}");
+        }
+        // No slash at all → the path itself.
+        assert_eq!(binary_name("tool"), "tool");
     }
 
     #[test]

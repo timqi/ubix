@@ -281,6 +281,10 @@ darwin-arm64 = "codex-aarch64-apple-darwin.zst"
 - 前置：go 工具链（见 §6.2）。
 - 安装/升级：`GOBIN=~/.local/bin go install <module>@<version>` → 落 `~/.local/bin`。
 - go **无账本、无 `go uninstall`**：ubix 用 `state.toml` 的 `install_paths` 记账，卸载即删对应文件；`go version -m <bin>` 可反查校验。
+- **可执行文件名**：取包路径末段，但末段是主版本后缀（`/v2`、`/v3`…）时取前一段
+  —— `go install github.com/mikefarah/yq/v4@latest` 产出的是 `yq` 而非 `v4`（对齐 cmd/go 的
+  `DefaultExecName`：仅 `v2`+ 算版本段，`v0`/`v1`/`v01`/`v2x` 不算）。记错会让 probe /
+  `remove` / `list` 的 `exists` 全部指向不存在的文件。
 
 ### 5.7 template（aqua 式模板 URL + 版本发现；旧名 `http`，仍作别名）
 面向「不在 GitHub Release、而是托管在固定 CDN/GCS，按版本模板下载」的工具（典型：claude-code）。区别于 `url:`（固定链接、无 latest）。
@@ -347,7 +351,7 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 | pypi | `https://pypi.org/pypi/<pkg>/json` 的 `info.version` |
 | npm | `https://registry.npmjs.org/<pkg>/latest` 的 `version` |
 | cargo | `https://crates.io/api/v1/crates/<name>` 的 `crate.max_stable_version` |
-| go | `https://proxy.golang.org/<module>/@latest` 的 `Version` |
+| go | `https://proxy.golang.org/<module>/@latest` 的 `Version`；locator 是**包路径**，代理只认**模块路径**，故从全路径逐段上溯（遇 `/vN` 即止，否则会拿到 v1 模块的版本） |
 | url | 无 latest 概念 → 标记 `n/a` |
 | template | 若设 `version_source`（github）→ 查其最新；否则 `n/a` |
 

@@ -67,10 +67,8 @@ pub fn latest_version(
             Ok(Latest::Version(parse_cargo(&body)?))
         }
         SourceKind::Go => {
-            let module = spec.locator.split('@').next().unwrap_or(&spec.locator);
-            let url = format!("https://proxy.golang.org/{module}/@latest");
-            let body = http.get_text(&url)?;
-            Ok(Latest::Version(parse_go(&body)?))
+            let pkg = spec.locator.split('@').next().unwrap_or(&spec.locator);
+            Ok(Latest::Version(go_latest(http, pkg)?))
         }
         SourceKind::Pixi => {
             // conda has no per-package REST endpoint; use the prefix.dev GraphQL
@@ -111,6 +109,52 @@ fn npm_pkg_name(locator: &str) -> String {
         // Unscoped: `pkg[@version]`.
         None => pkg_name(locator),
     }
+}
+
+/// Latest version for a go spec, from the module proxy.
+///
+/// A `go:` locator is a **package** path (`mvdan.cc/sh/v3/cmd/shfmt`), but the
+/// proxy only answers for the **module** path (`mvdan.cc/sh/v3`) — asking for the
+/// package path 404s, which used to surface as `skip: latest query failed` for
+/// every "command inside a module" tool. The boundary is invisible in the string,
+/// so try the full path and walk up one element at a time.
+fn go_latest(http: &dyn HttpClient, pkg: &str) -> Result<String> {
+    let candidates = go_module_candidates(pkg);
+    let mut first_err = None;
+    for candidate in &candidates {
+        let url = format!("https://proxy.golang.org/{candidate}/@latest");
+        match http.get_text(&url) {
+            // 200 means this IS the module path; a bad body is a real error.
+            Ok(body) => return parse_go(&body),
+            Err(e) => first_err.get_or_insert(e),
+        };
+    }
+    let tried = candidates.join(", ");
+    Err(first_err
+        .unwrap_or_else(|| anyhow::anyhow!("empty go module path"))
+        .context(format!("no go module found for `{pkg}` (tried: {tried})")))
+}
+
+/// Module-path candidates for a package path, longest first.
+///
+/// Stops at a major-version element (`/vN`): the module path always carries its
+/// own suffix, so stripping past it would silently answer with the **v1**
+/// module's version. Never goes below two elements.
+fn go_module_candidates(pkg: &str) -> Vec<String> {
+    let segs: Vec<&str> = pkg.split('/').filter(|s| !s.is_empty()).collect();
+    let mut out = Vec::new();
+    let mut n = segs.len();
+    while n >= 2 {
+        out.push(segs[..n].join("/"));
+        if crate::sources::go::is_version_element(segs[n - 1]) {
+            break;
+        }
+        n -= 1;
+    }
+    if out.is_empty() && !segs.is_empty() {
+        out.push(segs.join("/"));
+    }
+    out
 }
 
 /// Minimal percent-encoding for a gitlab project path (`/` → `%2F`).
@@ -276,6 +320,78 @@ mod tests {
     fn go_json() {
         let body = r#"{"Version":"v1.4.0","Time":"2026-01-01T00:00:00Z"}"#;
         assert_eq!(parse_go(body).unwrap(), "v1.4.0");
+    }
+
+    #[test]
+    fn go_module_candidates_walk_up_and_stop_at_the_version_element() {
+        // A command inside a module: walk up to the module root.
+        assert_eq!(
+            go_module_candidates("mvdan.cc/sh/v3/cmd/shfmt"),
+            vec![
+                "mvdan.cc/sh/v3/cmd/shfmt",
+                "mvdan.cc/sh/v3/cmd",
+                "mvdan.cc/sh/v3",
+            ]
+        );
+        // Stops AT `/v3` — `mvdan.cc/sh` is the v1 module and would answer with
+        // the wrong major version.
+        assert!(!go_module_candidates("mvdan.cc/sh/v3/cmd/shfmt")
+            .contains(&"mvdan.cc/sh".to_string()));
+        // Already a module path with a version suffix → a single candidate.
+        assert_eq!(
+            go_module_candidates("github.com/mikefarah/yq/v4"),
+            vec!["github.com/mikefarah/yq/v4"]
+        );
+        // No version element → walk down to two elements.
+        assert_eq!(
+            go_module_candidates("example.com/cmd/tool"),
+            vec!["example.com/cmd/tool", "example.com/cmd"]
+        );
+    }
+
+    #[test]
+    fn go_latest_falls_back_to_the_module_path() {
+        // Only the module root answers; the package path 404s (unknown to the mock).
+        let http = MockHttp::new().with_text(
+            "https://proxy.golang.org/mvdan.cc/sh/v3/@latest",
+            r#"{"Version":"v3.13.1"}"#,
+        );
+        let spec = ParsedSpec {
+            source: SourceKind::Go,
+            locator: "mvdan.cc/sh/v3/cmd/shfmt@latest".into(),
+        };
+        assert_eq!(
+            latest_version(&http, &spec, None).unwrap(),
+            Latest::Version("v3.13.1".into())
+        );
+    }
+
+    #[test]
+    fn go_latest_uses_the_full_path_when_it_resolves() {
+        let http = MockHttp::new().with_text(
+            "https://proxy.golang.org/github.com/mikefarah/yq/v4/@latest",
+            r#"{"Version":"v4.44.3"}"#,
+        );
+        let spec = ParsedSpec {
+            source: SourceKind::Go,
+            locator: "github.com/mikefarah/yq/v4@latest".into(),
+        };
+        assert_eq!(
+            latest_version(&http, &spec, None).unwrap(),
+            Latest::Version("v4.44.3".into())
+        );
+    }
+
+    #[test]
+    fn go_latest_reports_every_path_it_tried() {
+        let spec = ParsedSpec {
+            source: SourceKind::Go,
+            locator: "example.com/cmd/tool@latest".into(),
+        };
+        let err = latest_version(&MockHttp::new(), &spec, None).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no go module found for `example.com/cmd/tool`"), "{msg}");
+        assert!(msg.contains("example.com/cmd/tool, example.com/cmd"), "{msg}");
     }
 
     #[test]
