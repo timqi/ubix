@@ -10,6 +10,7 @@
 use anyhow::{bail, Context, Result};
 
 use crate::config::Config;
+use crate::hooks::{self, Hook};
 use crate::runner::CommandRunner;
 use crate::sources::{cargo, npm, parse_spec, pixi, unlink_tracked, uv, SourceKind};
 use crate::state::{State, ToolRecord};
@@ -57,10 +58,12 @@ pub fn remove_tool(
                 sha256: None,
                 installed_at: Some(crate::now_iso8601()),
                 updated_at: Some(crate::now_iso8601()),
+                pre_remove: tool.pre_remove.clone(),
             }
         }
     };
 
+    run_pre_remove(cfg, &record, runner, name, in_config)?;
     uninstall_record(cfg, &record, runner, name)?;
     state.tools.remove(name);
 
@@ -68,6 +71,46 @@ pub fn remove_tool(
         cfg.tools.remove(name);
     }
     Ok(())
+}
+
+/// Run the tool's `pre_remove` hook, if any, BEFORE anything is deleted. While
+/// the tool is declared the config's hook is authoritative (dropping the key is
+/// the opt-out); an orphan falls back to the hook recorded at install time. A
+/// failing hook keeps the tool: removing would orphan what it failed to undo.
+/// A tool whose binary is already gone has nothing left to undo — the hook is
+/// skipped (with a note) rather than wedging the record in state forever.
+fn run_pre_remove(
+    cfg: &Config,
+    record: &ToolRecord,
+    runner: &dyn CommandRunner,
+    name: &str,
+    in_config: bool,
+) -> Result<()> {
+    let argv = if in_config {
+        cfg.tools.get(name).and_then(|t| t.pre_remove.as_ref())
+    } else {
+        record.pre_remove.as_ref()
+    };
+    let Some(argv) = argv else {
+        return Ok(());
+    };
+    let missing = hooks::missing_binaries(&record.install_paths);
+    if !missing.is_empty() {
+        step!(
+            "`{name}`: {} is not on disk; skipping {}",
+            missing[0].display(),
+            hooks::describe(Hook::PreRemove, argv)
+        );
+        return Ok(());
+    }
+    step!("running {}", hooks::describe(Hook::PreRemove, argv));
+    hooks::run(
+        runner,
+        Hook::PreRemove,
+        argv,
+        &cfg.settings.install_dir_path(),
+        &record.install_paths,
+    )
 }
 
 /// Perform the source-appropriate uninstall (does NOT touch state).
@@ -170,6 +213,7 @@ mod tests {
             sha256: None,
             installed_at: None,
             updated_at: None,
+            pre_remove: None,
         }
     }
 
@@ -270,6 +314,103 @@ mod tests {
         remove_tool(&mut cfg, &mut state, &runner, "eza", true).unwrap();
         assert!(!bin.exists());
         assert!(!cfg.tools.contains_key("eza"));
+    }
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn pre_remove_runs_before_unlink_with_install_dir_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rtk");
+        std::fs::write(&bin, b"binary").unwrap();
+        let mut cfg = cfg_with("rtk", "github:rtk-ai/rtk");
+        cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
+        cfg.tools.get_mut("rtk").unwrap().pre_remove = Some(argv(&["rtk", "init", "--uninstall"]));
+        let mut state = State::default();
+        state.tools.insert("rtk".into(), record("github", vec![bin.clone()]));
+        let runner = MockRunner::new().expect(
+            "rtk init --uninstall",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        remove_tool(&mut cfg, &mut state, &runner, "rtk", false).unwrap();
+        assert!(!bin.exists());
+        assert!(state.tool("rtk").is_none());
+        let call = runner.last_call().unwrap();
+        assert_eq!(call.program, "rtk");
+        assert_eq!(call.cwd.as_deref(), Some(dir.path()));
+        assert!(call.envs[0].1.starts_with(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn failing_pre_remove_keeps_binary_state_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rtk");
+        std::fs::write(&bin, b"binary").unwrap();
+        let mut cfg = cfg_with("rtk", "github:rtk-ai/rtk");
+        cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
+        cfg.tools.get_mut("rtk").unwrap().pre_remove = Some(argv(&["rtk", "init", "--uninstall"]));
+        let mut state = State::default();
+        state.tools.insert("rtk".into(), record("github", vec![bin.clone()]));
+        let runner = MockRunner::new().expect(
+            "rtk init --uninstall",
+            CommandOutput { status: 4, stdout: String::new(), stderr: "no extension dir\n".into() },
+        );
+        let err = remove_tool(&mut cfg, &mut state, &runner, "rtk", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("pre_remove hook `rtk init --uninstall` exited 4: no extension dir"), "{msg}");
+        assert!(bin.exists(), "binary must survive a failed pre_remove");
+        assert!(state.tool("rtk").is_some());
+        assert!(cfg.tools.contains_key("rtk"));
+    }
+
+    #[test]
+    fn orphan_prune_uses_recorded_pre_remove_and_config_wins_when_declared() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rtk");
+        std::fs::write(&bin, b"binary").unwrap();
+        // Orphan: not in config → the hook recorded at install time runs.
+        let mut cfg = Config::default();
+        cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
+        let mut state = State::default();
+        let mut rec = record("github", vec![bin.clone()]);
+        rec.pre_remove = Some(argv(&["rtk", "recorded"]));
+        state.tools.insert("rtk".into(), rec.clone());
+        let runner = MockRunner::new().expect(
+            "rtk recorded",
+            CommandOutput { status: 0, stdout: String::new(), stderr: String::new() },
+        );
+        remove_tool(&mut cfg, &mut state, &runner, "rtk", false).unwrap();
+        assert_eq!(runner.last_call().unwrap().args, vec!["recorded"]);
+
+        // Declared without a hook: dropping the key opts out, even though the
+        // record still carries one (the user's escape hatch).
+        std::fs::write(&bin, b"binary").unwrap();
+        let mut cfg = cfg_with("rtk", "github:rtk-ai/rtk");
+        cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
+        let mut state = State::default();
+        state.tools.insert("rtk".into(), rec);
+        let runner = MockRunner::new();
+        remove_tool(&mut cfg, &mut state, &runner, "rtk", false).unwrap();
+        assert!(runner.last_call().is_none());
+        assert!(!bin.exists());
+    }
+
+    #[test]
+    fn pre_remove_skipped_when_binary_already_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("rtk"); // never written
+        let mut cfg = cfg_with("rtk", "github:rtk-ai/rtk");
+        cfg.settings.install_dir = dir.path().to_string_lossy().into_owned();
+        cfg.tools.get_mut("rtk").unwrap().pre_remove = Some(argv(&["rtk", "init", "--uninstall"]));
+        let mut state = State::default();
+        state.tools.insert("rtk".into(), record("github", vec![bin]));
+        // No canned response: running the hook would error, so this proves it was skipped.
+        let runner = MockRunner::new();
+        remove_tool(&mut cfg, &mut state, &runner, "rtk", false).unwrap();
+        assert!(state.tool("rtk").is_none());
+        assert!(runner.last_call().is_none());
     }
 
     #[test]

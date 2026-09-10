@@ -198,6 +198,14 @@ pub struct ToolConfig {
     /// Runtime-os → URL-token overrides applied before `{os}` substitution.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub os_replace: Option<BTreeMap<String, String>>,
+
+    // ---- lifecycle hooks (any source; see `hooks.rs`) ----
+    /// argv run after a successful install/upgrade of this tool (no shell).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub post_install: Option<Vec<String>>,
+    /// argv run before this tool's binary is removed; a failure blocks removal.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pre_remove: Option<Vec<String>>,
 }
 
 impl ToolConfig {
@@ -278,12 +286,22 @@ impl Config {
         }
     }
 
-    /// Validate every tool spec parses under the effective default source.
+    /// Validate every tool spec parses under the effective default source and
+    /// every declared hook is a runnable argv.
     fn validate(&self) -> Result<()> {
         let default_source = self.settings.default_source_kind()?;
         for (name, tool) in &self.tools {
             self.parse_tool_spec(tool, default_source)
                 .with_context(|| format!("tool `{name}`"))?;
+            for (hook, argv) in [
+                (crate::hooks::Hook::PostInstall, &tool.post_install),
+                (crate::hooks::Hook::PreRemove, &tool.pre_remove),
+            ] {
+                if let Some(argv) = argv {
+                    crate::hooks::validate(hook, argv)
+                        .with_context(|| format!("tool `{name}`"))?;
+                }
+            }
         }
         Ok(())
     }
@@ -563,6 +581,44 @@ spec = "ruff"
 "#;
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn parses_hooks_as_argv_arrays() {
+        let text = r#"
+[tools.rtk]
+spec = "github:rtk-ai/rtk"
+post_install = ["rtk", "init", "-g", "--agent", "pi", "--auto-patch"]
+pre_remove   = ["rtk", "init", "--uninstall", "--agent", "pi", "--global", "--auto-patch"]
+"#;
+        let cfg: Config = toml::from_str(text).unwrap();
+        cfg.validate().unwrap();
+        let rtk = &cfg.tools["rtk"];
+        assert_eq!(
+            rtk.post_install.as_deref().unwrap(),
+            ["rtk", "init", "-g", "--agent", "pi", "--auto-patch"]
+        );
+        assert_eq!(rtk.pre_remove.as_ref().unwrap().len(), 7);
+        // Round-trips (so `add`/`bootstrap` config rewrites keep the hooks).
+        let back: Config = toml::from_str(&toml::to_string_pretty(&cfg).unwrap()).unwrap();
+        assert_eq!(back, cfg);
+        // Absent hooks stay absent (not serialized as empty arrays).
+        let plain = toml::to_string_pretty(&ToolConfig::from_spec("github:o/r")).unwrap();
+        assert!(!plain.contains("post_install"), "{plain}");
+    }
+
+    #[test]
+    fn empty_hook_argv_is_a_config_error() {
+        for key in ["post_install", "pre_remove"] {
+            let text = format!("[tools.rtk]\nspec = \"github:rtk-ai/rtk\"\n{key} = []\n");
+            let cfg: Config = toml::from_str(&text).unwrap();
+            let err = cfg.validate().unwrap_err();
+            let msg = format!("{err:#}");
+            assert!(msg.contains("tool `rtk`") && msg.contains(key), "{msg}");
+        }
+        // A shell string is not accepted: hooks are argv arrays only.
+        let text = "[tools.rtk]\nspec = \"github:rtk-ai/rtk\"\npost_install = \"rtk init -g\"\n";
+        assert!(toml::from_str::<Config>(text).is_err());
     }
 
     #[test]

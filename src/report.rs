@@ -192,7 +192,9 @@ pub struct UpgradeEntry {
     pub to_version: Option<String>,
     /// Human reason for a skip (`null` otherwise).
     pub reason: Option<String>,
-    /// Full error chain when `action` is `failed` (`null` otherwise).
+    /// Full error chain when `action` is `failed`. Also set on an `installed` /
+    /// `upgraded` entry whose `post_install` hook failed: the tool landed and
+    /// is recorded, but the run still counts it as failed. `null` otherwise.
     pub error: Option<String>,
 }
 
@@ -233,7 +235,8 @@ pub struct UpgradeSummary {
     pub total: usize,
     /// Entries whose action mutated the system (never counts `would-*`).
     pub changed: usize,
-    /// Entries with `action = "failed"`.
+    /// Entries with `action = "failed"` or a non-null `error` (a completed
+    /// install whose `post_install` hook failed).
     pub failed: usize,
     /// Count per action; every action name is present (0 when unused).
     pub by_action: BTreeMap<String, usize>,
@@ -276,7 +279,7 @@ impl UpgradeReport {
             if t.action.is_change() {
                 changed += 1;
             }
-            if t.action == Action::Failed {
+            if t.action == Action::Failed || t.error.is_some() {
                 failed += 1;
             }
         }
@@ -304,6 +307,7 @@ mod tests {
             sha256: None,
             installed_at: Some("2026-07-02T08:45:00Z".into()),
             updated_at: Some("2026-07-03T08:45:00Z".into()),
+            pre_remove: None,
         }
     }
 
@@ -427,6 +431,27 @@ mod tests {
             .unwrap()
             .contains("no matching asset"));
         assert_eq!(v["summary"]["failed"], 1);
+    }
+
+    #[test]
+    fn hook_error_on_installed_entry_counts_as_failed() {
+        // The install happened (action stays truthful) but the run failed.
+        let mut r = UpgradeReport::new(false);
+        r.push(
+            UpgradeEntry::new("rtk", Action::Installed)
+                .versions(None, Some("v1".into()))
+                .error("post_install hook `rtk init` exited 1: boom"),
+        );
+        r.push(UpgradeEntry::new("eza", Action::Upgraded));
+        r.finalize();
+        assert_eq!(r.summary.changed, 2);
+        assert_eq!(r.summary.failed, 1);
+        assert_eq!(r.summary.by_action["installed"], 1);
+        assert_eq!(r.summary.by_action["failed"], 0);
+        let v: serde_json::Value = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(v["tools"][0]["action"], "installed");
+        assert!(v["tools"][0]["error"].as_str().unwrap().contains("post_install"));
+        assert!(v["tools"][1]["error"].is_null());
     }
 
     #[test]

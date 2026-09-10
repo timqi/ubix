@@ -44,6 +44,10 @@ lto, strip, panic=abort).
   install path. `template:`/`http:` are back-compat spec aliases for `url:`.
 - `engine.rs` — `ReleaseEngine` trait + `UbiEngine` (drives ubi on a
   current-thread tokio runtime) + `atomic_install` / `sha256_*`.
+- `hooks.rs` — per-tool `post_install` / `pre_remove` argv hooks (PRD §8.11):
+  validation, PATH/cwd setup, execution via `CommandRunner::run_in` (cwd +
+  timeout). Called from `cli.rs` (add/upgrade) and `remove.rs` (remove/prune).
+  `pre_remove` is copied into the `ToolRecord` so orphan prunes can still run it.
 - `aqua/` — aqua-registry integration as a **config generator** (NOT a runtime
   source): fetch registry.yaml → resolve branch/platform → synthesize a
   `github:` `ToolConfig`. `prune.rs` simulates ubi's asset picker.
@@ -84,6 +88,9 @@ fixture-based test. All tests are offline.
 - **`--json` owns stdout.** Under `--json`, stdout carries exactly ONE JSON
   document; every human line must go through `App::say` (suppressed) or `step!`
   (stderr). Never add a bare `println!` to a json-capable command path.
+- **Hooks never roll back.** `post_install` runs after state is saved and its
+  failure leaves the install in place (error carried in the result / `--json`
+  `error`); a failing `pre_remove` blocks the removal entirely.
 - **npm goes through `fnm exec --using=default -- npm …`** — never bare `npm`.
 - **uv/cargo/npm/pixi removal is tool-managed** (`uv tool uninstall`,
   `pixi global uninstall`, etc.); only github/gitlab/url/go removal unlinks

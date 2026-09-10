@@ -102,6 +102,8 @@ Actions: `installed`, `upgraded`, `skipped`, `pinned-skip`, `failed`, `pruned`,
 `{total, changed, failed, by_action}` with every action name present.
 Under `--json` a failing tool no longer aborts the run: it is recorded with its
 `error` text, the remaining tools still run, and the process exits non-zero.
+`error` may also accompany an `installed`/`upgraded` action when the tool's
+`post_install` hook failed (see [Hooks](#hooks)); `summary.failed` counts it.
 
 ### Examples
 
@@ -127,6 +129,40 @@ ubix search ripgrep --add        # exact match ambiguous across backends → lis
   reinstalls anyway.
 - `--dry-run` reports installed-vs-latest and the chosen action, read-only.
 - `--prune` removes **orphans** (in state but not config).
+
+## Hooks
+
+A tool may declare two lifecycle hooks, each an **argv array** (no shell, no
+expansion — quote nothing):
+
+```toml
+[tools.rtk]
+spec = "github:rtk-ai/rtk"
+post_install = ["rtk", "init", "-g", "--agent", "pi", "--auto-patch"]
+pre_remove   = ["rtk", "init", "--uninstall", "--agent", "pi", "--global", "--auto-patch"]
+```
+
+| Key | Runs |
+|---|---|
+| `post_install` | after a successful `add`, `upgrade` install/upgrade, or `--force` reinstall of that tool — not when it was already current |
+| `pre_remove` | before the binary is removed by `remove` or `upgrade --prune` |
+
+Hooks inherit ubix's environment, get `install_dir` (plus any other directory
+holding one of the tool's binaries) prepended to `PATH` so `argv[0]` can name
+the tool itself, run with `install_dir` as working directory, and are killed
+after 10 minutes. `--dry-run` prints the argv it would run. An empty array is a
+config error.
+
+- A failing `post_install` leaves the tool installed and recorded; the error
+  (exit code + trimmed stderr) is the tool's result and the process exits
+  non-zero. Under `--json` the entry keeps `action = "installed"|"upgraded"`
+  with `error` set, other tools still run, and `summary.failed` counts it.
+- A failing `pre_remove` **keeps** the binary, its state and its config entry —
+  removing would orphan what the hook failed to undo. If the binary is already
+  gone the hook is skipped and the record is dropped.
+- `pre_remove` is also recorded in `state.toml` at install time so an orphan
+  (dropped from config) still runs it on `upgrade --prune`. While the tool is
+  declared, config wins: deleting the key is the opt-out.
 
 ## Bootstrap
 

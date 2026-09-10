@@ -15,6 +15,7 @@ mod checksum;
 mod cli;
 mod config;
 mod engine;
+mod hooks;
 mod http;
 mod outdated;
 mod paths;

@@ -6,6 +6,7 @@ use clap::{Args, Parser, Subcommand};
 use crate::bootstrap;
 use crate::config::{Config, ToolConfig};
 use crate::engine::UbiEngine;
+use crate::hooks::{self, Hook};
 use crate::http::{HttpClient, ReqwestClient};
 use crate::outdated::{self, Latest};
 use crate::paths::Paths;
@@ -418,14 +419,46 @@ impl App {
         // never relinks its entry points into our bin dir.
         let record = self.install_tool(&cfg, &name, &tool, force)?;
         let version = record.installed_version.clone();
+        let install_paths = record.install_paths.clone();
         locked.state.tools.insert(name.clone(), record);
         locked.save()?;
 
-        cfg.tools.insert(name.clone(), tool);
+        cfg.tools.insert(name.clone(), tool.clone());
         cfg.save(&cfg_path)?;
         // stdout: machine-facing result, augmented with the resolved version.
         println!("added `{name}` ({}) {version}", parsed.source);
-        Ok(())
+        // The install is recorded either way; a failing hook is the run's error.
+        self.run_post_install(&cfg, &name, &tool, &install_paths)
+    }
+
+    /// Run a tool's `post_install` hook (if declared) against the binaries the
+    /// install just recorded. Callers invoke this only after state is saved: the
+    /// binary stays installed whether or not the hook succeeds.
+    fn run_post_install(
+        &self,
+        cfg: &Config,
+        name: &str,
+        tool: &ToolConfig,
+        install_paths: &[std::path::PathBuf],
+    ) -> Result<()> {
+        let Some(argv) = &tool.post_install else {
+            return Ok(());
+        };
+        let missing = hooks::missing_binaries(install_paths);
+        if !missing.is_empty() {
+            bail!(
+                "post_install hook for `{name}` not run: {} is not on disk",
+                missing[0].display()
+            );
+        }
+        step!("running {}", hooks::describe(Hook::PostInstall, argv));
+        hooks::run(
+            self.runner.as_ref(),
+            Hook::PostInstall,
+            argv,
+            &cfg.settings.install_dir_path(),
+            install_paths,
+        )
     }
 
     // ---- remove ----
@@ -609,6 +642,9 @@ impl App {
             if args.prune {
                 if dry_run {
                     self.say(format!("would prune orphan `{name}`"));
+                    if let Some(argv) = state!().tool(name).and_then(|r| r.pre_remove.as_ref()) {
+                        self.say(format!("  would run {}", hooks::describe(Hook::PreRemove, argv)));
+                    }
                     rep.push(UpgradeEntry::new(name, Action::WouldPrune).versions(from, None));
                 } else if let Some(locked) = locked_opt.as_mut() {
                     // Prune uses a throwaway config so remove_tool can still find
@@ -722,6 +758,9 @@ impl App {
                             )
                             .versions(from, latest),
                         );
+                        if let Some(argv) = &tool.post_install {
+                            self.say(format!("  would run {}", hooks::describe(Hook::PostInstall, argv)));
+                        }
                         continue;
                     }
                     match &installed {
@@ -749,6 +788,7 @@ impl App {
                         Err(e) => return Err(e),
                     };
                     let to = record.installed_version.clone();
+                    let install_paths = record.install_paths.clone();
                     if let Some(locked) = locked_opt.as_mut() {
                         locked.state.tools.insert(name.clone(), record);
                         locked.save()?;
@@ -763,13 +803,21 @@ impl App {
                         from.as_deref(),
                         &to,
                     ));
-                    rep.push(
-                        UpgradeEntry::new(
-                            name,
-                            if is_install { Action::Installed } else { Action::Upgraded },
-                        )
-                        .versions(from, Some(to)),
-                    );
+                    let mut entry = UpgradeEntry::new(
+                        name,
+                        if is_install { Action::Installed } else { Action::Upgraded },
+                    )
+                    .versions(from, Some(to));
+                    // post_install runs after every install/upgrade that actually
+                    // changed the tool (state is already saved). A failure keeps
+                    // the action truthful (the tool IS installed) and rides in
+                    // `error`, which makes the run fail.
+                    match self.run_post_install(&cfg, name, tool, &install_paths) {
+                        Ok(()) => {}
+                        Err(e) if self.json => entry = entry.error(format!("{e:#}")),
+                        Err(e) => return Err(e),
+                    }
+                    rep.push(entry);
                 }
             }
         }
@@ -1554,6 +1602,7 @@ impl App {
                 sha256: outcome.sha256,
                 installed_at: Some(now.clone()),
                 updated_at: Some(now),
+                pre_remove: tool.pre_remove.clone(),
             });
         }
         // github/gitlab/url/go/cargo/npm "upgrade" is a reinstall in place.
@@ -1669,6 +1718,7 @@ impl App {
             sha256: outcome.sha256,
             installed_at: Some(now.clone()),
             updated_at: Some(now),
+            pre_remove: tool.pre_remove.clone(),
         })
     }
 }
@@ -2705,6 +2755,7 @@ mod tests {
             sha256: None,
             installed_at: None,
             updated_at: None,
+            pre_remove: None,
         }
     }
 
@@ -3307,5 +3358,136 @@ mod tests {
         assert!(same_version("v1.2.3", "v1.2.3"));
         assert!(!same_version("1.2.3", "1.2.4"));
         assert!(!same_version("v1.2.3", "1.2.4"));
+    }
+
+    // ---- lifecycle hooks through the real upgrade flow ----
+    //
+    // A fixed `url:` tool is the one source that installs offline through the
+    // seams (MockHttp bytes → real atomic install into a tempdir), so it drives
+    // `cmd_upgrade` end to end with the MockRunner standing in for the hook.
+
+    const HOOK_URL: &str = "https://example.invalid/rtk";
+    const HOOK_KEY: &str = "rtk init -g --agent pi";
+
+    type CallLog = std::rc::Rc<std::cell::RefCell<Vec<crate::runner::RecordedCall>>>;
+
+    /// A throwaway config/state/install_dir triple holding one `rtk` tool with
+    /// `post_install`/`pre_remove` hooks. Returns the tempdir (keep it alive),
+    /// the App, and a handle onto the runner's call log.
+    fn hook_fixture(runner: MockRunner, json: bool) -> (tempfile::TempDir, App, CallLog) {
+        let log = runner.calls_handle();
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let mut cfg = Config::default();
+        cfg.settings.install_dir = bin.to_string_lossy().into_owned();
+        let mut tool = ToolConfig::from_spec(format!("url:{HOOK_URL}"));
+        tool.post_install = Some(HOOK_KEY.split(' ').map(str::to_string).collect());
+        tool.pre_remove = Some(vec!["rtk".into(), "init".into(), "--uninstall".into()]);
+        cfg.tools.insert("rtk".into(), tool);
+        cfg.save(&dir.path().join("config.toml")).unwrap();
+        let app = App {
+            paths: Paths { config_dir: dir.path().to_path_buf(), data_dir: dir.path().to_path_buf() },
+            runner: Box::new(runner),
+            http: Box::new(MockHttp::new().with_bytes(HOOK_URL, b"#!/bin/sh\nexit 0\n".to_vec())),
+            verbosity: crate::progress::Verbosity::Quiet,
+            assume_yes: false,
+            json,
+        };
+        (dir, app, log)
+    }
+
+    fn upgrade_args(force: bool, dry_run: bool) -> UpgradeArgs {
+        UpgradeArgs { names: vec![], all: true, force, dry_run, prune: true, wait: false }
+    }
+
+    #[test]
+    fn post_install_runs_on_install_and_force_reinstall_but_not_on_noop() {
+        let runner = MockRunner::new().expect(HOOK_KEY, ok_out(""));
+        let (dir, app, log) = hook_fixture(runner, false);
+        let bin_dir = dir.path().join("bin");
+        // 1) fresh install → hook runs once, with install_dir as cwd and on PATH.
+        app.cmd_upgrade(upgrade_args(false, false)).unwrap();
+        let state = read_state_no_lock(&dir.path().join("state.toml")).unwrap();
+        let rec = state.tool("rtk").expect("installed");
+        assert!(rec.install_paths[0].exists());
+        // The pre_remove hook is recorded so a later orphan prune can run it.
+        assert_eq!(rec.pre_remove.as_ref().unwrap()[1], "init");
+        {
+            let calls = log.borrow();
+            assert_eq!(calls.len(), 1, "{calls:?}");
+            assert_eq!(calls[0].program, "rtk");
+            assert_eq!(calls[0].args, vec!["init", "-g", "--agent", "pi"]);
+            assert_eq!(calls[0].cwd.as_deref(), Some(bin_dir.as_path()));
+            assert_eq!(calls[0].envs[0].0, "PATH");
+            assert!(calls[0].envs[0].1.starts_with(&bin_dir.display().to_string()));
+        }
+
+        // 2) already current (fixed url → skip) → no hook.
+        app.cmd_upgrade(upgrade_args(false, false)).unwrap();
+        assert_eq!(log.borrow().len(), 1);
+
+        // 3) --dry-run (even with --force) → prints only, no hook.
+        app.cmd_upgrade(upgrade_args(true, true)).unwrap();
+        assert_eq!(log.borrow().len(), 1);
+
+        // 4) --force reinstall counts as an install → hook runs again.
+        app.cmd_upgrade(upgrade_args(true, false)).unwrap();
+        assert_eq!(log.borrow().len(), 2);
+    }
+
+    #[test]
+    fn failing_post_install_keeps_install_and_fails_the_run() {
+        let runner = MockRunner::new().expect(
+            HOOK_KEY,
+            CommandOutput { status: 7, stdout: String::new(), stderr: "no PI dir\n".into() },
+        );
+        // Human mode: the error is the run's error, state still records the tool.
+        let (dir, app, _log) = hook_fixture(runner, false);
+        let err = app.cmd_upgrade(upgrade_args(false, false)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("post_install hook `rtk init -g --agent pi` exited 7: no PI dir"), "{msg}");
+        let state = read_state_no_lock(&dir.path().join("state.toml")).unwrap();
+        assert!(state.tool("rtk").unwrap().install_paths[0].exists());
+
+        // --json: the entry stays `installed` with `error`, the run exits non-zero.
+        let runner = MockRunner::new().expect(
+            HOOK_KEY,
+            CommandOutput { status: 7, stdout: String::new(), stderr: "no PI dir\n".into() },
+        );
+        let (dir, app, _log) = hook_fixture(runner, true);
+        let err = app.cmd_upgrade(upgrade_args(false, false)).unwrap_err();
+        assert!(err.to_string().contains("1 tool(s) failed"), "{err}");
+        let state = read_state_no_lock(&dir.path().join("state.toml")).unwrap();
+        assert!(state.tool("rtk").is_some());
+    }
+
+    #[test]
+    fn prune_dry_run_and_failing_pre_remove_keep_the_orphan() {
+        let runner = MockRunner::new()
+            .expect(HOOK_KEY, ok_out(""))
+            .expect(
+                "rtk init --uninstall",
+                CommandOutput { status: 3, stdout: String::new(), stderr: "still in use".into() },
+            );
+        let (dir, app, log) = hook_fixture(runner, true);
+        app.cmd_upgrade(upgrade_args(false, false)).unwrap();
+        // Drop rtk from config → it is now an orphan carrying a recorded pre_remove.
+        let cfg_path = dir.path().join("config.toml");
+        let mut cfg = Config::load(&cfg_path).unwrap().unwrap();
+        cfg.tools.remove("rtk");
+        cfg.save(&cfg_path).unwrap();
+
+        // dry-run: no hook call.
+        app.cmd_upgrade(upgrade_args(false, true)).unwrap();
+        assert_eq!(log.borrow().len(), 1);
+
+        // prune: the hook fails → binary + state survive, run fails (json).
+        let err = app.cmd_upgrade(upgrade_args(false, false)).unwrap_err();
+        assert!(err.to_string().contains("1 tool(s) failed"), "{err}");
+        let state = read_state_no_lock(&dir.path().join("state.toml")).unwrap();
+        let rec = state.tool("rtk").expect("orphan must survive a failed pre_remove");
+        assert!(rec.install_paths[0].exists());
+        assert_eq!(log.borrow().last().unwrap().args, vec!["init", "--uninstall"]);
     }
 }

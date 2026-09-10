@@ -85,6 +85,13 @@ pub struct ToolRecord {
 
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub updated_at: Option<String>,
+
+    /// The tool's `pre_remove` hook as declared when it was installed, so an
+    /// orphan (dropped from config) can still undo its footprint on
+    /// `upgrade --prune`. Config wins while the tool is still declared.
+    /// Additive optional field — schema_version stays 1.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub pre_remove: Option<Vec<String>>,
 }
 
 impl State {
@@ -239,6 +246,7 @@ mod tests {
             sha256: Some("abc".into()),
             installed_at: Some("2026-07-02T08:45:00Z".into()),
             updated_at: Some("2026-07-02T08:45:00Z".into()),
+            pre_remove: None,
         }
     }
 

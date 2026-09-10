@@ -187,6 +187,8 @@ spec = "go:example.com/cmd/gotool@latest"
 | `url_musl` | template | Linux musl 上的替代 URL 模板（§5.7） |
 | `version_source` | template | 版本发现来源，如 `github:owner/repo`（§5.7） |
 | `arch_replace`/`os_replace` | template | 运行时 arch/os token → URL token 映射（如 `amd64→x64`） |
+| `post_install` | 任意 | argv 数组（无 shell）；成功 install/upgrade/`--force` 重装后执行（§8.11） |
+| `pre_remove` | 任意 | argv 数组（无 shell）；`remove`/`upgrade --prune` 删除二进制**之前**执行，失败则不删（§8.11） |
 
 ### 4.5 state.toml 草案（机器写入）
 ```toml
@@ -200,6 +202,7 @@ install_paths     = ["/home/qiqi/.local/bin/eza"]
 sha256            = "…"
 installed_at      = "2026-07-02T08:45:00Z"
 updated_at        = "2026-07-02T08:45:00Z"
+# pre_remove      = ["rtk", "init", "--uninstall", …]  # 安装时从 config 复制，孤儿 prune 仍能执行（§8.11）
 
 [tools.gotool]
 source            = "go"
@@ -377,6 +380,8 @@ ubix bootstrap <rust|go|python|nodejs> [--reinstall]  # rust/go 工具链；pyth
 `by_action` 包含全部 action 键（未命中为 0）。
 **`--json` 下单个工具失败不再中断整轮**：记为 `failed` 并保留 `error` 全文，
 其余工具继续，最后仍以非零退出（人类模式保持原有的“遇错即停”）。
+`post_install` 钩子失败时（§8.11）条目仍为 `installed`/`upgraded`（工具确已落地）但 `error` 非空，
+`summary.failed` 计入；shape 不变，`schema_version` 仍为 1。
 
 ---
 
@@ -424,6 +429,13 @@ state 有、config 无的工具：`upgrade` 默认**仅列出警告**；`upgrade
 
 ### 8.10 add 已存在保护
 `add` 计算出的工具 key 若已在 `config.toml` 中存在，默认**报错并中止**（在安装前，不触网），提示改用 `upgrade <name>`（重装）或 `add --force`（有意覆盖）。`--force` 时整条替换该 config 条目并重装。此举避免静默覆盖已设参数（如 `exe`/`matching`）。注意 key 由 locator 末段派生，`--name` 可显式指定；不同 key 会新建并存条目而非覆盖。
+
+### 8.11 生命周期钩子（`post_install` / `pre_remove`）
+每个工具可选两条 argv 数组钩子（**不经 shell、不展开**；空数组 = 配置错误），实现在 `src/hooks.rs`，经 `CommandRunner` seam 执行。
+- 环境：继承 ubix 进程环境；`PATH` 前置 `install_dir`（及工具其它二进制所在目录，如 pixi 的 `$PIXI_HOME/bin`），使 `argv[0]` 可直接写工具名；工作目录 = `install_dir`；超时 10 分钟后 kill。
+- `post_install`：`add`、`upgrade` 的 install/upgrade、`--force` 重装成功**且 state 已写入后**执行；已是最新（skip）不执行；二进制不在磁盘 → 报错不执行。失败：二进制与 state 保留，错误（退出码 + stderr，永不为空）作为该工具结果，进程非零退出；`--json` 下写入该条目 `error`，其余工具继续。
+- `pre_remove`：`remove` 与 `upgrade --prune` 删除**之前**执行。失败 → **不删**（二进制、state、config 均保留），否则会留下钩子未能撤销的痕迹。二进制已不存在 → 跳过钩子并照常删记录。安装时把 `pre_remove` 复制进 state 记录，孤儿（已不在 config）prune 时仍可执行；工具仍在 config 时以 config 为准（删掉该键即退出）。
+- `--dry-run` 打印将执行的 argv，不执行。
 
 ---
 
