@@ -1926,32 +1926,23 @@ pub fn resolve_record_version(
     }
 }
 
-/// Install the latest stable Python as the default via the freshly-installed
-/// uv, invoked by ABSOLUTE path (`<install_dir>/uv`) since install_dir may not
-/// be on PATH yet. Prefers `uv python install --default` (installs latest stable
-/// and creates default `python`/`python3`); falls back to `uv python install`
-/// on older uv that lacks `--default`.
+/// Install the latest stable Python via the freshly-installed uv, invoked by
+/// ABSOLUTE path (`<install_dir>/uv`) since install_dir may not be on PATH yet.
+/// Deliberately NOT `--default`: that flag drops a `python3` symlink in
+/// install_dir, which precedes /usr/bin on PATH and hijacks every distro script
+/// with a `#!/usr/bin/env python3` shebang (they then lose the system
+/// dist-packages). uv finds its managed interpreters on its own, so `uv run`,
+/// `uv venv` and `uv tool` are unaffected by the missing symlink.
 fn run_python_runtime(runner: &dyn CommandRunner, install_dir: &std::path::Path) -> Result<()> {
     let uv = install_dir.join("uv");
     let uv_s = uv.to_string_lossy().into_owned();
-    step!("uv python install --default (latest stable Python)…");
+    step!("uv python install (latest stable Python)…");
     let out = runner
-        .run(&uv_s, &["python", "install", "--default"], &[])
-        .context("running uv python install --default")?;
-    if out.success() {
-        return Ok(());
-    }
-    step!("`--default` not accepted; retrying `uv python install`…");
-    let out2 = runner
         .run(&uv_s, &["python", "install"], &[])
         .context("running uv python install")?;
-    if !out2.success() {
-        bail!("uv python install failed: {}", out2.stderr.trim());
+    if !out.success() {
+        bail!("uv python install failed: {}", out.stderr.trim());
     }
-    println!(
-        "note: installed latest Python without --default (older uv); \
-         `uv python install --default` unsupported here"
-    );
     Ok(())
 }
 
@@ -3273,30 +3264,28 @@ mod tests {
     }
 
     #[test]
-    fn python_runtime_uses_uv_python_install_default() {
+    fn python_runtime_installs_without_default_flag() {
+        // No `--default`: it would symlink `python3` into install_dir and shadow
+        // /usr/bin/python3 for every distro script on PATH.
         let dir = "/home/u/.local/bin";
-        let runner = MockRunner::new()
-            .expect("/home/u/.local/bin/uv python install --default", ok_out(""));
+        let runner =
+            MockRunner::new().expect("/home/u/.local/bin/uv python install", ok_out(""));
         run_python_runtime(&runner, Path::new(dir)).unwrap();
         let calls = runner.calls.borrow();
+        assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].program, "/home/u/.local/bin/uv");
-        assert_eq!(calls[0].args, vec!["python", "install", "--default"]);
+        assert_eq!(calls[0].args, vec!["python", "install"]);
     }
 
     #[test]
-    fn python_runtime_falls_back_without_default_flag() {
+    fn python_runtime_errors_when_uv_fails() {
         let dir = "/home/u/.local/bin";
-        // `--default` fails (status != 0) → retry plain `uv python install`.
-        let runner = MockRunner::new()
-            .expect(
-                "/home/u/.local/bin/uv python install --default",
-                CommandOutput { status: 2, stdout: String::new(), stderr: "unexpected argument".into() },
-            )
-            .expect("/home/u/.local/bin/uv python install", ok_out(""));
-        run_python_runtime(&runner, Path::new(dir)).unwrap();
-        let calls = runner.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].args, vec!["python", "install"]);
+        let runner = MockRunner::new().expect(
+            "/home/u/.local/bin/uv python install",
+            CommandOutput { status: 2, stdout: String::new(), stderr: "no such version".into() },
+        );
+        let err = run_python_runtime(&runner, Path::new(dir)).unwrap_err();
+        assert!(err.to_string().contains("no such version"));
     }
 
     // ---- version backfill helpers ----

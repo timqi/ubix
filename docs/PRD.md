@@ -312,7 +312,7 @@ arch_replace   = { amd64 = "x64" }
 ---
 
 ## 6. 工具链引导（D9）
-`bootstrap <rust|go|python|nodejs>`。`rust`/`go` 引导多文件语言工具链（无法当单二进制 `add`）。`python`/`nodejs` 是**便捷编排**：先用普通 `add`（github 源）装好 uv / fnm（幂等、纳入 config 追踪），再让 **uv 装最新稳定版 Python 设默认**（`uv python install --default`）/ **fnm 装最新 LTS 设默认**（`fnm install --lts` + `fnm default <ver>`，修好「无 default node」）。uv / fnm 本身仍是普通 `add` 安装的单文件工具。一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑。
+`bootstrap <rust|go|python|nodejs>`。`rust`/`go` 引导多文件语言工具链（无法当单二进制 `add`）。`python`/`nodejs` 是**便捷编排**：先用普通 `add`（github 源）装好 uv / fnm（幂等、纳入 config 追踪），再让 **uv 装最新稳定版 Python**（`uv python install`，刻意不加 `--default`：那会在 install_dir 放 `python`/`python3` 软链，抢在 `/usr/bin` 前面劫持所有 `#!/usr/bin/env python3` 的发行版脚本；uv 自己找得到托管解释器，`uv run`/`venv`/`tool` 不受影响）/ **fnm 装最新 LTS 设默认**（`fnm install --lts` + `fnm default <ver>`，修好「无 default node」）。uv / fnm 本身仍是普通 `add` 安装的单文件工具。一次性引导，后续版本升级交回官方工具；工具链不作为普通单二进制 tool 追踪。**幂等**：若目标已存在则默认跳过并提示，`--reinstall` 才重跑。
 
 ### 6.1 Rust → rustup
 - `rustup-init` 单文件：`url:` 来源从 `https://static.rust-lang.org/rustup/dist/<target>/rustup-init` 拉取，运行 `rustup-init -y`。
